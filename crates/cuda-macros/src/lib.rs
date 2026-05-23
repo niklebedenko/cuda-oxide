@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod address_space;
 mod device_copy;
+mod gpu_only;
 mod printf;
 
 use proc_macro::TokenStream;
@@ -60,6 +62,33 @@ pub fn device_copy(input: TokenStream) -> TokenStream {
     let ast = syn::parse(input).unwrap();
     let code = device_copy::impl_device_copy(&ast, quote!(::cuda_core::DeviceCopy));
     code.into()
+}
+
+/// Creates a cpu version of the function which panics and cfg-gates the
+/// function for only nvptx/nvptx64.
+///
+/// Faithful port of NVIDIA Rust-CUDA's `cuda_std_macros::gpu_only`, needed so
+/// the legacy `impulse_*` tree's `#[gpu_only]` device helpers (e.g. the warp
+/// shuffle primitives) resolve verbatim under the `cuda_std` → `cuda_device`
+/// path remap of Port v2 (Impulse epic #198). On the host target the body is
+/// replaced with an `unimplemented!` stub, which is what lets `cuda_device`
+/// build on the host despite the device-only bodies.
+#[proc_macro_attribute]
+pub fn gpu_only(attr: TokenStream, item: TokenStream) -> TokenStream {
+    gpu_only::gpu_only_impl(attr, item)
+}
+
+/// Notifies the codegen to put a `static`/`static mut` inside of a specific
+/// memory address space. Takes a single argument (`global`/`shared`/
+/// `constant`/`local`). Does nothing on the CPU.
+///
+/// Faithful port of NVIDIA Rust-CUDA's `cuda_std_macros::address_space`, needed
+/// so the legacy `impulse_*` tree's `#[cuda_std::address_space(shared)]`
+/// shared-memory statics resolve verbatim under the `cuda_std` → `cuda_device`
+/// path remap of Port v2 (Impulse epic #198).
+#[proc_macro_attribute]
+pub fn address_space(attr: TokenStream, item: TokenStream) -> TokenStream {
+    address_space::address_space_impl(attr, item)
 }
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
