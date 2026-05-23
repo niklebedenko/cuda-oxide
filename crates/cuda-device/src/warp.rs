@@ -925,3 +925,232 @@ pub fn elect_sync(mask: u32) -> (u32, bool) {
 pub fn is_elected_sync(mask: u32) -> bool {
     elect_sync(mask).1
 }
+
+// =============================================================================
+// WarpShuffleValue — faithful port of cuda_std::warp
+// =============================================================================
+//
+// Faithful port of NVIDIA Rust-CUDA `cuda_std::warp` (`WarpShuffleValue`,
+// `WarpShuffleMode`, and the `warp_shuffle_N` primitives). The legacy
+// `impulse_*` tree bounds its generic warp-shuffle helpers on
+// `cuda_std::warp::WarpShuffleValue` and implements it for the scalar field
+// types; Port v2 (Impulse epic #198) remaps `cuda_std::warp` ->
+// `cuda_device::warp`, so this trait surface, enum, and the free functions
+// must resolve verbatim.
+//
+// These are ADDED alongside the fork's native `lane_id`/`shuffle_*`/`ballot`
+// API above; the names do not collide. The `warp_shuffle_N` bodies are
+// `#[gpu_only]`, so on the host target they expand to an `unimplemented!`
+// stub and the crate still builds; the real `__nvvm_warp_shuffle` body lives
+// behind the `nvptx64` cfg and is intercepted by the cuda-oxide codegen.
+
+use crate::gpu_only;
+use half::{bf16, f16};
+
+/// A value that can be used in a warp shuffle
+pub trait WarpShuffleValue: Sized {
+    /// Executes the shuffle, note that `mode` must be a constant value.
+    #[allow(clippy::missing_safety_doc)]
+    unsafe fn shuffle(
+        mode: WarpShuffleMode,
+        mask: u32,
+        value: Self,
+        b: u32,
+        width: u32,
+    ) -> (Self, bool);
+}
+
+macro_rules! impl_shuffle {
+    ($($type:ty, $width:literal),*, $(,)?) => {
+        $(
+            paste::paste! {
+                impl WarpShuffleValue for $type {
+                    unsafe fn shuffle(
+                        mode: WarpShuffleMode,
+                        mask: u32,
+                        value: Self,
+                        b: u32,
+                        width: u32,
+                    ) -> (Self, bool) {
+                        let (res, oob) = unsafe { [<warp_shuffle_ $width>](mode, mask, value as [<u $width>], b, width) };
+                        (res as $type, oob)
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_shuffle! {
+    i8, 8,
+    i16, 16,
+    i32, 32,
+    i64, 64,
+    i128, 128,
+    u8, 8,
+    u16, 16,
+    u32, 32,
+    u64, 64,
+    u128, 128,
+}
+
+// special cases
+
+impl WarpShuffleValue for f32 {
+    unsafe fn shuffle(
+        mode: WarpShuffleMode,
+        mask: u32,
+        value: Self,
+        b: u32,
+        width: u32,
+    ) -> (Self, bool) {
+        let (res, oob) = unsafe { warp_shuffle_32(mode, mask, value.to_bits(), b, width) };
+        (f32::from_bits(res), oob)
+    }
+}
+
+impl WarpShuffleValue for f64 {
+    unsafe fn shuffle(
+        mode: WarpShuffleMode,
+        mask: u32,
+        value: Self,
+        b: u32,
+        width: u32,
+    ) -> (Self, bool) {
+        let (res, oob) = unsafe { warp_shuffle_64(mode, mask, value.to_bits(), b, width) };
+        (f64::from_bits(res), oob)
+    }
+}
+
+impl WarpShuffleValue for f16 {
+    unsafe fn shuffle(
+        mode: WarpShuffleMode,
+        mask: u32,
+        value: Self,
+        b: u32,
+        width: u32,
+    ) -> (Self, bool) {
+        let (res, oob) = unsafe { warp_shuffle_16(mode, mask, value.to_bits(), b, width) };
+        (f16::from_bits(res), oob)
+    }
+}
+
+impl WarpShuffleValue for bf16 {
+    unsafe fn shuffle(
+        mode: WarpShuffleMode,
+        mask: u32,
+        value: Self,
+        b: u32,
+        width: u32,
+    ) -> (Self, bool) {
+        let (res, oob) = unsafe { warp_shuffle_16(mode, mask, value.to_bits(), b, width) };
+        (bf16::from_bits(res), oob)
+    }
+}
+
+#[doc(hidden)]
+#[repr(u32)]
+#[derive(Clone, Copy)]
+pub enum WarpShuffleMode {
+    Up,   // 0
+    Down, // 1
+    Xor,  // 2 (butterfly)
+    Idx,  // 3
+}
+
+// C-compatible struct to match LLVM IR's {i32, i8} return type
+// This fixes an ABI mismatch where Rust would represent (u32, bool) as [2 x i32]
+// but the LLVM intrinsic returns {i32, i8} (a struct, not an array)
+#[doc(hidden)]
+#[repr(C)]
+pub struct WarpShuffleResult {
+    value: u32,
+    predicate: u8,
+}
+
+#[gpu_only]
+unsafe fn warp_shuffle_32(
+    mode: WarpShuffleMode,
+    mask: u32,
+    value: u32,
+    b: u32,
+    width: u32,
+) -> (u32, bool) {
+    unsafe extern "C" {
+        // see libintrinsics.ll
+        // Returns {i32, i8} in LLVM IR, which maps to our WarpShuffleResult struct
+        fn __nvvm_warp_shuffle(mask: u32, mode: u32, a: u32, b: u32, c: u32) -> WarpShuffleResult;
+    }
+
+    assert!(
+        !(width & (width - 1)) != 0 && width <= 32,
+        "width must be a power of 2 and less than or equal to 32"
+    );
+
+    // mimicking nvcc's behavior
+    let mut c = 0;
+    c |= 0b11111;
+    c |= (32 - width) << 8;
+
+    let result = unsafe { __nvvm_warp_shuffle(mask, mode as u32, value, b, c) };
+    (result.value, result.predicate != 0)
+}
+
+unsafe fn warp_shuffle_128(
+    mode: WarpShuffleMode,
+    mask: u32,
+    value: u128,
+    b: u32,
+    width: u32,
+) -> (u128, bool) {
+    let first_half = value as u64;
+    let second_half = (value >> 64) as u64;
+    // shuffle the first and second half of the value then recombine them
+    // this will perform 4 shuffles in total (4 32-bit shuffles)
+    let (new_first_half, oob) = unsafe { warp_shuffle_64(mode, mask, first_half, b, width) };
+    let (new_second_half, _) = unsafe { warp_shuffle_64(mode, mask, second_half, b, width) };
+    (
+        ((new_second_half as u128) << 64) | (new_first_half as u128),
+        oob,
+    )
+}
+
+unsafe fn warp_shuffle_64(
+    mode: WarpShuffleMode,
+    mask: u32,
+    value: u64,
+    b: u32,
+    width: u32,
+) -> (u64, bool) {
+    let first_half = value as u32;
+    let second_half = (value >> 32) as u32;
+    // shuffle the first and second half of the value then recombine them
+    let (new_first_half, oob) = unsafe { warp_shuffle_32(mode, mask, first_half, b, width) };
+    let (new_second_half, _) = unsafe { warp_shuffle_32(mode, mask, second_half, b, width) };
+    (
+        ((new_second_half as u64) << 32) | (new_first_half as u64),
+        oob,
+    )
+}
+
+unsafe fn warp_shuffle_16(
+    mode: WarpShuffleMode,
+    mask: u32,
+    value: u16,
+    b: u32,
+    width: u32,
+) -> (u16, bool) {
+    let (value, oob) = unsafe { warp_shuffle_32(mode, mask, value as u32, b, width) };
+    ((value as u16), oob)
+}
+
+unsafe fn warp_shuffle_8(
+    mode: WarpShuffleMode,
+    mask: u32,
+    value: u8,
+    b: u32,
+    width: u32,
+) -> (u8, bool) {
+    let (value, oob) = unsafe { warp_shuffle_32(mode, mask, value as u32, b, width) };
+    ((value as u8), oob)
+}

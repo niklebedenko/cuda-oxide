@@ -9,6 +9,12 @@ description = "Device-side intrinsics and types for CUDA kernels in Rust"
 
 [dependencies]
 cuda-macros = { workspace = true }
+# no_std crate — disable half's default `std` feature. Not using the
+# workspace `half` dep because that one carries default features (`std`) for
+# the host crates and a workspace dep's `default-features` cannot be overridden
+# per-consumer. Keep the version in sync with the workspace dep (2.7).
+half = { version = "2.7", default-features = false }
+paste = "1"
 
 [dev-dependencies]
 trybuild = "1"
