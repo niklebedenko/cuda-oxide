@@ -270,26 +270,6 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     let constants = collect_cuda_module_constants(items, ident)?;
     let module_items = cuda_module_items_with_constant_symbols(items, &constants);
 
-    let non_generic_kernels = kernels.iter().filter(|kernel| !kernel.is_generic);
-    let function_fields = non_generic_kernels.clone().map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: ::cuda_core::CudaFunction,
-        }
-    });
-
-    let function_initializers = non_generic_kernels.map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        let marker = cuda_kernel_marker_name(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: module.load_function(<#marker as ::cuda_host::CudaKernel>::PTX_NAME)?,
-        }
-    });
-
     let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&kernels)?;
     let has_generic = kernels.iter().any(|k| k.is_generic);
     let module_loader = if has_generic {
@@ -362,7 +342,6 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                         ::std::collections::HashMap<&'static str, ::cuda_core::CudaFunction>
                     >
                 >,
-                #(#function_fields)*
                 #(#constant_fields)*
             }
 
@@ -389,7 +368,6 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                     __generic_functions: ::std::sync::Arc::new(
                         ::std::sync::Mutex::new(::std::collections::HashMap::new())
                     ),
-                    #(#function_initializers)*
                     #(#constant_initializers)*
                 })
             }
@@ -1341,9 +1319,23 @@ fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
             let __func = &__func_storage;
         }
     } else {
-        let field = cuda_module_function_field(&kernel.fn_name);
+        let marker = cuda_kernel_marker_name(&kernel.fn_name);
         quote! {
-            let __func = &self.#field;
+            let __ptx_name = <#marker as ::cuda_host::CudaKernel>::PTX_NAME;
+            let __func_storage = {
+                let mut __cache = self
+                    .__generic_functions
+                    .lock()
+                    .expect("cuda_module function cache poisoned");
+                if let Some(__func) = __cache.get(__ptx_name) {
+                    __func.clone()
+                } else {
+                    let __func = self.__module.load_function(__ptx_name)?;
+                    __cache.insert(__ptx_name, __func.clone());
+                    __func
+                }
+            };
+            let __func = &__func_storage;
         }
     }
 }
@@ -1416,10 +1408,6 @@ fn cuda_module_type_param_names(generics: &syn::Generics) -> Vec<Ident> {
             }
         })
         .collect()
-}
-
-fn cuda_module_function_field(fn_name: &Ident) -> Ident {
-    format_ident!("__{}_function", fn_name)
 }
 
 fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
