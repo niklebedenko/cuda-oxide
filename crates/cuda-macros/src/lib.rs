@@ -312,7 +312,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
             #[derive(Clone, Debug)]
             #[allow(non_snake_case)]
             pub struct LoadedModule {
-                __module: ::std::sync::Arc<::cuda_core::CudaModule>,
+                __modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
                 __generic_functions: ::std::sync::Arc<
                     ::std::sync::Mutex<
                         ::std::collections::HashMap<&'static str, ::cuda_core::CudaFunction>
@@ -339,8 +339,14 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
             pub fn from_module(
                 module: ::std::sync::Arc<::cuda_core::CudaModule>,
             ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                from_modules(::std::vec![module])
+            }
+
+            pub fn from_modules(
+                modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
                 Ok(LoadedModule {
-                    __module: module.clone(),
+                    __modules: modules,
                     __generic_functions: ::std::sync::Arc::new(
                         ::std::sync::Mutex::new(::std::collections::HashMap::new())
                     ),
@@ -352,7 +358,21 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
 
             impl LoadedModule {
                 pub fn as_cuda_module(&self) -> &::std::sync::Arc<::cuda_core::CudaModule> {
-                    &self.__module
+                    &self.__modules[0]
+                }
+
+                fn __load_function(
+                    &self,
+                    __ptx_name: &'static str,
+                ) -> ::core::result::Result<::cuda_core::CudaFunction, ::cuda_core::DriverError> {
+                    let mut __last_error = None;
+                    for __module in &self.__modules {
+                        match __module.load_function(__ptx_name) {
+                            Ok(__func) => return Ok(__func),
+                            Err(__error) => __last_error = Some(__error),
+                        }
+                    }
+                    Err(__last_error.expect("cuda_module LoadedModule must contain at least one CUDA module"))
                 }
 
                 #(#launch_methods)*
@@ -669,7 +689,22 @@ fn generate_cuda_module_constant_resolver_method(constant: &CudaModuleConstant) 
                 return ::core::result::Result::Ok(handle);
             }
 
-            let (dptr, size) = self.__module.get_global(#symbol_lit)?;
+            let (dptr, size) = {
+                let mut __last_error = None;
+                let mut __resolved = ::core::option::Option::None;
+                for __module in &self.__modules {
+                    match __module.get_global(#symbol_lit) {
+                        ::core::result::Result::Ok(__global) => {
+                            __resolved = ::core::option::Option::Some(__global);
+                            break;
+                        }
+                        ::core::result::Result::Err(__error) => __last_error = ::core::option::Option::Some(__error),
+                    }
+                }
+                __resolved.ok_or_else(|| {
+                    __last_error.expect("cuda_module LoadedModule must contain at least one CUDA module")
+                })?
+            };
             assert_eq!(
                 size,
                 ::core::mem::size_of::<#inner_ty>(),
@@ -739,7 +774,7 @@ fn generate_cuda_module_set_constant_method(constant: &CudaModuleConstant) -> To
             // `size_of::<#inner_ty>()`.
             unsafe {
                 handle.write_blocking(
-                    &self.__module,
+                    self.as_cuda_module(),
                     value as *const #inner_ty as *const u8,
                     ::core::mem::size_of::<#inner_ty>(),
                 )
@@ -1287,7 +1322,7 @@ fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
                 if let Some(__func) = __cache.get(__ptx_name) {
                     __func.clone()
                 } else {
-                    let __func = self.__module.load_function(__ptx_name)?;
+                    let __func = self.__load_function(__ptx_name)?;
                     __cache.insert(__ptx_name, __func.clone());
                     __func
                 }
@@ -1306,7 +1341,7 @@ fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
                 if let Some(__func) = __cache.get(__ptx_name) {
                     __func.clone()
                 } else {
-                    let __func = self.__module.load_function(__ptx_name)?;
+                    let __func = self.__load_function(__ptx_name)?;
                     __cache.insert(__ptx_name, __func.clone());
                     __func
                 }
