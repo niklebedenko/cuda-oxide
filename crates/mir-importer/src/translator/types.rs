@@ -128,11 +128,12 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
                 false
             }
         }
-        // Closures with no captures are ZST, closures with captures are not
+        // Closures with no captures are ZST, closures with captures are not.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, substs)) => {
-            // Check substs[2] which is the tuple of upvar types
-            if substs.0.len() >= 3
-                && let rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty) = &substs.0[2]
+            // The tupled-upvars type is the last closure generic arg:
+            // [parent_args.., closure_kind, closure_sig, tupled_upvars].
+            // Index 2 only works for closures with no parent generics.
+            if let Some(rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty)) = substs.0.last()
                 && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Tuple(
                     upvar_tys,
                 )) = upvar_tuple_ty.kind()
@@ -858,21 +859,21 @@ pub fn translate_type(
         // Handle Closure types
         // Closures are represented as structs with fields for each captured variable (upvar).
         // The substs for a closure contain:
-        //   [0] Internal marker type (usually i8)
-        //   [1] Function signature
-        //   [2] Tuple of upvar types (the captured variables)
+        //   [parent_args..] Captured parent generics, when the closure appears in a generic item
+        //   [n - 3] Closure kind
+        //   [n - 2] Function signature
+        //   [n - 1] Tuple of upvar types (the captured variables)
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(
             closure_def,
             substs,
         )) => {
             let closure_name = format!("{:?}", closure_def.def_id());
 
-            // Extract upvar types from substs[2] (the tuple of captured types)
+            // Extract upvar types from the tupled-upvars generic arg.
             let mut field_names = Vec::new();
             let mut field_types = Vec::new();
 
-            if substs.0.len() >= 3
-                && let rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty) = &substs.0[2]
+            if let Some(rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty)) = substs.0.last()
                 && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Tuple(
                     upvar_tys,
                 )) = upvar_tuple_ty.kind()
