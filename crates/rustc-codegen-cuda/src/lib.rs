@@ -376,6 +376,8 @@ pub struct CudaCodegenConfig {
     pub dump_llvm_dialect: bool,
     /// Override PTX output directory (defaults to current directory).
     pub ptx_output_dir: Option<std::path::PathBuf>,
+    /// If set, only run CUDA device lowering for these local crate names.
+    pub device_codegen_crate: Option<String>,
 }
 
 impl CudaCodegenConfig {
@@ -388,6 +390,7 @@ impl CudaCodegenConfig {
     /// | `CUDA_OXIDE_DUMP_MIR`       | `dump_mir_dialect`  |
     /// | `CUDA_OXIDE_DUMP_LLVM`      | `dump_llvm_dialect` |
     /// | `CUDA_OXIDE_PTX_DIR`        | `ptx_output_dir`    |
+    /// | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE` | `device_codegen_crate` |
     pub fn from_env() -> Self {
         Self {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
@@ -397,6 +400,7 @@ impl CudaCodegenConfig {
             ptx_output_dir: std::env::var("CUDA_OXIDE_PTX_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
+            device_codegen_crate: std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok(),
         }
     }
 }
@@ -473,11 +477,11 @@ impl CodegenBackend for CudaCodegenBackend {
             let device_fn_count =
                 collector::count_device_fns_in_cgus(tcx, mono_partitions.codegen_units);
             let has_device_code = kernel_count > 0 || device_fn_count > 0;
+            let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string();
             let mut artifact_objects = Vec::new();
 
             // Only log for crates that have device code (reduces noise from dependency crates)
             if self.config.verbose && has_device_code {
-                let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
                 eprintln!(
                     "[rustc_codegen_cuda] Compiling crate '{}': {} CGUs, {} kernel(s), {} device fn(s)",
                     crate_name,
@@ -489,6 +493,20 @@ impl CodegenBackend for CudaCodegenBackend {
 
             // Step 2: If device code exists, compile via cuda-oxide
             let _device_result = if has_device_code {
+                if self
+                    .config
+                    .device_codegen_crate
+                    .as_deref()
+                    .is_some_and(|selected| !selected_device_codegen_crate(selected, &crate_name))
+                {
+                    if self.config.verbose {
+                        eprintln!(
+                            "[rustc_codegen_cuda] Skipping device codegen for crate '{}' due to CUDA_OXIDE_DEVICE_CODEGEN_CRATE",
+                            crate_name
+                        );
+                    }
+                    None
+                } else {
                 if self.config.verbose {
                     eprintln!("[rustc_codegen_cuda] Compiling device code via cuda-oxide...");
                 }
@@ -520,7 +538,7 @@ impl CodegenBackend for CudaCodegenBackend {
                         output_dir: self.config.ptx_output_dir.clone().unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| ".".into())
                         }),
-                        output_name: tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string(),
+                        output_name: crate_name.clone(),
                         verbose: self.config.verbose,
                         dump_rustc_mir: self.config.dump_rustc_mir,
                         dump_mir_dialect: self.config.dump_mir_dialect,
@@ -647,6 +665,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             .fatal(format!("[rustc_codegen_cuda] Device codegen failed: {}", e));
                     }
                 }
+                }
             } else {
                 None
             };
@@ -769,6 +788,29 @@ fn write_device_artifact_object(
     ));
     std::fs::write(&object_path, object)?;
     Ok(object_path)
+}
+
+fn selected_device_codegen_crate(selected: &str, crate_name: &str) -> bool {
+    selected
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == crate_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_device_codegen_crate;
+
+    #[test]
+    fn selected_device_codegen_crate_matches_exact_trimmed_names() {
+        assert!(selected_device_codegen_crate("device_kernels", "device_kernels"));
+        assert!(selected_device_codegen_crate(
+            "host_support, device_kernels",
+            "device_kernels"
+        ));
+        assert!(!selected_device_codegen_crate("device_kernel", "device_kernels"));
+        assert!(!selected_device_codegen_crate("device_kernels_extra", "device_kernels"));
+    }
 }
 
 fn sanitize_path_component(name: &str) -> String {
