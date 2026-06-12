@@ -381,6 +381,246 @@ pub fn emit_cvt_f32x2_bf16x2(
     )
 }
 
+/// Emits `core::intrinsics::volatile_load::<T>(ptr)`, which backs
+/// `core::ptr::read_volatile`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_volatile_load(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::MirLoadOp;
+    use dialect_mir::types::MirPtrType;
+
+    if args.len() != 1 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "volatile_load expects 1 argument (ptr), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (ptr_val, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    let elem_ty = {
+        let ptr_ty = ptr_val.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+        match ptr_ty_obj.downcast_ref::<MirPtrType>() {
+            Some(mir_ptr) => mir_ptr.pointee,
+            None => {
+                return input_err!(
+                    loc.clone(),
+                    TranslationErr::unsupported(format!(
+                        "volatile_load: expected pointer operand, got {:?}",
+                        ptr_ty_obj
+                    ))
+                );
+            }
+        }
+    };
+
+    let load_op = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_val],
+        vec![],
+        0,
+    );
+    load_op.deref_mut(ctx).set_loc(loc.clone());
+    MirLoadOp::new(load_op).set_volatile(ctx, true);
+
+    if let Some(prev) = last_op {
+        load_op.insert_after(ctx, prev);
+    } else {
+        load_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let result = load_op.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        load_op,
+        value_map,
+        block_map,
+        loc,
+        "volatile_load call without target block",
+    )
+}
+
+/// Emits `core::intrinsics::ptr_offset_from_unsigned::<T>(this, other) -> usize`.
+///
+/// Computes `(this.addr() - other.addr()) / size_of::<T>()`. The intrinsic
+/// contract guarantees `this >= other` and an exact multiple.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_ptr_offset_from_unsigned(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use crate::translator::types;
+    use dialect_mir::ops::{MirConstantOp, MirDivOp, MirSubOp};
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::utils::apint::APInt;
+    use rustc_public::ty::{RigidTy, TyKind};
+    use std::num::NonZeroUsize;
+
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "ptr_offset_from_unsigned expects 2 arguments (this, other), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let arg0_ty = match &args[0] {
+        mir::Operand::Copy(place) | mir::Operand::Move(place) => place.ty(body.locals()).ok(),
+        mir::Operand::Constant(c) => Some(c.const_.ty()),
+        _ => None,
+    };
+    let pointee = arg0_ty.and_then(|ty| match ty.kind() {
+        TyKind::RigidTy(RigidTy::RawPtr(inner, _)) | TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
+            Some(inner)
+        }
+        _ => None,
+    });
+    let elem_size = pointee
+        .and_then(|t| t.layout().ok())
+        .map(|l| l.shape().size.bytes() as u64)
+        .unwrap_or(1)
+        .max(1);
+
+    let usize_type = types::get_usize_type(ctx);
+
+    let (this_ptr, op_a) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let cast_a = Operation::new(
+        ctx,
+        MirCastOp::get_concrete_op_info(),
+        vec![usize_type.to_ptr()],
+        vec![this_ptr],
+        vec![],
+        0,
+    );
+    cast_a.deref_mut(ctx).set_loc(loc.clone());
+    MirCastOp::new(cast_a).set_attr_cast_kind(ctx, MirCastKindAttr::PointerExposeAddress);
+    match op_a {
+        Some(prev) => cast_a.insert_after(ctx, prev),
+        None => cast_a.insert_at_front(block_ptr, ctx),
+    }
+    let a_val = cast_a.deref(ctx).get_result(0);
+
+    let (other_ptr, op_b) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        Some(cast_a),
+        loc.clone(),
+    )?;
+    let cast_b = Operation::new(
+        ctx,
+        MirCastOp::get_concrete_op_info(),
+        vec![usize_type.to_ptr()],
+        vec![other_ptr],
+        vec![],
+        0,
+    );
+    cast_b.deref_mut(ctx).set_loc(loc.clone());
+    MirCastOp::new(cast_b).set_attr_cast_kind(ctx, MirCastKindAttr::PointerExposeAddress);
+    cast_b.insert_after(ctx, op_b.unwrap_or(cast_a));
+    let b_val = cast_b.deref(ctx).get_result(0);
+
+    let sub_op = Operation::new(
+        ctx,
+        MirSubOp::get_concrete_op_info(),
+        vec![usize_type.to_ptr()],
+        vec![a_val, b_val],
+        vec![],
+        0,
+    );
+    sub_op.deref_mut(ctx).set_loc(loc.clone());
+    sub_op.insert_after(ctx, cast_b);
+    let diff_val = sub_op.deref(ctx).get_result(0);
+
+    let size_apint = APInt::from_i64(elem_size as i64, NonZeroUsize::new(64).unwrap());
+    let size_attr = IntegerAttr::new(usize_type, size_apint);
+    let size_const = Operation::new(
+        ctx,
+        MirConstantOp::get_concrete_op_info(),
+        vec![usize_type.to_ptr()],
+        vec![],
+        vec![],
+        0,
+    );
+    size_const.deref_mut(ctx).set_loc(loc.clone());
+    MirConstantOp::new(size_const).set_attr_value(ctx, size_attr);
+    size_const.insert_after(ctx, sub_op);
+    let size_val = size_const.deref(ctx).get_result(0);
+
+    let div_op = Operation::new(
+        ctx,
+        MirDivOp::get_concrete_op_info(),
+        vec![usize_type.to_ptr()],
+        vec![diff_val, size_val],
+        vec![],
+        0,
+    );
+    div_op.deref_mut(ctx).set_loc(loc.clone());
+    div_op.insert_after(ctx, size_const);
+    let result = div_op.deref(ctx).get_result(0);
+
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        div_op,
+        value_map,
+        block_map,
+        loc,
+        "ptr_offset_from_unsigned call without target block",
+    )
+}
+
 /// Emits `SharedArray::index()`: Compute pointer to element in shared memory.
 ///
 /// Computes `base_ptr + index` to get a pointer to the indexed element.

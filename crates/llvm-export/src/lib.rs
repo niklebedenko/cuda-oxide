@@ -138,6 +138,7 @@ pub mod ops {
     pub use pliron::builtin::ops::ConstantOp;
 
     use pliron::{
+        builtin::attributes::BoolAttr,
         context::{Context, Ptr},
         identifier::Identifier,
         op::Op,
@@ -184,6 +185,10 @@ pub mod ops {
     /// and emitted as `align N` during export.
     const OP_ALIGNMENT_KEY: &str = "cuda_oxide_op_alignment";
 
+    /// Op-attribute key used to preserve volatile load semantics through the
+    /// textual LLVM exporter.
+    const LOAD_VOLATILE_KEY: &str = "cuda_oxide_load_volatile";
+
     /// Stamp the ABI alignment (bytes) onto a memory op.
     pub fn set_op_alignment(ctx: &mut Context, op: Ptr<Operation>, align: u32) {
         let key = Identifier::try_new(OP_ALIGNMENT_KEY.to_string()).expect("valid identifier");
@@ -197,6 +202,33 @@ pub mod ops {
             .attributes
             .get::<AlignmentAttr>(&key)
             .map(|a| a.0)
+    }
+
+    /// Volatile helpers for upstream `LoadOp`, which has no native volatile flag.
+    pub trait LoadOpExt {
+        /// True if this load should export as `load volatile`.
+        fn is_volatile(&self, ctx: &Context) -> bool;
+        /// Mark this load for `load volatile` export.
+        fn set_volatile(&self, ctx: &mut Context, volatile: bool);
+    }
+
+    impl LoadOpExt for LoadOp {
+        fn is_volatile(&self, ctx: &Context) -> bool {
+            let key = Identifier::try_new(LOAD_VOLATILE_KEY.to_string()).expect("valid identifier");
+            self.get_operation()
+                .deref(ctx)
+                .attributes
+                .get::<BoolAttr>(&key)
+                .is_some_and(|attr| bool::from(attr.clone()))
+        }
+
+        fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
+            let key = Identifier::try_new(LOAD_VOLATILE_KEY.to_string()).expect("valid identifier");
+            self.get_operation()
+                .deref_mut(ctx)
+                .attributes
+                .set(key, BoolAttr::new(volatile));
+        }
     }
 
     /// Alignment helpers re-homed from the pre-migration local `GlobalOp`.

@@ -54,7 +54,7 @@ use dialect_mir::types::MirPtrType;
 use llvm_export::attributes::IntegerOverflowFlagsAttr;
 use llvm_export::op_interfaces::IntBinArithOpWithOverflowFlag;
 use llvm_export::ops as llvm;
-use llvm_export::ops::GlobalOpExt;
+use llvm_export::ops::{GlobalOpExt, LoadOpExt};
 use llvm_export::types::{ArrayType, FuncType, VoidType};
 use pliron::attribute::AttrObj;
 use pliron::builtin::attributes::IntegerAttr;
@@ -249,6 +249,9 @@ pub(crate) fn convert_load(
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    if dialect_mir::ops::MirLoadOp::new(op).is_volatile(ctx) {
+        llvm_load.set_volatile(ctx, true);
+    }
     copy_alignment(ctx, op, llvm_load.get_operation());
     rewriter.insert_operation(ctx, llvm_load.get_operation());
     rewriter.replace_operation(ctx, op, llvm_load.get_operation());

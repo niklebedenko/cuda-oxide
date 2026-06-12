@@ -8,8 +8,7 @@
 
 pub use cuda_macros::{
     address_space, cluster_launch, constant, convergent, cooperative_launch, cuda_module, device,
-    gpu_only, gpu_printf,
-    kernel, launch_bounds, pure, readonly,
+    gpu_only, gpu_printf, kernel, launch_bounds, pure, readonly,
 };
 
 // Re-export for convenience
