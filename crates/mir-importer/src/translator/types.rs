@@ -40,6 +40,27 @@ use pliron::{input_err_noloc, input_error_noloc};
 use rustc_public::CrateDef;
 use rustc_public_bridge::IndexedVal;
 
+fn tcx_normalize_projection(rust_ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    use rustc_middle::ty as mty;
+    use rustc_public::rustc_internal;
+
+    if !crate::tcx_scope::is_active() {
+        return None;
+    }
+
+    crate::tcx_scope::with_tcx(|tcx| {
+        let internal_ty: mty::Ty<'_> = rustc_internal::internal(tcx, *rust_ty);
+        let normalized: mty::Ty<'_> =
+            tcx.normalize_erasing_regions(mty::TypingEnv::fully_monomorphized(), internal_ty);
+
+        if normalized == internal_ty {
+            None
+        } else {
+            Some(rustc_internal::stable(normalized))
+        }
+    })
+}
+
 // Re-export types from dialect_mir for convenience
 pub use dialect_mir::types::{
     EnumVariant, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType, MirTupleType,
@@ -992,6 +1013,10 @@ pub fn translate_type(
             // the normalized type (destination place, or the signature of
             // the resolved `Instance`) rather than teaching this function
             // to guess what the projection resolves to.
+            if let Some(normalized_ty) = tcx_normalize_projection(rust_ty) {
+                return translate_type(ctx, &normalized_ty);
+            }
+
             input_err_noloc!(TranslationErr::unsupported(format!(
                 "Alias type not yet supported: {:?}",
                 alias_ty.def_id
