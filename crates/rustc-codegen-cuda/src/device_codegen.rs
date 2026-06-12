@@ -534,59 +534,61 @@ pub fn generate_device_code<'tcx>(
         .collect();
 
     let result = rustc_internal::run(tcx, || {
-        // Convert internal Instance<'tcx> to stable_mir Instance
-        let stable_functions: Vec<mir_importer::CollectedFunction> = functions
-            .iter()
-            .zip(export_names.iter())
-            .zip(debug_scope_maps.iter())
-            .zip(inline_always_flags.iter())
-            .map(
-                |(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
-                    // Use rustc_internal::stable() to convert the Instance.
-                    // This is the key bridge between rustc_middle and rustc_public types.
-                    let stable_instance = rustc_internal::stable(func.instance);
+        mir_importer::tcx_scope::set_tcx(tcx, || {
+            // Convert internal Instance<'tcx> to stable_mir Instance
+            let stable_functions: Vec<mir_importer::CollectedFunction> = functions
+                .iter()
+                .zip(export_names.iter())
+                .zip(debug_scope_maps.iter())
+                .zip(inline_always_flags.iter())
+                .map(
+                    |(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
+                        // Use rustc_internal::stable() to convert the Instance.
+                        // This is the key bridge between rustc_middle and rustc_public types.
+                        let stable_instance = rustc_internal::stable(func.instance);
 
-                    mir_importer::CollectedFunction {
-                        instance: stable_instance,
-                        is_kernel: *is_kernel,
-                        export_name: export_name.clone(),
-                        debug_source_scopes: Some(debug_source_scopes.clone()),
-                        is_inline_always: *is_inline_always,
-                    }
-                },
-            )
-            .collect();
+                        mir_importer::CollectedFunction {
+                            instance: stable_instance,
+                            is_kernel: *is_kernel,
+                            export_name: export_name.clone(),
+                            debug_source_scopes: Some(debug_source_scopes.clone()),
+                            is_inline_always: *is_inline_always,
+                        }
+                    },
+                )
+                .collect();
 
-        // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
-        let emit_nvvm_ir = std::env::var("CUDA_OXIDE_EMIT_NVVM_IR").is_ok();
+            // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
+            let emit_nvvm_ir = std::env::var("CUDA_OXIDE_EMIT_NVVM_IR").is_ok();
 
-        if verbose {
-            eprintln!(
-                "[device_codegen] Converted {} functions to stable_mir format",
-                stable_functions.len()
-            );
-            if emit_nvvm_ir {
-                eprintln!("[device_codegen] NVVM IR mode enabled");
+            if verbose {
+                eprintln!(
+                    "[device_codegen] Converted {} functions to stable_mir format",
+                    stable_functions.len()
+                );
+                if emit_nvvm_ir {
+                    eprintln!("[device_codegen] NVVM IR mode enabled");
+                }
             }
-        }
 
-        let debug_kind = device_debug_kind(tcx.sess.opts.debuginfo);
+            let debug_kind = device_debug_kind(tcx.sess.opts.debuginfo);
 
-        // Create pipeline config
-        let pipeline_config = mir_importer::PipelineConfig {
-            output_dir: output_dir.clone(),
-            output_name: output_name.clone(),
-            verbose,
-            show_mir_dialect: show_mir,
-            show_llvm_dialect: show_llvm,
-            emit_nvvm_ir,
-            debug_kind,
-        };
+            // Create pipeline config
+            let pipeline_config = mir_importer::PipelineConfig {
+                output_dir: output_dir.clone(),
+                output_name: output_name.clone(),
+                verbose,
+                show_mir_dialect: show_mir,
+                show_llvm_dialect: show_llvm,
+                emit_nvvm_ir,
+                debug_kind,
+            };
 
-        // Run the cuda-oxide pipeline!
-        // Rust MIR → `dialect-mir` → mem2reg → LLVM dialect → LLVM IR → PTX.
-        // Device externs are emitted as `declare` statements in LLVM IR
-        mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
+            // Run the cuda-oxide pipeline!
+            // Rust MIR → `dialect-mir` → mem2reg → LLVM dialect → LLVM IR → PTX.
+            // Device externs are emitted as `declare` statements in LLVM IR
+            mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
+        })
     });
 
     // Handle the result from rustc_internal::run.

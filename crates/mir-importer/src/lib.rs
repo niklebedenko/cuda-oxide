@@ -80,6 +80,7 @@ extern crate rustc_span;
 pub mod error;
 mod llvm_tools;
 pub mod pipeline;
+pub mod tcx_scope;
 pub mod translator;
 
 pub use error::{TranslationErr, TranslationResult};
