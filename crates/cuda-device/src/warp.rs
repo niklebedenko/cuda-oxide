@@ -720,3 +720,47 @@ unsafe fn warp_shuffle_8(
     let (value, oob) = unsafe { warp_shuffle_32(mode, mask, value as u32, b, width) };
     ((value as u8), oob)
 }
+
+// =============================================================================
+// Legacy `cuda_std::warp` free-function surface
+// =============================================================================
+
+/// Legacy `cuda_std::warp::sync_warp`: synchronize the lanes named in `mask`.
+///
+/// # Safety
+///
+/// Every lane named in `mask` must reach this call, else the warp deadlocks.
+#[inline(always)]
+pub unsafe fn sync_warp(mask: u32) {
+    sync_mask(mask);
+}
+
+/// Legacy `cuda_std::warp::warp_shuffle_xor`: butterfly shuffle.
+///
+/// # Safety
+///
+/// Every lane named in `mask` must reach this call.
+#[inline(always)]
+pub unsafe fn warp_shuffle_xor<T: WarpShuffleValue>(
+    mask: u32,
+    value: T,
+    lane_mask: u32,
+    width: u32,
+) -> (T, bool) {
+    unsafe { T::shuffle(WarpShuffleMode::Xor, mask, value, lane_mask, width) }
+}
+
+/// Legacy `cuda_std::warp::warp_shuffle_idx`: indexed shuffle.
+///
+/// # Safety
+///
+/// Every lane named in `mask` must reach this call.
+#[inline(always)]
+pub unsafe fn warp_shuffle_idx<T: WarpShuffleValue>(
+    mask: u32,
+    value: T,
+    src_lane: u32,
+    width: u32,
+) -> (T, bool) {
+    unsafe { T::shuffle(WarpShuffleMode::Idx, mask, value, src_lane, width) }
+}
