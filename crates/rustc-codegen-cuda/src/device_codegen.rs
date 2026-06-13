@@ -438,8 +438,7 @@ pub fn generate_device_code<'tcx>(
             let def_id = func.instance.def_id();
             matches!(
                 tcx.codegen_fn_attrs(def_id).inline,
-                rustc_hir::attrs::InlineAttr::Always
-                    | rustc_hir::attrs::InlineAttr::Force { .. }
+                rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
             )
         })
         .collect();

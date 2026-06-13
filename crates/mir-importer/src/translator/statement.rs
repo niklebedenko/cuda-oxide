@@ -639,6 +639,28 @@ pub fn translate_statement(
                         )
                     }
                     (
+                        mir::ProjectionElem::Field(..),
+                        mir::ProjectionElem::Index(_) | mir::ProjectionElem::ConstantIndex { .. },
+                    ) => {
+                        // `_local.field[i] = value`, e.g. a write into an
+                        // array field inside a scalar aggregate. The generic
+                        // address walker composes the field address with the
+                        // element address, so use the same store-through path
+                        // as deeper projections.
+                        store_through_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            result_value,
+                            rvalue_op_opt,
+                            last_inserted,
+                            prev_op,
+                            block_ptr,
+                            loc,
+                        )
+                    }
+                    (
                         mir::ProjectionElem::Index(_outer_index_local),
                         mir::ProjectionElem::Index(_inner_index_local),
                     ) => {

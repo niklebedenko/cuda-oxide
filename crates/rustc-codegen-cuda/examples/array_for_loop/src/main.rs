@@ -19,9 +19,8 @@
 //!   supported on the device; cuda-oxide does not yet emit device-side
 //!   `drop_in_place` calls.
 //!
-//! Two kernels cover the shapes from the issue: a `for` loop over a
-//! plain `[u32; 4]` and one over an array of Copy structs. Both sums are
-//! verified on the host.
+//! The kernels cover by-value array iteration, array helper closures/function
+//! items, and fieldless enum array constants. Results are verified on the host.
 //!
 //! Run: cargo oxide run array_for_loop
 
@@ -38,6 +37,17 @@ mod kernels {
     pub struct Point {
         pub x: u32,
         pub y: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Side {
+        Low,
+        High,
+    }
+
+    #[inline(always)]
+    fn triple(x: u32) -> u32 {
+        x * 3
     }
 
     /// Sum a by-value `[u32; 4]` with a `for` loop (the issue-138 shape).
@@ -74,6 +84,39 @@ mod kernels {
             *out_elem = acc;
         }
     }
+
+    /// `from_fn` and `map` exercise zero-capture closure and function-item
+    /// constants in `core::array` helpers. `SIDES` covers fieldless enum array
+    /// constants such as Impulse's `LowHigh::ALL`.
+    #[kernel]
+    pub fn array_helper_constants(mut out: DisjointSlice<u32>) {
+        let tid = thread::index_1d();
+        let t = tid.get() as u32;
+        if let Some(out_elem) = out.get_mut(tid) {
+            let generated: [u32; 4] = core::array::from_fn(|i| t + i as u32);
+            let tripled = generated.map(triple);
+            let shifted = generated.map(|x| x + 7);
+
+            const SIDES: [Side; 2] = [Side::Low, Side::High];
+            let mut side_score = 0;
+            for side in SIDES {
+                side_score += match side {
+                    Side::Low => 11,
+                    Side::High => 19,
+                };
+            }
+
+            *out_elem = tripled[0]
+                + tripled[1]
+                + tripled[2]
+                + tripled[3]
+                + shifted[0]
+                + shifted[1]
+                + shifted[2]
+                + shifted[3]
+                + side_score;
+        }
+    }
 }
 
 fn main() {
@@ -108,6 +151,12 @@ fn main() {
         .expect("launch sum_point_array");
     let got_pts = d_pts.to_host_vec(&stream).unwrap();
 
+    let mut d_helpers = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    module
+        .array_helper_constants(stream.as_ref(), cfg, &mut d_helpers)
+        .expect("launch array_helper_constants");
+    let got_helpers = d_helpers.to_host_vec(&stream).unwrap();
+
     let mut failures = 0usize;
     for tid in 0..N {
         let t = tid as u32;
@@ -129,10 +178,18 @@ fn main() {
             );
             failures += 1;
         }
+        let want_helpers = 16 * t + 82;
+        if got_helpers[tid] != want_helpers {
+            println!(
+                "FAIL tid={tid}: array_helper_constants={} expected={want_helpers}",
+                got_helpers[tid]
+            );
+            failures += 1;
+        }
     }
 
     if failures == 0 {
-        println!("array_for_loop: PASS ({N} threads, both array for-loops summed correctly)");
+        println!("array_for_loop: PASS ({N} threads, array iteration/helpers translated correctly)");
     } else {
         println!("array_for_loop: FAIL ({failures} mismatches)");
         std::process::exit(1);

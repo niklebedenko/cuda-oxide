@@ -25,6 +25,8 @@ cargo oxide new my_project          # scaffold a new cuda-oxide project
 cargo oxide new my_project --async  # scaffold with async template (tokio + cuda-async)
 cargo oxide run vecadd              # build + run an example
 cargo oxide build vecadd            # compile only (no run)
+cargo oxide build -- -p my_app      # arbitrary cargo build through cuda-oxide
+cargo oxide test -- -p my_app       # arbitrary cargo test through cuda-oxide
 cargo oxide pipeline vecadd         # verbose pipeline dump
                                     # (MIR -> dialect-mir -> LLVM dialect -> LLVM IR -> PTX)
 cargo oxide debug vecadd --tui      # build + launch cuda-gdb
@@ -39,9 +41,12 @@ cargo oxide setup                   # explicitly build the codegen backend
 | Flag              | Applies to           | Description                              |
 |-------------------|----------------------|------------------------------------------|
 | `--emit-nvvm-ir`  | run, build, pipeline | Generate NVVM IR for libNVVM             |
-| `--arch <sm_XX>`  | run, build, pipeline | Target architecture override             |
-| `--features <F>`  | run, build           | Comma-separated cargo features to enable |
-| `-v, --verbose`   | run, build           | Show detailed compilation output         |
+| `--arch <sm_XX>`  | run, build, test, pipeline | Target architecture override        |
+| `--features <F>`  | run, build examples  | Comma-separated cargo features to enable |
+| `--cargo-target-dir <PATH>` | build/test passthrough | Cargo target directory       |
+| `--device-codegen-crate <LIST>` | build/test passthrough | Device owner filter      |
+| `--device-cfg <NAME>` | build/test passthrough | Append `--cfg NAME` to rustflags |
+| `-v, --verbose`   | run, build, test     | Show detailed compilation output         |
 | `--async`         | new                  | Use the async template                   |
 | `--cgdb`          | debug                | Use cgdb instead of cuda-gdb             |
 | `--tui`           | debug                | Use GDB's TUI interface                  |
@@ -82,6 +87,26 @@ Same as `run` but stops after compilation. Useful for examples that require hard
 ```bash
 cargo oxide build htens          # compiles PTX, doesn't try to run on GPU
 cargo oxide build tcgen05        # sm_100a only, but PTX generation works anywhere
+```
+
+`build` also has a passthrough mode for normal Cargo workspaces. Put the Cargo
+arguments after `--`; cargo-oxide supplies the backend, target architecture,
+configured environment, and optional device owner filters.
+
+```bash
+cargo oxide build --arch sm_86 -- -p my_app --bin app --release
+cargo oxide build --cargo-target-dir target/cuda -- -p my_app --release
+```
+
+### `cargo oxide test`
+
+Runs arbitrary `cargo test` invocations through the cuda-oxide backend. Put all
+Cargo test arguments after `--`, including the test binary separator when
+needed.
+
+```bash
+cargo oxide test -- -p my_app --release --test gpu_smoke -- --nocapture
+cargo oxide test --device-codegen-crate gpu_smoke -- -p my_app --test gpu_smoke
 ```
 
 ### `cargo oxide pipeline <example>`
@@ -134,9 +159,22 @@ Explicitly builds (or rebuilds) the codegen backend. Normally this happens autom
 When `cargo oxide` needs the `librustc_codegen_cuda.so` backend, it searches in this order:
 
 1. **`CUDA_OXIDE_BACKEND` env var** — explicit path override
-2. **Local repo** — detects `crates/rustc-codegen-cuda` relative to workspace root, builds from source
-3. **Cached `.so`** — checks `~/.cargo/cuda-oxide/librustc_codegen_cuda.so`
-4. **Auto-fetch** — clones the cuda-oxide repo, builds, and caches (one-time)
+2. **Project config** — `.cargo/cuda-oxide.toml`
+3. **Local repo** — detects `crates/rustc-codegen-cuda` relative to workspace root, builds from source
+4. **Cached `.so`** — checks `~/.cargo/cuda-oxide/librustc_codegen_cuda.so`
+5. **Auto-fetch** — clones the cuda-oxide repo, builds, and caches (one-time)
+
+Project config can also provide the default architecture, extra rustflags, and
+child-process environment:
+
+```toml
+backend = "/path/to/librustc_codegen_cuda.so"
+default-arch = "sm_86"
+extra-rustflags = ["--cfg", "my_device_cfg"]
+
+[env]
+MY_BUILD_FLAG = "1"
+```
 
 ## Architecture
 
@@ -154,7 +192,6 @@ crates/cargo-oxide/
 | Command                         | Description                                             |
 |---------------------------------|---------------------------------------------------------|
 | `cargo oxide bench <example>`   | GPU profiling (nsys/ncu integration), report TFLOPS     |
-| `cargo oxide test`              | Run all examples as a test suite, report pass/fail      |
 | `cargo oxide clean`             | Remove generated PTX/LL/LTOIR artifacts and build caches|
 | `cargo oxide update`            | Update the cached codegen backend to latest version     |
 | `cargo oxide list`              | List examples with descriptions and hardware reqs       |

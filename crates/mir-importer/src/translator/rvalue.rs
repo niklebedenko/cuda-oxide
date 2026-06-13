@@ -39,7 +39,7 @@ use dialect_mir::ops::{
     MirCheckedSubOp, MirCmpOp, MirConstructArrayOp, MirConstructEnumOp, MirConstructStructOp,
     MirDivOp, MirEqOp, MirExtractFieldOp, MirGeOp, MirGlobalAllocOp, MirGtOp, MirLeOp, MirLoadOp,
     MirLtOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp, MirRemOp, MirShlOp,
-    MirShrOp, MirSubOp,
+    MirShrOp, MirSubOp, MirUndefOp,
 };
 use dialect_mir::types::MirFP16Type;
 use pliron::basic_block::BasicBlock;
@@ -942,27 +942,33 @@ pub fn translate_rvalue(
             // - Array construction: [a, b, c]
 
             match aggregate_kind {
-                mir::AggregateKind::Adt(adt_def, variant_idx, substs, _, _) => {
+                mir::AggregateKind::Adt(adt_def, variant_idx, substs, _, active_field_idx) => {
                     let adt_kind = adt_def.kind();
 
                     // Get the type using adt_def.ty_with_args()
                     let adt_ty_rust = adt_def.ty_with_args(substs);
                     let adt_ty = types::translate_type(ctx, &adt_ty_rust)?;
-                    let (field_values, current_prev_op) = translate_adt_aggregate_field_values(
-                        ctx,
-                        body,
-                        *adt_def,
-                        *variant_idx,
-                        substs,
-                        operands,
-                        value_map,
-                        block_ptr,
-                        prev_op,
-                        loc.clone(),
-                    )?;
+                    let translated_field_values = if matches!(adt_kind, AdtKind::Union) {
+                        None
+                    } else {
+                        Some(translate_adt_aggregate_field_values(
+                            ctx,
+                            body,
+                            *adt_def,
+                            *variant_idx,
+                            substs,
+                            operands,
+                            value_map,
+                            block_ptr,
+                            prev_op,
+                            loc.clone(),
+                        )?)
+                    };
 
                     match adt_kind {
                         AdtKind::Struct => {
+                            let (field_values, current_prev_op) = translated_field_values
+                                .expect("non-union ADT fields should have been translated");
                             // Check if the translated type is a struct type.
                             // Scalar-lowered newtypes like ThreadIndex are translated to
                             // their single runtime field type. They may still have ZST
@@ -1037,6 +1043,8 @@ pub fn translate_rvalue(
                             }
                         }
                         AdtKind::Enum => {
+                            let (field_values, current_prev_op) = translated_field_values
+                                .expect("non-union ADT fields should have been translated");
                             // Get the variant index for the enum
                             // NOTE: variant_idx IS the index (0, 1, 2, ...), NOT the discriminant!
                             // discriminant_for_variant returns the discriminant VALUE which may differ
@@ -1080,13 +1088,44 @@ pub fn translate_rvalue(
                             Ok((Some(op), result, prev_after_casts))
                         }
                         AdtKind::Union => {
-                            input_err!(
-                                loc,
-                                TranslationErr::unsupported(format!(
-                                    "Union aggregate not yet supported: {}",
-                                    adt_def.trimmed_name()
-                                ))
-                            )
+                            let (field_values, current_prev_op) =
+                                translate_union_aggregate_field_values(
+                                    ctx,
+                                    body,
+                                    *adt_def,
+                                    *variant_idx,
+                                    substs,
+                                    *active_field_idx,
+                                    operands,
+                                    value_map,
+                                    block_ptr,
+                                    prev_op,
+                                    loc.clone(),
+                                )?;
+
+                            let (casted_field_values, prev_after_casts) =
+                                cast_struct_fields_to_expected_types(
+                                    ctx,
+                                    field_values,
+                                    adt_ty,
+                                    block_ptr,
+                                    current_prev_op,
+                                    loc.clone(),
+                                );
+
+                            let op = Operation::new(
+                                ctx,
+                                MirConstructStructOp::get_concrete_op_info(),
+                                vec![adt_ty],
+                                casted_field_values,
+                                vec![],
+                                0,
+                            );
+                            op.deref_mut(ctx).set_loc(loc);
+
+                            let result = op.deref(ctx).get_result(0);
+
+                            Ok((Some(op), result, prev_after_casts))
                         }
                     }
                 }
@@ -1774,62 +1813,15 @@ pub fn translate_operand(
             if let Some(static_def) = static_def_from_constant(constant)?
                 && let Some((pointee_ty, is_mutable)) = get_static_pointer_info(&rust_ty)
             {
-                // All device-side statics — `#[constant]` and ordinary — must
-                // currently be zero-initialized. Lowering honored initializers
-                // into PTX `.const` (or `.global`) bytes is on the roadmap;
-                // for now use `ConstantMemory::UNINIT` and populate from host.
-                ensure_zero_initializer(&static_def, loc.clone())?;
-                let is_constant = is_constant_wrapper_type(&pointee_ty);
-
-                // Constants need the linker-visible mangled name (honors
-                // `#[export_name]`) so mir-lower can emit a matching LLVM
-                // symbol that the host resolves via `cuModuleGetGlobal`.
-                // Ordinary statics only need a unique key for in-pass
-                // deduplication, so we take the cheaper definition-path name.
-                let global_key: String = if is_constant {
-                    rustc_public::mir::mono::Instance::from(static_def)
-                        .mangled_name()
-                        .to_string()
-                } else {
-                    static_def.name()
-                };
-
-                let global_ty = types::translate_type(ctx, &pointee_ty)?;
-                let ptr_ty = if is_constant {
-                    dialect_mir::types::MirPtrType::get_constant(ctx, global_ty, is_mutable).into()
-                } else {
-                    dialect_mir::types::MirPtrType::get_global(ctx, global_ty, is_mutable).into()
-                };
-
-                let op = Operation::new(
+                return translate_static_global_pointer(
                     ctx,
-                    MirGlobalAllocOp::get_concrete_op_info(),
-                    vec![ptr_ty],
-                    vec![],
-                    vec![],
-                    0,
+                    &static_def,
+                    &pointee_ty,
+                    is_mutable,
+                    block_ptr,
+                    prev_op,
+                    loc.clone(),
                 );
-                op.deref_mut(ctx).set_loc(loc);
-
-                let global_alloc = MirGlobalAllocOp::new(op);
-
-                use pliron::builtin::attributes::{StringAttr, TypeAttr};
-                global_alloc.set_attr_global_type(ctx, TypeAttr::new(global_ty));
-                global_alloc.set_attr_global_key(ctx, StringAttr::new(global_key));
-
-                if let Some(alignment) = static_alignment(&static_def)? {
-                    global_alloc.set_alignment_value(ctx, alignment);
-                }
-
-                if let Some(prev) = prev_op {
-                    global_alloc.get_operation().insert_after(ctx, prev);
-                } else {
-                    global_alloc.get_operation().insert_at_front(block_ptr, ctx);
-                }
-
-                let val = global_alloc.get_operation().deref(ctx).get_result(0);
-
-                return Ok((val, Some(global_alloc.get_operation())));
             }
 
             let const_ty_ptr = types::translate_type(ctx, &rust_ty)?;
@@ -2300,19 +2292,48 @@ pub fn translate_operand(
                             })
                         }
                         GlobalAlloc::Static(static_def) => {
-                            let target_alloc = static_def.eval_initializer().map_err(|e| {
-                                input_error_noloc!(TranslationErr::unsupported(format!(
-                                    "Failed to evaluate static initializer for pointer constant: {:?}",
-                                    e
-                                )))
-                            })?;
-                            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
-                                target_alloc
-                                    .bytes
-                                    .iter()
-                                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
-                                    .collect::<Vec<u8>>()
-                            })
+                            if target_offset != 0 {
+                                return input_err!(
+                                    loc,
+                                    TranslationErr::unsupported(format!(
+                                        "Pointer constant to static {} has non-zero byte offset {}; static-offset lowering is not yet supported",
+                                        static_def.name(),
+                                        target_offset
+                                    ))
+                                );
+                            }
+
+                            let Some((pointee_rust_ty, static_is_mutable)) =
+                                get_static_pointer_info(&rust_ty)
+                            else {
+                                return input_err!(
+                                    loc,
+                                    TranslationErr::unsupported(format!(
+                                        "Pointer constant to static {} has unsupported Rust type: {:?}",
+                                        static_def.name(),
+                                        rust_ty
+                                    ))
+                                );
+                            };
+
+                            let (static_ptr, static_op) = translate_static_global_pointer(
+                                ctx,
+                                &static_def,
+                                &pointee_rust_ty,
+                                static_is_mutable,
+                                block_ptr,
+                                prev_op,
+                                loc.clone(),
+                            )?;
+                            let (casted_ptr, cast_op) = cast_to_generic_addrspace_if_needed(
+                                ctx,
+                                static_ptr,
+                                const_ty_ptr,
+                                block_ptr,
+                                static_op,
+                                loc.clone(),
+                            );
+                            return Ok((casted_ptr, cast_op));
                         }
                         other => {
                             return input_err!(
@@ -4454,9 +4475,11 @@ fn translate_ptr_to_array_constant(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
-    // Extract array type from the pointer type, then delegate to the shared
-    // value-producing helper. We wrap the resulting value with `MirRefOp` to
-    // recover the pointer.
+    // Extract array type from the pointer type. A pointer-to-array constant can
+    // outlive this function (for example a trait method returning
+    // `&'static [[f32; 2]; N]`), so lowering it as `array value + mir.ref`
+    // would return a pointer to function-local stack storage. Materialize it
+    // as an immutable device global instead.
     let array_ty = {
         let ty_obj = const_ty_ptr.deref(ctx);
         let ptr_ty = ty_obj
@@ -4482,41 +4505,45 @@ fn translate_ptr_to_array_constant(
         ptr_ty.pointee
     };
 
-    let (array_val, last_op) = translate_array_value_constant_inner(
-        ctx,
-        constant,
-        array_ty,
-        block_ptr,
-        prev_op,
-        loc.clone(),
-    )?;
-
-    use dialect_mir::ops::MirRefOp;
     use dialect_mir::types::MirPtrType;
+    use pliron::builtin::attributes::{StringAttr, TypeAttr};
 
-    let generic_ptr_ty = MirPtrType::get_generic(ctx, array_ty, false);
+    let bytes = constant_bytes(constant, "array", loc.clone())?;
+    let initializer_hex = bytes_to_hex(&bytes);
+    let global_key = promoted_constant_global_key(ctx, array_ty, &bytes);
+    let global_ptr_ty = MirPtrType::get_global(ctx, array_ty, false);
 
-    let ref_op = Operation::new(
+    let global_op = Operation::new(
         ctx,
-        MirRefOp::get_concrete_op_info(),
-        vec![generic_ptr_ty.into()],
-        vec![array_val],
+        MirGlobalAllocOp::get_concrete_op_info(),
+        vec![global_ptr_ty.into()],
+        vec![],
         vec![],
         0,
     );
-    ref_op.deref_mut(ctx).set_loc(loc);
+    global_op.deref_mut(ctx).set_loc(loc.clone());
 
-    let ref_op_wrapper = MirRefOp::new(ref_op);
-    ref_op_wrapper.set_mutable(ctx, false);
+    let global_alloc = MirGlobalAllocOp::new(global_op);
+    global_alloc.set_attr_global_type(ctx, TypeAttr::new(array_ty));
+    global_alloc.set_attr_global_key(ctx, StringAttr::new(global_key));
+    set_global_initializer_hex_attr(ctx, global_alloc.get_operation(), &initializer_hex);
 
-    if let Some(prev) = last_op {
-        ref_op.insert_after(ctx, prev);
+    if let Some(prev) = prev_op {
+        global_alloc.get_operation().insert_after(ctx, prev);
     } else {
-        ref_op.insert_at_front(block_ptr, ctx);
+        global_alloc.get_operation().insert_at_front(block_ptr, ctx);
     }
 
-    let ptr_val = ref_op.deref(ctx).get_result(0);
-    Ok((ptr_val, Some(ref_op)))
+    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
+    let (ptr_val, last_op) = cast_to_generic_addrspace_if_needed(
+        ctx,
+        global_ptr,
+        const_ty_ptr,
+        block_ptr,
+        Some(global_alloc.get_operation()),
+        loc,
+    );
+    Ok((ptr_val, last_op))
 }
 
 /// Lower a bare `MirArrayType` value constant (e.g. `const TABLE: [f32; N] =
@@ -4578,13 +4605,26 @@ fn array_constant_type_byte_size(
                 count, elem_size
             )))
         })
+    } else if let Some(enum_ty) = ty_obj.downcast_ref::<dialect_mir::types::MirEnumType>() {
+        if enum_ty.variant_field_counts.iter().all(|&count| count == 0) {
+            Ok(enum_ty.total_size as usize)
+        } else {
+            input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Array constant element type is a payload enum: {:?}. Supported enum array \
+                     constants must be fieldless.",
+                    ty_obj
+                ))
+            )
+        }
     } else {
         input_err!(
             loc,
             TranslationErr::unsupported(format!(
                 "Array constant element type is not supported: {:?}. Supported array constants \
-                 are primitive scalar elements (integers, f16, f32, f64) or nested arrays of \
-                 those.",
+                 are primitive scalar elements (integers, f16, f32, f64), fieldless enums, or \
+                 nested arrays of those.",
                 ty_obj
             ))
         )
@@ -4649,6 +4689,7 @@ fn build_array_op_from_bytes(
         F16,
         Int { width: u32, signedness: Signedness },
         Array,
+        FieldlessEnum,
     }
     let elem_kind = {
         let elem_obj = element_ty_ptr.deref(ctx);
@@ -4665,13 +4706,26 @@ fn build_array_op_from_bytes(
             }
         } else if elem_obj.is::<dialect_mir::types::MirArrayType>() {
             ElemKind::Array
+        } else if let Some(enum_ty) = elem_obj.downcast_ref::<dialect_mir::types::MirEnumType>() {
+            if enum_ty.variant_field_counts.iter().all(|&count| count == 0) {
+                ElemKind::FieldlessEnum
+            } else {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "Array constant element type is a payload enum: {:?}. Supported enum \
+                         array constants must be fieldless.",
+                        elem_obj
+                    ))
+                );
+            }
         } else {
             return input_err!(
                 loc,
                 TranslationErr::unsupported(format!(
                     "Array constant element type is not supported by byte lowering: {:?}. \
                      Supported array constants are primitive scalar elements (integers, f16, \
-                     f32, f64) or nested arrays of those.",
+                     f32, f64), fieldless enums, or nested arrays of those.",
                     elem_obj
                 ))
             );
@@ -4815,6 +4869,14 @@ fn build_array_op_from_bytes(
                 last_op,
                 loc.clone(),
             )?,
+            ElemKind::FieldlessEnum => build_fieldless_enum_op_from_bytes(
+                ctx,
+                element_ty_ptr,
+                chunk,
+                block_ptr,
+                last_op,
+                loc.clone(),
+            )?,
         };
 
         element_values.push(elem_val);
@@ -4841,6 +4903,64 @@ fn build_array_op_from_bytes(
 
     let array_val = construct_op.deref(ctx).get_result(0);
     Ok((array_val, last_op))
+}
+
+fn build_fieldless_enum_op_from_bytes(
+    ctx: &mut Context,
+    enum_ty_ptr: Ptr<TypeObj>,
+    bytes: &[u8],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let discr = read_uint_from_bytes(bytes) as u64;
+    let variant_index = {
+        let enum_obj = enum_ty_ptr.deref(ctx);
+        let enum_ty = enum_obj
+            .downcast_ref::<dialect_mir::types::MirEnumType>()
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(
+                    "build_fieldless_enum_op_from_bytes: expected enum type"
+                ))
+            })?;
+        enum_ty
+            .variant_discriminants
+            .iter()
+            .position(|&candidate| candidate == discr)
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(format!(
+                    "Fieldless enum array constant discriminant {} does not match enum '{}'",
+                    discr,
+                    enum_ty.name()
+                )))
+            })?
+    };
+
+    let op = Operation::new(
+        ctx,
+        MirConstructEnumOp::get_concrete_op_info(),
+        vec![enum_ty_ptr],
+        vec![],
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc);
+    let enum_op = MirConstructEnumOp::new(op);
+    enum_op.set_attr_construct_enum_variant_index(
+        ctx,
+        dialect_mir::attributes::VariantIndexAttr(variant_index as u32),
+    );
+
+    if let Some(prev) = prev_op {
+        enum_op.get_operation().insert_after(ctx, prev);
+    } else {
+        enum_op.get_operation().insert_at_front(block_ptr, ctx);
+    }
+
+    Ok((
+        enum_op.get_operation().deref(ctx).get_result(0),
+        Some(enum_op.get_operation()),
+    ))
 }
 
 /// Shared body for both `translate_ptr_to_array_constant` (which then wraps
@@ -4876,433 +4996,166 @@ fn translate_array_value_constant_inner(
 fn translate_struct_constant(
     ctx: &mut Context,
     constant: &mir::ConstOperand,
-    _rust_ty: &rustc_public::ty::Ty, // Reserved for future layout computation
+    rust_ty: &rustc_public::ty::Ty,
     const_ty_ptr: Ptr<TypeObj>,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
-    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+    let bytes = constant_bytes(constant, "struct", loc.clone())?;
+    translate_struct_constant_from_bytes(
+        ctx,
+        rust_ty,
+        const_ty_ptr,
+        &bytes,
+        block_ptr,
+        prev_op,
+        loc,
+    )
+}
 
-    // Get the struct type to access field information
-    // Clone field types to avoid borrow conflicts when we need to mutate ctx later
-    let field_types: Vec<Ptr<TypeObj>> = {
+/// Reconstruct a struct-like ADT constant from rustc layout bytes.
+///
+/// Unlike the historical decoder, this recurses through nested structs and
+/// arrays. That covers standard-library helpers like `core::array::try_from_fn`,
+/// whose constants contain aggregate fields rather than only scalar fields.
+fn translate_struct_constant_from_bytes(
+    ctx: &mut Context,
+    rust_ty: &rustc_public::ty::Ty,
+    const_ty_ptr: Ptr<TypeObj>,
+    bytes: &[u8],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let (field_types, field_offsets) = {
         let ty_obj = const_ty_ptr.deref(ctx);
         let struct_ty = ty_obj
             .downcast_ref::<dialect_mir::types::MirStructType>()
             .ok_or_else(|| {
                 input_error_noloc!(TranslationErr::unsupported(
-                    "translate_struct_constant called on non-struct type"
+                    "translate_struct_constant_from_bytes called on non-struct type"
                 ))
             })?;
-        struct_ty.field_types().to_vec()
+        (
+            struct_ty.field_types().to_vec(),
+            struct_ty.field_offsets().to_vec(),
+        )
     };
 
-    // Get the bytes from the constant's allocation.
-    // For promoted constants like &(8..16), the allocation contains a pointer
-    // (8 zero bytes with provenance) pointing to another allocation with the actual struct data.
-    // We need to follow the provenance to get the real struct bytes.
-    let bytes = match constant.const_.kind() {
-        ConstantKind::Allocated(alloc) => {
-            // Check if this allocation has provenance (i.e., it's a pointer to another allocation)
-            if let Some((_, prov)) = alloc.provenance.ptrs.first() {
-                // Follow the provenance to get the actual struct allocation
-                use rustc_public::mir::alloc::GlobalAlloc;
-                let alloc_id = prov.0;
-                match GlobalAlloc::from(alloc_id) {
-                    GlobalAlloc::Memory(target_alloc) => {
-                        target_alloc.raw_bytes().ok().unwrap_or_else(|| {
-                            target_alloc
-                                .bytes
-                                .iter()
-                                .map(|opt: &Option<u8>| opt.unwrap_or(0))
-                                .collect::<Vec<u8>>()
-                        })
-                    }
-                    GlobalAlloc::Static(static_def) => {
-                        let target_alloc = static_def.eval_initializer().map_err(|e| {
-                            input_error_noloc!(TranslationErr::unsupported(format!(
-                                "Failed to evaluate static initializer for struct constant: {:?}",
-                                e
-                            )))
-                        })?;
-                        target_alloc.raw_bytes().ok().unwrap_or_else(|| {
-                            target_alloc
-                                .bytes
-                                .iter()
-                                .map(|opt: &Option<u8>| opt.unwrap_or(0))
-                                .collect::<Vec<u8>>()
-                        })
-                    }
-                    other => {
-                        return input_err!(
-                            loc,
-                            TranslationErr::unsupported(format!(
-                                "Struct constant provenance points to non-memory allocation: {:?}",
-                                other
-                            ))
-                        );
-                    }
-                }
-            } else {
-                // No provenance - use bytes directly (inline struct constant)
-                alloc.raw_bytes().ok().unwrap_or_else(|| {
-                    alloc
-                        .bytes
-                        .iter()
-                        .map(|opt| opt.unwrap_or(0))
-                        .collect::<Vec<u8>>()
-                })
-            }
+    let (adt_def, substs) = match rust_ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, substs)) => {
+            (adt_def, substs)
         }
-        ConstantKind::ZeroSized => {
-            // ZeroSized structs have no bytes - this shouldn't happen for non-ZST structs
-            // but handle gracefully
-            vec![]
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
+            if field_types.is_empty() =>
+        {
+            return translate_zero_sized_constant_value(ctx, const_ty_ptr, block_ptr, prev_op, loc);
         }
-        _ => {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, _))
+            if field_types.is_empty() =>
+        {
+            return translate_zero_sized_constant_value(ctx, const_ty_ptr, block_ptr, prev_op, loc);
+        }
+        other => {
             return input_err!(
                 loc,
                 TranslationErr::unsupported(format!(
-                    "Struct constant must be Allocated, got: {:?}. \
-                     Consider using inline construction: `let s = MyStruct {{ field: value }};`",
-                    constant.const_.kind()
+                    "Struct constant expected Rust ADT type, got {:?}",
+                    other
                 ))
             );
         }
     };
 
-    // Parse field values from the bytes
-    let mut field_values = Vec::with_capacity(field_types.len());
-    let mut current_prev_op = prev_op;
-    let mut byte_offset = 0usize;
+    let variants = adt_def.variants();
+    let variant = variants.first().ok_or_else(|| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Struct-like constant '{}' has no variants",
+            adt_def.trimmed_name()
+        )))
+    })?;
+    let rust_fields = variant.fields();
 
-    for (field_idx, field_ty_ptr) in field_types.iter().copied().enumerate() {
-        // First, gather type information we need while holding immutable borrow
-        enum FieldTypeKind {
-            ZstStruct, // Struct ZST like PhantomData<T>
-            ZstTuple,  // Tuple ZST like ()
-            Integer { width: u32, signedness: Signedness },
-            Float16,
-            Float32,
-            Pointer,
-            Unsupported,
-        }
-
-        let field_kind = {
-            let field_ty = field_ty_ptr.deref(ctx);
-
-            // Check for ZST
-            if types::is_zst_type(ctx, field_ty_ptr) {
-                // Distinguish between struct ZSTs and tuple ZSTs
-                if field_ty.is::<dialect_mir::types::MirStructType>() {
-                    FieldTypeKind::ZstStruct
-                } else {
-                    FieldTypeKind::ZstTuple
-                }
-            } else if let Some(int_ty) = field_ty.downcast_ref::<IntegerType>() {
-                FieldTypeKind::Integer {
-                    width: int_ty.width(),
-                    signedness: int_ty.signedness(),
-                }
-            } else if field_ty.is::<MirFP16Type>() {
-                FieldTypeKind::Float16
-            } else if field_ty.is::<FP32Type>() {
-                FieldTypeKind::Float32
-            } else if field_ty.is::<dialect_mir::types::MirPtrType>() {
-                FieldTypeKind::Pointer
-            } else {
-                FieldTypeKind::Unsupported
-            }
-        };
-
-        // Now handle each field type kind with mutable operations
-        match field_kind {
-            FieldTypeKind::ZstStruct => {
-                // Struct ZST fields (like PhantomData<T>) produce empty struct values
-                let op = Operation::new(
-                    ctx,
-                    MirConstructStructOp::get_concrete_op_info(),
-                    vec![field_ty_ptr], // Use the actual struct type
-                    vec![],             // No operands for ZST
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                if let Some(prev) = current_prev_op {
-                    op.insert_after(ctx, prev);
-                } else {
-                    op.insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(op);
-                field_values.push(op.deref(ctx).get_result(0));
-                // ZST takes no bytes
-            }
-
-            FieldTypeKind::ZstTuple => {
-                // Tuple ZST fields produce empty tuple values
-                let empty_tuple_ty = dialect_mir::types::MirTupleType::get(ctx, vec![]).into();
-
-                use dialect_mir::ops::MirConstructTupleOp;
-                let op = Operation::new(
-                    ctx,
-                    MirConstructTupleOp::get_concrete_op_info(),
-                    vec![empty_tuple_ty],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                if let Some(prev) = current_prev_op {
-                    op.insert_after(ctx, prev);
-                } else {
-                    op.insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(op);
-                field_values.push(op.deref(ctx).get_result(0));
-                // ZST takes no bytes
-            }
-
-            FieldTypeKind::Integer { width, signedness } => {
-                let byte_size = (width as usize).div_ceil(8);
-
-                // Extract bytes for this field
-                let field_bytes = if byte_offset + byte_size <= bytes.len() {
-                    &bytes[byte_offset..byte_offset + byte_size]
-                } else {
-                    return input_err!(
-                        loc,
-                        TranslationErr::unsupported(format!(
-                            "Struct constant has insufficient bytes for field {} (need {} bytes at offset {}, have {})",
-                            field_idx,
-                            byte_size,
-                            byte_offset,
-                            bytes.len()
-                        ))
-                    );
-                };
-
-                let int_val = read_uint_from_bytes(field_bytes);
-
-                // Create the constant operation
-                let width_nz = NonZeroUsize::new(width as usize).unwrap();
-                let apint = APInt::from_u128(int_val, width_nz);
-                let int_attr = pliron::builtin::attributes::IntegerAttr::new(
-                    IntegerType::get(ctx, width, signedness),
-                    apint,
-                );
-
-                use dialect_mir::ops::MirConstantOp;
-                let op = Operation::new(
-                    ctx,
-                    MirConstantOp::get_concrete_op_info(),
-                    vec![field_ty_ptr],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                let const_op = MirConstantOp::new(op);
-                const_op.set_attr_value(ctx, int_attr);
-
-                if let Some(prev) = current_prev_op {
-                    const_op.get_operation().insert_after(ctx, prev);
-                } else {
-                    const_op.get_operation().insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(const_op.get_operation());
-                field_values.push(const_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
-            }
-
-            FieldTypeKind::Float16 => {
-                let byte_size = 2;
-
-                let field_bytes = if byte_offset + byte_size <= bytes.len() {
-                    &bytes[byte_offset..byte_offset + byte_size]
-                } else {
-                    return input_err!(
-                        loc,
-                        TranslationErr::unsupported(format!(
-                            "Struct constant has insufficient bytes for f16 field {}",
-                            field_idx
-                        ))
-                    );
-                };
-
-                let bits = read_uint_from_bytes(field_bytes) as u16;
-                let float_attr = MirFP16Attr::from_bits(bits);
-
-                use dialect_mir::ops::MirFloatConstantOp;
-                let op = Operation::new(
-                    ctx,
-                    MirFloatConstantOp::get_concrete_op_info(),
-                    vec![field_ty_ptr],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                let float_op = MirFloatConstantOp::new(op);
-                float_op.set_attr_float_value_f16(ctx, float_attr);
-
-                if let Some(prev) = current_prev_op {
-                    float_op.get_operation().insert_after(ctx, prev);
-                } else {
-                    float_op.get_operation().insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(float_op.get_operation());
-                field_values.push(float_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
-            }
-
-            FieldTypeKind::Float32 => {
-                let byte_size = 4;
-
-                let field_bytes = if byte_offset + byte_size <= bytes.len() {
-                    &bytes[byte_offset..byte_offset + byte_size]
-                } else {
-                    return input_err!(
-                        loc,
-                        TranslationErr::unsupported(format!(
-                            "Struct constant has insufficient bytes for f32 field {} (need {} bytes at offset {}, have {})",
-                            field_idx,
-                            byte_size,
-                            byte_offset,
-                            bytes.len()
-                        ))
-                    );
-                };
-
-                let float_val = f32::from_le_bytes([
-                    field_bytes[0],
-                    field_bytes[1],
-                    field_bytes[2],
-                    field_bytes[3],
-                ]);
-
-                let float_attr = pliron::builtin::attributes::FPSingleAttr::from(float_val);
-
-                use dialect_mir::ops::MirFloatConstantOp;
-                let op = Operation::new(
-                    ctx,
-                    MirFloatConstantOp::get_concrete_op_info(),
-                    vec![field_ty_ptr],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                let float_op = MirFloatConstantOp::new(op);
-                float_op.set_attr_float_value(ctx, float_attr);
-
-                if let Some(prev) = current_prev_op {
-                    float_op.get_operation().insert_after(ctx, prev);
-                } else {
-                    float_op.get_operation().insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(float_op.get_operation());
-                field_values.push(float_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
-            }
-
-            FieldTypeKind::Pointer => {
-                let byte_size = 8; // 64-bit pointers
-
-                let field_bytes = if byte_offset + byte_size <= bytes.len() {
-                    &bytes[byte_offset..byte_offset + byte_size]
-                } else {
-                    return input_err!(
-                        loc,
-                        TranslationErr::unsupported(format!(
-                            "Struct constant has insufficient bytes for pointer field {} (need {} bytes at offset {}, have {})",
-                            field_idx,
-                            byte_size,
-                            byte_offset,
-                            bytes.len()
-                        ))
-                    );
-                };
-
-                let mut ptr_val: u64 = 0;
-                for (i, &byte) in field_bytes.iter().enumerate() {
-                    ptr_val |= (byte as u64) << (i * 8);
-                }
-
-                // Create integer constant then cast to pointer
-                let i64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
-                let apint = APInt::from_u64(ptr_val, NonZeroUsize::new(64).unwrap());
-                let int_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, apint);
-
-                use dialect_mir::ops::MirConstantOp;
-                let op = Operation::new(
-                    ctx,
-                    MirConstantOp::get_concrete_op_info(),
-                    vec![i64_ty.into()],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                let const_op = MirConstantOp::new(op);
-                const_op.set_attr_value(ctx, int_attr);
-
-                if let Some(prev) = current_prev_op {
-                    const_op.get_operation().insert_after(ctx, prev);
-                } else {
-                    const_op.get_operation().insert_at_front(block_ptr, ctx);
-                }
-
-                // Cast to pointer type
-                use dialect_mir::ops::MirCastOp;
-                let const_value = const_op.get_operation().deref(ctx).get_result(0);
-                let cast_op = Operation::new(
-                    ctx,
-                    MirCastOp::get_concrete_op_info(),
-                    vec![field_ty_ptr],
-                    vec![const_value],
-                    vec![],
-                    0,
-                );
-                cast_op.deref_mut(ctx).set_loc(loc.clone());
-                MirCastOp::new(cast_op)
-                    .set_attr_cast_kind(ctx, MirCastKindAttr::PointerWithExposedProvenance);
-                cast_op.insert_after(ctx, const_op.get_operation());
-
-                current_prev_op = Some(cast_op);
-                field_values.push(cast_op.deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
-            }
-
-            FieldTypeKind::Unsupported => {
-                return input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Struct constant field {} has unsupported type. \
-                         Consider using inline construction instead of const.",
-                        field_idx
-                    ))
-                );
-            }
-        }
+    if field_types.len() != rust_fields.len() {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Struct constant '{}' has {} MIR fields but {} Rust fields",
+                adt_def.trimmed_name(),
+                field_types.len(),
+                rust_fields.len()
+            ))
+        );
     }
 
-    // Cast field values to expected types (address space normalization)
+    let has_field_offsets = field_offsets.len() == field_types.len();
+    let mut next_sequential_offset = 0usize;
+    let mut field_values = Vec::with_capacity(field_types.len());
+    let mut current_prev_op = prev_op;
+
+    for (field_idx, field_ty_ptr) in field_types.iter().copied().enumerate() {
+        let rust_field_ty = rust_fields[field_idx].ty_with_args(&substs);
+        let field_layout = rust_field_ty.layout().map_err(|e| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Failed to query layout for struct field {} of '{}': {:?}",
+                field_idx,
+                adt_def.trimmed_name(),
+                e
+            )))
+        })?;
+        let field_size = field_layout.shape().size.bytes() as usize;
+        let field_offset = if has_field_offsets {
+            field_offsets[field_idx] as usize
+        } else {
+            let offset = next_sequential_offset;
+            next_sequential_offset =
+                next_sequential_offset
+                    .checked_add(field_size)
+                    .ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Struct constant '{}' field offset overflowed",
+                            adt_def.trimmed_name()
+                        )))
+                    })?;
+            offset
+        };
+        let field_end = field_offset.checked_add(field_size).ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Struct constant '{}' field {} byte range overflowed",
+                adt_def.trimmed_name(),
+                field_idx
+            )))
+        })?;
+
+        if field_end > bytes.len() {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Struct constant '{}' has {} bytes, but field {} needs [{}..{})",
+                    adt_def.trimmed_name(),
+                    bytes.len(),
+                    field_idx,
+                    field_offset,
+                    field_end
+                ))
+            );
+        }
+
+        let field_bytes = &bytes[field_offset..field_end];
+        let (field_val, new_prev_op) = translate_constant_value_from_bytes(
+            ctx,
+            &rust_field_ty,
+            field_ty_ptr,
+            field_bytes,
+            block_ptr,
+            current_prev_op,
+            loc.clone(),
+        )?;
+        field_values.push(field_val);
+        current_prev_op = new_prev_op;
+    }
+
     let (casted_field_values, prev_after_casts) = cast_struct_fields_to_expected_types(
         ctx,
         field_values,
@@ -5312,7 +5165,6 @@ fn translate_struct_constant(
         loc.clone(),
     );
 
-    // Create the MirConstructStructOp with all field values
     let op = Operation::new(
         ctx,
         MirConstructStructOp::get_concrete_op_info(),
@@ -5324,6 +5176,106 @@ fn translate_struct_constant(
     op.deref_mut(ctx).set_loc(loc);
 
     if let Some(prev) = prev_after_casts {
+        op.insert_after(ctx, prev);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+
+    let val = op.deref(ctx).get_result(0);
+    Ok((val, Some(op)))
+}
+
+fn translate_array_value_from_bytes(
+    ctx: &mut Context,
+    rust_ty: &rustc_public::ty::Ty,
+    array_ty: Ptr<TypeObj>,
+    bytes: &[u8],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let (element_ty_ptr, element_count) = {
+        let arr_ty_obj = array_ty.deref(ctx);
+        let arr_ty = arr_ty_obj
+            .downcast_ref::<dialect_mir::types::MirArrayType>()
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(
+                    "translate_array_value_from_bytes: expected array type"
+                ))
+            })?;
+        (arr_ty.element_type(), arr_ty.size() as usize)
+    };
+
+    let rust_element_ty = match rust_ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Array(elem_ty, _)) => elem_ty,
+        other => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Array constant expected Rust array type, got {:?}",
+                    other
+                ))
+            );
+        }
+    };
+    let element_layout = rust_element_ty.layout().map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Failed to query array element layout: {:?}",
+            e
+        )))
+    })?;
+    let element_byte_size = element_layout.shape().size.bytes() as usize;
+    let expected_bytes = element_count
+        .checked_mul(element_byte_size)
+        .ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Array constant byte size overflowed: {} elements x {} bytes each",
+                element_count, element_byte_size
+            )))
+        })?;
+    if bytes.len() < expected_bytes {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Array constant has {} bytes but expected {} ({} elements x {} bytes each)",
+                bytes.len(),
+                expected_bytes,
+                element_count,
+                element_byte_size
+            ))
+        );
+    }
+
+    let mut element_values = Vec::with_capacity(element_count);
+    let mut current_prev_op = prev_op;
+    for i in 0..element_count {
+        let start = i * element_byte_size;
+        let end = start + element_byte_size;
+        let element_bytes = &bytes[start..end];
+        let (element_value, new_prev_op) = translate_constant_value_from_bytes(
+            ctx,
+            &rust_element_ty,
+            element_ty_ptr,
+            element_bytes,
+            block_ptr,
+            current_prev_op,
+            loc.clone(),
+        )?;
+        element_values.push(element_value);
+        current_prev_op = new_prev_op;
+    }
+
+    let op = Operation::new(
+        ctx,
+        MirConstructArrayOp::get_concrete_op_info(),
+        vec![array_ty],
+        element_values,
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc);
+
+    if let Some(prev) = current_prev_op {
         op.insert_after(ctx, prev);
     } else {
         op.insert_at_front(block_ptr, ctx);
@@ -5383,8 +5335,22 @@ fn translate_tuple_constant(
     }
 
     let bytes = constant_bytes(constant, "tuple", loc.clone())?;
+    let tuple_layout = rust_ty.layout().map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Failed to query tuple constant layout: {:?}",
+            e
+        )))
+    })?;
+    let tuple_field_offsets: Vec<usize> = match &tuple_layout.shape().fields {
+        rustc_public::abi::FieldsShape::Arbitrary { offsets } => offsets
+            .iter()
+            .map(|offset| offset.bytes() as usize)
+            .collect(),
+        _ => vec![],
+    };
+    let has_field_offsets = tuple_field_offsets.len() == field_types.len();
+    let mut next_sequential_offset = 0usize;
     let mut values = Vec::with_capacity(field_types.len());
-    let mut byte_offset = 0usize;
     let mut current_prev_op = prev_op;
 
     for (field_idx, (field_ty, rust_field_ty)) in field_types
@@ -5393,46 +5359,58 @@ fn translate_tuple_constant(
         .zip(rust_field_types.iter())
         .enumerate()
     {
-        let byte_size = constant_storage_size(ctx, field_ty).ok_or_else(|| {
-            input_error!(
-                loc.clone(),
-                TranslationErr::unsupported(format!(
-                    "Tuple constant field {} has unsupported type {:?}",
-                    field_idx,
-                    field_ty.deref(ctx)
-                ))
-            )
+        let field_layout = rust_field_ty.layout().map_err(|e| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Failed to query layout for tuple field {}: {:?}",
+                field_idx, e
+            )))
+        })?;
+        let field_size = field_layout.shape().size.bytes() as usize;
+        let field_offset = if has_field_offsets {
+            tuple_field_offsets[field_idx]
+        } else {
+            let offset = next_sequential_offset;
+            next_sequential_offset =
+                next_sequential_offset
+                    .checked_add(field_size)
+                    .ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(
+                            "Tuple constant field offset overflowed"
+                        ))
+                    })?;
+            offset
+        };
+        let field_end = field_offset.checked_add(field_size).ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Tuple constant field {} byte range overflowed",
+                field_idx
+            )))
         })?;
 
-        let field_bytes = if byte_size == 0 {
-            &[][..]
-        } else if byte_offset + byte_size <= bytes.len() {
-            &bytes[byte_offset..byte_offset + byte_size]
-        } else {
+        if field_end > bytes.len() {
             return input_err!(
                 loc,
                 TranslationErr::unsupported(format!(
-                    "Tuple constant has insufficient bytes for field {} (need {} bytes at offset {}, have {})",
+                    "Tuple constant has insufficient bytes for field {} (need [{}..{}), have {} bytes)",
                     field_idx,
-                    byte_size,
-                    byte_offset,
+                    field_offset,
+                    field_end,
                     bytes.len()
                 ))
             );
-        };
+        }
 
         let (value, new_prev_op) = translate_constant_value_from_bytes(
             ctx,
             rust_field_ty,
             field_ty,
-            field_bytes,
+            &bytes[field_offset..field_end],
             block_ptr,
             current_prev_op,
             loc.clone(),
         )?;
         values.push(value);
         current_prev_op = new_prev_op;
-        byte_offset += byte_size;
     }
 
     use dialect_mir::ops::MirConstructTupleOp;
@@ -5453,25 +5431,6 @@ fn translate_tuple_constant(
     }
 
     Ok((op.deref(ctx).get_result(0), Some(op)))
-}
-
-fn constant_storage_size(ctx: &Context, ty_ptr: Ptr<TypeObj>) -> Option<usize> {
-    let ty_ref = ty_ptr.deref(ctx);
-    if types::is_zst_type(ctx, ty_ptr) {
-        Some(0)
-    } else if let Some(int_ty) = ty_ref.downcast_ref::<IntegerType>() {
-        Some((int_ty.width() as usize).div_ceil(8))
-    } else if ty_ref.is::<MirFP16Type>() {
-        Some(2)
-    } else if ty_ref.is::<FP32Type>() {
-        Some(4)
-    } else if ty_ref.is::<FP64Type>() {
-        Some(8)
-    } else if ty_ref.is::<dialect_mir::types::MirPtrType>() {
-        Some(rustc_public::target::MachineInfo::target_pointer_width().bytes())
-    } else {
-        None
-    }
 }
 
 /// Translate an enum constant by reconstructing both its active variant and any
@@ -5669,6 +5628,26 @@ fn translate_constant_value_from_bytes(
     };
     if is_enum {
         return translate_enum_constant_from_bytes(
+            ctx, rust_ty, ty_ptr, bytes, block_ptr, prev_op, loc,
+        );
+    }
+
+    let is_array = {
+        let ty_ref = ty_ptr.deref(ctx);
+        ty_ref.is::<dialect_mir::types::MirArrayType>()
+    };
+    if is_array {
+        return translate_array_value_from_bytes(
+            ctx, rust_ty, ty_ptr, bytes, block_ptr, prev_op, loc,
+        );
+    }
+
+    let is_struct = {
+        let ty_ref = ty_ptr.deref(ctx);
+        ty_ref.is::<dialect_mir::types::MirStructType>()
+    };
+    if is_struct {
+        return translate_struct_constant_from_bytes(
             ctx, rust_ty, ty_ptr, bytes, block_ptr, prev_op, loc,
         );
     }
@@ -6114,6 +6093,97 @@ fn translate_adt_aggregate_field_values(
                 variant.name()
             ))
         );
+    }
+
+    Ok((field_values, current_prev_op))
+}
+
+/// Translate a union aggregate by materializing the active field and using
+/// `mir.undef` for inactive fields.
+///
+/// The MIR dialect represents rustc union ADTs with the same struct-like
+/// storage type used for single-variant ADTs. For union construction we only
+/// receive the active field operand, but downstream lowering still expects a
+/// value for every field slot.
+fn translate_union_aggregate_field_values(
+    ctx: &mut Context,
+    body: &mir::Body,
+    adt_def: rustc_public::ty::AdtDef,
+    variant_idx: rustc_public::ty::VariantIdx,
+    substs: &rustc_public::ty::GenericArgs,
+    active_field_idx: Option<usize>,
+    operands: &[mir::Operand],
+    value_map: &mut ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Vec<Value>, Option<Ptr<Operation>>)> {
+    let active_field_idx = active_field_idx.ok_or_else(|| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Union aggregate '{}' did not identify an active field",
+            adt_def.trimmed_name()
+        )))
+    })?;
+    let active_field_index = active_field_idx;
+
+    if operands.len() != 1 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Union aggregate '{}' expected exactly one operand for active field {}, found {}",
+                adt_def.trimmed_name(),
+                active_field_index,
+                operands.len()
+            ))
+        );
+    }
+
+    let variant_index = variant_idx.to_index();
+    let variant = &adt_def.variants()[variant_index];
+    let field_count = variant.fields().len();
+    if active_field_index >= field_count {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Union aggregate '{}' active field {} is out of bounds for {} fields",
+                adt_def.trimmed_name(),
+                active_field_index,
+                field_count
+            ))
+        );
+    }
+
+    let mut field_values = Vec::with_capacity(field_count);
+    let mut current_prev_op = prev_op;
+
+    for (field_index, field) in variant.fields().iter().enumerate() {
+        let field_rust_ty = field.ty_with_args(substs);
+        let translated_ty = types::translate_type(ctx, &field_rust_ty)?;
+
+        if field_index == active_field_index {
+            let (value, new_prev_op) = translate_operand(
+                ctx,
+                body,
+                &operands[0],
+                value_map,
+                block_ptr,
+                current_prev_op,
+                loc.clone(),
+            )?;
+            field_values.push(value);
+            current_prev_op = new_prev_op;
+            continue;
+        }
+
+        let undef_op = MirUndefOp::new(ctx, translated_ty).get_operation();
+        undef_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = current_prev_op {
+            undef_op.insert_after(ctx, prev);
+        } else {
+            undef_op.insert_at_front(block_ptr, ctx);
+        }
+        field_values.push(undef_op.deref(ctx).get_result(0));
+        current_prev_op = Some(undef_op);
     }
 
     Ok((field_values, current_prev_op))
@@ -6626,12 +6696,11 @@ fn static_def_from_constant(
     }
 }
 
-/// Ordinary device globals are currently emitted as `zeroinitializer`.
-/// Reject non-zero initializers until constant-data export is implemented.
-fn ensure_zero_initializer(
+/// Return rustc's evaluated static initializer bytes as lowercase hex.
+fn static_initializer_hex(
     static_def: &rustc_public::mir::mono::StaticDef,
-    loc: Location,
-) -> TranslationResult<()> {
+    _loc: Location,
+) -> TranslationResult<String> {
     let alloc = static_def.eval_initializer().map_err(|e| {
         input_error_noloc!(TranslationErr::unsupported(format!(
             "Failed to evaluate initializer for device static {}: {:?}",
@@ -6646,18 +6715,112 @@ fn ensure_zero_initializer(
             e
         )))
     })?;
+    Ok(bytes_to_hex(&bytes))
+}
 
-    if bytes.iter().all(|byte| *byte == 0) {
-        Ok(())
-    } else {
-        input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "Device static {} has a non-zero initializer; cuda-oxide currently supports zero-initialized device statics",
-                static_def.name()
-            ))
-        )
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
+    hex
+}
+
+fn promoted_constant_global_key(ctx: &Context, ty: Ptr<TypeObj>, bytes: &[u8]) -> String {
+    // FNV-1a keeps the key short while still deduplicating identical promoted
+    // array constants during one device-codegen pass.
+    fn update_hash(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let type_tag = format!("{:?}", ty.deref(ctx));
+    let type_hash = update_hash(0xcbf2_9ce4_8422_2325u64, type_tag.as_bytes());
+    format!(
+        "promoted_array_const_{}_0x{hash:016x}_0x{type_hash:016x}",
+        bytes.len()
+    )
+}
+
+fn translate_static_global_pointer(
+    ctx: &mut Context,
+    static_def: &rustc_public::mir::mono::StaticDef,
+    pointee_ty: &rustc_public::ty::Ty,
+    is_mutable: bool,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let initializer_hex = static_initializer_hex(static_def, loc.clone())?;
+    let is_constant = is_constant_wrapper_type(pointee_ty);
+
+    // Constants need the linker-visible mangled name (honors `#[export_name]`)
+    // so mir-lower can emit a matching LLVM symbol that the host resolves via
+    // `cuModuleGetGlobal`. Ordinary statics only need a unique key for in-pass
+    // deduplication, so we take the cheaper definition-path name.
+    let global_key: String = if is_constant {
+        rustc_public::mir::mono::Instance::from(*static_def)
+            .mangled_name()
+            .to_string()
+    } else {
+        static_def.name()
+    };
+
+    let global_ty = types::translate_type(ctx, pointee_ty)?;
+    let ptr_ty = if is_constant {
+        dialect_mir::types::MirPtrType::get_constant(ctx, global_ty, is_mutable).into()
+    } else {
+        dialect_mir::types::MirPtrType::get_global(ctx, global_ty, is_mutable).into()
+    };
+
+    let op = Operation::new(
+        ctx,
+        MirGlobalAllocOp::get_concrete_op_info(),
+        vec![ptr_ty],
+        vec![],
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc);
+
+    let global_alloc = MirGlobalAllocOp::new(op);
+
+    use pliron::builtin::attributes::{StringAttr, TypeAttr};
+    global_alloc.set_attr_global_type(ctx, TypeAttr::new(global_ty));
+    global_alloc.set_attr_global_key(ctx, StringAttr::new(global_key));
+    set_global_initializer_hex_attr(ctx, global_alloc.get_operation(), &initializer_hex);
+
+    if let Some(alignment) = static_alignment(static_def)? {
+        global_alloc.set_alignment_value(ctx, alignment);
+    }
+
+    if let Some(prev) = prev_op {
+        global_alloc.get_operation().insert_after(ctx, prev);
+    } else {
+        global_alloc.get_operation().insert_at_front(block_ptr, ctx);
+    }
+
+    let val = global_alloc.get_operation().deref(ctx).get_result(0);
+    Ok((val, Some(global_alloc.get_operation())))
+}
+
+fn set_global_initializer_hex_attr(ctx: &mut Context, op: Ptr<Operation>, initializer_hex: &str) {
+    use pliron::builtin::attributes::StringAttr;
+    use pliron::identifier::Identifier;
+
+    let key = Identifier::try_new("global_initializer_hex".to_string()).expect("valid identifier");
+    op.deref_mut(ctx)
+        .attributes
+        .set(key, StringAttr::new(initializer_hex.to_string()));
 }
 
 fn static_alignment(

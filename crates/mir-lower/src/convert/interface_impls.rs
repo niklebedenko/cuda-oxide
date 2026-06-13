@@ -1515,7 +1515,6 @@ impl MirToLlvmConversion for ShflSyncIdxI32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_idx_i32",
-            31,
         )
     }
 }
@@ -1534,7 +1533,6 @@ impl MirToLlvmConversion for ShflSyncBflyI32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_bfly_i32",
-            31,
         )
     }
 }
@@ -1553,7 +1551,6 @@ impl MirToLlvmConversion for ShflSyncDownI32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_down_i32",
-            31,
         )
     }
 }
@@ -1572,7 +1569,6 @@ impl MirToLlvmConversion for ShflSyncUpI32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_up_i32",
-            0,
         )
     }
 }
@@ -1591,7 +1587,6 @@ impl MirToLlvmConversion for ShflSyncIdxF32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_idx_f32",
-            31,
         )
     }
 }
@@ -1610,7 +1605,6 @@ impl MirToLlvmConversion for ShflSyncBflyF32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_bfly_f32",
-            31,
         )
     }
 }
@@ -1629,7 +1623,6 @@ impl MirToLlvmConversion for ShflSyncDownF32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_down_f32",
-            31,
         )
     }
 }
@@ -1648,7 +1641,6 @@ impl MirToLlvmConversion for ShflSyncUpF32Op {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_shfl_sync_up_f32",
-            0,
         )
     }
 }

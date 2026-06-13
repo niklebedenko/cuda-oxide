@@ -127,7 +127,7 @@
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::mir::mono::{CodegenUnit, MonoItem};
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{ConstOperand, ConstValue, Location, TerminatorKind};
+use rustc_middle::mir::{ConstOperand, ConstValue, Location, Operand, TerminatorKind};
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -573,6 +573,19 @@ impl<'tcx> Visitor<'tcx> for StrConstScan<'tcx> {
     }
 }
 
+struct FnDefConstScan<'tcx> {
+    found: Vec<(ConstOperand<'tcx>, Span)>,
+}
+
+impl<'tcx> Visitor<'tcx> for FnDefConstScan<'tcx> {
+    fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
+        if matches!(constant.const_.ty().kind(), TyKind::FnDef(..)) {
+            self.found.push((constant.clone(), constant.span));
+        }
+        self.super_const_operand(constant, location);
+    }
+}
+
 /// Provenance of a function discovered during the call-graph walk:
 /// which root (kernel or standalone device fn) the walk started from, and
 /// the nearest call site that still lives in user-written code.
@@ -855,9 +868,10 @@ impl<'tcx> DeviceCollector<'tcx> {
                     );
                 }
 
-                // Fail fast with an actionable diagnostic when this body
-                // contains panic-formatting machinery the device pipeline
-                // cannot compile (issue #76).
+                // Preserve actionable diagnostics for panic-only host stubs
+                // reached from device code. Ordinary panic-formatting blocks
+                // are handled by the MIR importer, which lowers them directly
+                // to `unreachable` without translating their formatting setup.
                 self.check_panic_machinery(mir, &func, &ctx);
 
                 // Walk all basic blocks looking for calls.
@@ -867,6 +881,12 @@ impl<'tcx> DeviceCollector<'tcx> {
                     if let Some(ref terminator) = bb_data.terminator {
                         self.process_terminator(terminator, mir, &func, &ctx);
                     }
+                }
+
+                let mut fn_def_scan = FnDefConstScan { found: Vec::new() };
+                fn_def_scan.visit_body(mir);
+                for (constant, span) in fn_def_scan.found {
+                    self.process_fn_def_constant(&constant, span, &func, &ctx);
                 }
             }
 
@@ -942,13 +962,13 @@ impl<'tcx> DeviceCollector<'tcx> {
         caller: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
     ) {
-        if let TerminatorKind::Call { func, .. } = &terminator.kind {
+        if let TerminatorKind::Call { func, args, .. } = &terminator.kind {
             // The span of the whole call expression, mapped back through
             // MIR inlining and macro expansion to the line the user wrote.
             // (The function operand's own span is reset to a dummy by MIR
             // inlining, so it is useless for diagnostics.)
             let call_span = outermost_user_span(mir, terminator.source_info);
-            self.process_call_operand(func, call_span, caller, ctx);
+            self.process_call_operand(func, args, mir, call_span, caller, ctx);
         }
     }
 
@@ -963,7 +983,9 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// `ctx` is the caller's discovery provenance, used for diagnostics.
     fn process_call_operand(
         &mut self,
-        func: &rustc_middle::mir::Operand<'tcx>,
+        func: &Operand<'tcx>,
+        call_args: &[rustc_span::Spanned<Operand<'tcx>>],
+        mir: &rustc_middle::mir::Body<'tcx>,
         call_span: Span,
         caller: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
@@ -976,7 +998,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         };
 
         let ty = const_op.const_.ty();
-        let TyKind::FnDef(def_id, args) = ty.kind() else {
+        let TyKind::FnDef(def_id, fn_args) = ty.kind() else {
             return;
         };
         let fn_path = self.tcx.def_path_str(*def_id);
@@ -1004,10 +1026,10 @@ impl<'tcx> DeviceCollector<'tcx> {
         //   Caller: cuda_oxide_kernel_<hash>_scale::<f32> (args = [f32])
         //   Call in MIR: scale<T>(...)  (args = [T])
         //   After substitution: scale::<f32> (args = [f32])
-        let args = self.tcx.instantiate_and_normalize_erasing_regions(
+        let resolved_fn_args = self.tcx.instantiate_and_normalize_erasing_regions(
             caller.instance.args,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(*args),
+            EarlyBinder::bind(*fn_args),
         );
 
         // Check if function is from a crate we should compile
@@ -1099,8 +1121,20 @@ impl<'tcx> DeviceCollector<'tcx> {
             || fn_name.contains("call_mut")
             || fn_name.ends_with("::call")
         {
+            if let Some(receiver) = call_args.first()
+                && let Some(function_item_instance) =
+                    self.resolve_function_item_receiver(&receiver.node, mir, caller)
+            {
+                self.enqueue_function_item_call(
+                    function_item_instance,
+                    call_span,
+                    caller,
+                    callee_ctx.clone(),
+                );
+            }
+
             // Check if any type arg is a closure
-            for arg in args.iter() {
+            for arg in resolved_fn_args.iter() {
                 if let Some(ty) = arg.as_type()
                     && let TyKind::Closure(closure_def_id, closure_substs) = ty.kind()
                 {
@@ -1142,7 +1176,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Try to resolve the instance with substitutions first, so we can
         // check if we've already seen THIS specific monomorphization
         let typing_env = TypingEnv::fully_monomorphized();
-        let Some(resolved) = Instance::try_resolve(self.tcx, typing_env, *def_id, args)
+        let Some(resolved) = Instance::try_resolve(self.tcx, typing_env, *def_id, resolved_fn_args)
             .ok()
             .flatten()
         else {
@@ -1239,6 +1273,155 @@ impl<'tcx> DeviceCollector<'tcx> {
 
         if self.verbose {
             eprintln!("[collector] Discovered callee: {} -> {}", name, export_name);
+        }
+
+        self.discovery.insert(mangled.clone(), callee_ctx);
+        self.seen.insert(mangled);
+        self.worklist.push_back(CollectedFunction {
+            instance: resolved,
+            is_kernel: false,
+            export_name,
+        });
+    }
+
+    fn process_fn_def_constant(
+        &mut self,
+        const_op: &ConstOperand<'tcx>,
+        span: Span,
+        caller: &CollectedFunction<'tcx>,
+        ctx: &DiscoveryCtx,
+    ) {
+        use rustc_middle::ty::EarlyBinder;
+
+        let ty = const_op.const_.ty();
+        let TyKind::FnDef(def_id, fn_args) = ty.kind() else {
+            return;
+        };
+
+        match self.should_collect_from_crate(*def_id) {
+            CollectDecision::Collect => {}
+            CollectDecision::SkipIntentional => return,
+            CollectDecision::Forbidden { .. } => return,
+        }
+
+        let typing_env = TypingEnv::fully_monomorphized();
+        let resolved_fn_args = self.tcx.instantiate_and_normalize_erasing_regions(
+            caller.instance.args,
+            typing_env,
+            EarlyBinder::bind(*fn_args),
+        );
+
+        let Some(resolved) = Instance::try_resolve(self.tcx, typing_env, *def_id, resolved_fn_args)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+
+        let callee_ctx = DiscoveryCtx {
+            root_name: ctx.root_name.clone(),
+            root_is_kernel: ctx.root_is_kernel,
+            user_span: if caller.instance.def_id().is_local() && !span.is_dummy() {
+                span.source_callsite()
+            } else {
+                ctx.user_span
+            },
+        };
+
+        self.enqueue_function_item_call(resolved, span, caller, callee_ctx);
+    }
+
+    /// Resolve the receiver of a `FnOnce`/`FnMut`/`Fn` trait-call shim when it
+    /// is a function item. Rust lowers calls through a generic
+    /// `Eval: FnOnce(...)` parameter to `<Eval as FnOnce>::call_once(self,
+    /// tuple)`. For `Eval = F::eval_dg_operator`, the MIR importer lowers that
+    /// shim to a direct call to the function item body, so the collector must
+    /// enqueue the same body or the lowered LLVM module has a dangling symbol.
+    fn resolve_function_item_receiver(
+        &self,
+        receiver: &Operand<'tcx>,
+        mir: &rustc_middle::mir::Body<'tcx>,
+        caller: &CollectedFunction<'tcx>,
+    ) -> Option<Instance<'tcx>> {
+        use rustc_middle::ty::EarlyBinder;
+
+        let raw_ty = receiver.ty(&mir.local_decls, self.tcx);
+        let typing_env = TypingEnv::fully_monomorphized();
+        let ty = self.tcx.instantiate_and_normalize_erasing_regions(
+            caller.instance.args,
+            typing_env,
+            EarlyBinder::bind(raw_ty),
+        );
+        let ty = match ty.kind() {
+            TyKind::Ref(_, inner, _) => *inner,
+            _ => ty,
+        };
+
+        let TyKind::FnDef(def_id, args) = ty.kind() else {
+            return None;
+        };
+
+        Instance::try_resolve(self.tcx, typing_env, *def_id, args)
+            .ok()
+            .flatten()
+    }
+
+    fn enqueue_function_item_call(
+        &mut self,
+        resolved: Instance<'tcx>,
+        call_span: Span,
+        caller: &CollectedFunction<'tcx>,
+        callee_ctx: DiscoveryCtx,
+    ) {
+        let mangled = self.tcx.symbol_name(resolved).name.to_string();
+        if self.seen.contains(&mangled) {
+            return;
+        }
+
+        if !is_fully_monomorphized(self.tcx, resolved) {
+            if self.verbose {
+                eprintln!(
+                    "[collector] Skipping non-monomorphized function-item receiver: {}",
+                    self.tcx.def_path_str(resolved.def_id())
+                );
+            }
+            return;
+        }
+
+        if !matches!(resolved.def, InstanceKind::Item(_)) {
+            return;
+        }
+
+        if !self.tcx.is_mir_available(resolved.def_id()) {
+            if self.verbose {
+                eprintln!(
+                    "[collector] Skipping function-item receiver without MIR: {}",
+                    self.tcx.def_path_str(resolved.def_id())
+                );
+            }
+            return;
+        }
+
+        if self.is_unreachable_body(resolved.def_id()) {
+            self.check_unreachable_callee(resolved, call_span, caller, &callee_ctx);
+            if self.verbose {
+                eprintln!(
+                    "[collector] Skipping unreachable function-item receiver: {}",
+                    self.tcx.def_path_str(resolved.def_id())
+                );
+            }
+            return;
+        }
+
+        let name = self.fqdn(resolved);
+        let export_name = sanitize_ptx_name(&mangled);
+        self.used_export_names.insert(export_name.clone());
+
+        if self.verbose {
+            eprintln!(
+                "[collector] Discovered function-item call target: {} -> {}",
+                name, export_name
+            );
         }
 
         self.discovery.insert(mangled.clone(), callee_ctx);
@@ -1651,22 +1834,14 @@ impl<'tcx> DeviceCollector<'tcx> {
             .emit()
     }
 
-    /// Diagnoses panic-formatting machinery inside a collected body
-    /// (issue #76).
+    /// Diagnoses panic-only host stubs inside a collected body.
     ///
     /// Called from [`collect`] for every function that is about to be
-    /// translated. A basic block that ends in a call into
-    /// `core::panicking` and *materializes a `&str` constant in a
-    /// statement* (the panic message, or pieces of a `format_args!`
-    /// template) cannot be translated: string constants in statements have
-    /// no device lowering, so the user would get an opaque
-    /// constant-translation error pointing into `core`. Report the real
-    /// situation instead.
-    ///
-    /// Panic calls whose message travels only in the call arguments are
-    /// left alone on purpose: diverging call arguments are dropped by the
-    /// translator and the call lowers to LLVM `unreachable`, which is the
-    /// supported behavior for conditional panics like `unwrap`.
+    /// translated. Ordinary panic paths, including formatted panic messages,
+    /// are lowered to `unreachable` by the MIR importer. The one case we still
+    /// reject here is a public cuda-device host stub such as
+    /// `thread::index_1d`; that means a helper was used from device code
+    /// without being marked `#[device]`.
     fn check_panic_machinery(
         &self,
         mir: &rustc_middle::mir::Body<'tcx>,
@@ -1741,35 +1916,6 @@ impl<'tcx> DeviceCollector<'tcx> {
                         "annotate the helper that calls `{stub}` with `#[device]`, or \
                          compute the index in the kernel and pass it in as a parameter"
                     ))
-                    .emit()
-            }
-
-            // A panic message materialized in a statement: translation of
-            // this body is guaranteed to fail, so error out with the likely
-            // causes instead.
-            if scan
-                .found
-                .iter()
-                .any(|(loc, _, _)| loc.statement_index < bb_data.statements.len())
-            {
-                self.tcx
-                    .dcx()
-                    .struct_span_fatal(
-                        user_span,
-                        "device code reaches a panic that builds a message string; \
-                         panic message formatting is not supported on the GPU",
-                    )
-                    .with_note(location_note)
-                    .with_note(
-                        "likely causes: a function used in device code without \
-                         `#[device]` (its body then resolves to a host-only stub that \
-                         panics), or a real panic path such as `panic!` / `assert!` / \
-                         `expect` with a message",
-                    )
-                    .with_help(
-                        "annotate device helpers with `#[device]`; for intentional \
-                         checks, branch and return instead of panicking with a message",
-                    )
                     .emit()
             }
         }

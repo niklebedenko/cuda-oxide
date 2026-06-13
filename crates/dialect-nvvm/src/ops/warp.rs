@@ -125,6 +125,7 @@ impl Verify for ReadPtxSregLaneIdOp {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i32): the value to share
 /// - `src_lane` (i32): the lane index to read from (0-31)
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -133,7 +134,7 @@ impl Verify for ReadPtxSregLaneIdOp {
     name = "nvvm.shfl_sync_idx_i32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncIdxI32Op;
 
@@ -156,6 +157,7 @@ impl ShflSyncIdxI32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i32): the value to exchange
 /// - `lane_mask` (i32): XOR mask for lane calculation
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -164,7 +166,7 @@ impl ShflSyncIdxI32Op {
     name = "nvvm.shfl_sync_bfly_i32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncBflyI32Op;
 
@@ -186,6 +188,7 @@ impl ShflSyncBflyI32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i32): the value to share
 /// - `delta` (i32): offset to add to lane ID
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -194,7 +197,7 @@ impl ShflSyncBflyI32Op {
     name = "nvvm.shfl_sync_down_i32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncDownI32Op;
 
@@ -216,6 +219,7 @@ impl ShflSyncDownI32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i32): the value to share
 /// - `delta` (i32): offset to subtract from lane ID
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -224,7 +228,7 @@ impl ShflSyncDownI32Op {
     name = "nvvm.shfl_sync_up_i32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncUpI32Op;
 
@@ -248,6 +252,7 @@ impl ShflSyncUpI32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (f32): the value to share
 /// - `src_lane` (i32): the lane index to read from (0-31)
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -256,7 +261,7 @@ impl ShflSyncUpI32Op {
     name = "nvvm.shfl_sync_idx_f32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncIdxF32Op;
 
@@ -276,6 +281,7 @@ impl ShflSyncIdxF32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (f32): the value to exchange
 /// - `lane_mask` (i32): XOR mask for lane calculation
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -284,7 +290,7 @@ impl ShflSyncIdxF32Op {
     name = "nvvm.shfl_sync_bfly_f32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncBflyF32Op;
 
@@ -304,6 +310,7 @@ impl ShflSyncBflyF32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (f32): the value to share
 /// - `delta` (i32): offset to add to lane ID
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -312,7 +319,7 @@ impl ShflSyncBflyF32Op {
     name = "nvvm.shfl_sync_down_f32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncDownF32Op;
 
@@ -332,6 +339,7 @@ impl ShflSyncDownF32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (f32): the value to share
 /// - `delta` (i32): offset to subtract from lane ID
+/// - `clamp` (i32): PTX shuffle clamp/segment value
 ///
 /// # Results
 ///
@@ -340,7 +348,7 @@ impl ShflSyncDownF32Op {
     name = "nvvm.shfl_sync_up_f32",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncUpF32Op;
 

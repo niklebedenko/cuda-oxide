@@ -16,10 +16,8 @@
 //! * `mir-importer::translator::terminator::intrinsics::float_math`
 //! * `mir-lower::convert::ops::call`
 //!
-//! the calls lower to libdevice `__nv_fmaxf` / `__nv_fmax` / `__nv_fminf`
-//! / `__nv_fmin`, which the auto-detected libNVVM + nvJitLink pipeline
-//! resolves transparently. This smoke check validates the full chain on a
-//! real GPU.
+//! the calls lower to LLVM `maxnum` / `minnum` intrinsics, which llc lowers
+//! directly to PTX. This smoke check validates the full chain on a real GPU.
 //!
 //! NaN inputs are passed in from the host rather than being embedded as
 //! `f32::NAN` literals in the kernel so the example stays focused on the
@@ -81,9 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
-    // The kernels use libdevice (`__nv_fmaxf` etc.), so cuda-oxide emits NVVM
-    // IR rather than PTX and `ltoir::load_kernel_module` finishes the build
-    // through libNVVM + nvJitLink, just like `primitive_stress`.
+    // `load_kernel_module` loads the PTX produced by llc directly here. The
+    // same helper also handles NVVM IR for examples that genuinely need
+    // libdevice.
     let module = ltoir::load_kernel_module(&ctx, "fmaxmin_smoke")?;
     let module = kernels::from_module(module)?;
     let cfg = LaunchConfig::for_num_elems(1);

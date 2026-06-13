@@ -61,7 +61,7 @@ pub mod intrinsics;
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
-use crate::translator::values::ValueMap;
+use crate::translator::values::{ValueMap, maybe_ptr_coerce};
 use dialect_mir::ops::{
     MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp, MirNotOp, MirReturnOp,
 };
@@ -117,7 +117,9 @@ pub fn translate_terminator(
     };
 
     match &term.kind {
-        mir::TerminatorKind::Return => translate_return(ctx, value_map, block_ptr, prev_op, loc),
+        mir::TerminatorKind::Return => {
+            translate_return(ctx, body, value_map, block_ptr, prev_op, loc)
+        }
 
         mir::TerminatorKind::Goto { target } => {
             translate_goto(ctx, *target, block_ptr, prev_op, block_map, loc)
@@ -213,6 +215,7 @@ pub fn translate_terminator(
 /// transfers control back to the caller with this value.
 fn translate_return(
     ctx: &mut Context,
+    body: &mir::Body,
     value_map: &mut ValueMap,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -223,24 +226,29 @@ fn translate_return(
     // pass it as the `mir.return` operand. ZSTs (including `()` kernel
     // returns) have no slot, so we simply emit a bare `return`.
     let return_local = mir::Local::from(0usize);
+    let return_decl = &body.locals()[return_local];
+    let return_type = types::translate_type(ctx, &return_decl.ty)?;
+    let is_unit_return = {
+        use dialect_mir::types::MirTupleType;
+        let return_type_obj = return_type.deref(ctx);
+        if let Some(tuple_ty) = return_type_obj.downcast_ref::<MirTupleType>() {
+            tuple_ty.get_types().is_empty()
+        } else {
+            false
+        }
+    };
     let loaded = value_map.load_local(ctx, return_local, block_ptr, prev_op);
 
     let (operands, terminator_prev_op) = match loaded {
         Some((load_op, val)) => {
-            use dialect_mir::types::MirTupleType;
-            let val_type = val.get_type(ctx);
-            let val_type_obj = val_type.deref(ctx);
-            if let Some(tuple_ty) = val_type_obj.downcast_ref::<MirTupleType>() {
-                if tuple_ty.get_types().is_empty() {
-                    // Unit return: the load we just emitted is dead, but
-                    // harmless; leave it as prev_op so the return chains
-                    // after it.
-                    (vec![], Some(load_op))
-                } else {
-                    (vec![val], Some(load_op))
-                }
+            if is_unit_return {
+                // Unit return: the load we just emitted is dead, but harmless;
+                // leave it as prev_op so the return chains after it.
+                (vec![], Some(load_op))
             } else {
-                (vec![val], Some(load_op))
+                let (val, prev_op) =
+                    maybe_ptr_coerce(ctx, val, return_type, block_ptr, Some(load_op));
+                (vec![val], prev_op)
             }
         }
         None => (vec![], prev_op),
@@ -906,28 +914,46 @@ fn translate_call(
         }
     }
 
-    // Handle genuine closure trait method calls. The receiver test matters:
-    // wrapper ADTs can carry a closure in their generic substitutions while
-    // still expecting the rust-call tuple as one argument.
+    // Handle callable trait method calls whose receiver is a concrete callable.
+    // The receiver test matters: wrapper ADTs can carry a closure or function
+    // item in their generic substitutions while still expecting the rust-call
+    // tuple as one argument.
     if let Some(ref name) = pattern_name
         && (name.contains("call_once") || name.contains("call_mut") || name.ends_with("::call"))
         && !args.is_empty()
-        && receiver_is_closure(&args[0], body)
     {
-        return translate_closure_call(
-            ctx,
-            body,
-            &call_name,
-            args,
-            destination,
-            &target_usize,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-            legaliser,
-        );
+        if receiver_is_closure(&args[0], body) {
+            return translate_closure_call(
+                ctx,
+                body,
+                &call_name,
+                args,
+                destination,
+                &target_usize,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+                legaliser,
+            );
+        }
+        if let Some(function_item_name) = extract_function_item_body_name(&args[0], body) {
+            return translate_function_item_call(
+                ctx,
+                body,
+                &function_item_name,
+                args,
+                destination,
+                &target_usize,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+                legaliser,
+            );
+        }
     }
 
     // Handle prof_trigger specially to extract const generic N
@@ -1220,6 +1246,134 @@ fn translate_call(
     )
 }
 
+/// Handle `FnOnce::call_once`, `FnMut::call_mut`, or `Fn::call` when the
+/// receiver is a function item, for example a generic helper invoked with
+/// `F::eval_dg_operator` as an `Eval: FnOnce(...)` argument.
+///
+/// Rust-call ABI still passes `(self, tuple_args)` to the trait shim, but the
+/// function item's real body expects only the tuple elements as ordinary
+/// arguments. Lowering the shim as an ordinary call leaves a dangling
+/// `<fn item as FnOnce>::call_once` symbol because no MIR body is collected for
+/// that shim.
+#[allow(clippy::too_many_arguments)]
+fn translate_function_item_call(
+    ctx: &mut Context,
+    body: &mir::Body,
+    function_item_name: &str,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    legaliser: &mut Legaliser,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirCallOp, MirExtractFieldOp};
+    use pliron::builtin::attributes::StringAttr;
+    use pliron::identifier::Identifier;
+
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let callee = legaliser.legalise(function_item_name).to_string();
+
+    let mut unpacked_args = Vec::new();
+    let mut last_op = prev_op;
+
+    if let Some(tuple_arg) = args.get(1) {
+        let (tuple_value, tuple_last_op) = rvalue::translate_operand(
+            ctx,
+            body,
+            tuple_arg,
+            value_map,
+            block_ptr,
+            last_op,
+            loc.clone(),
+        )?;
+        last_op = tuple_last_op;
+
+        let tuple_ty = tuple_value.get_type(ctx);
+        let element_types: Option<Vec<_>> = {
+            let tuple_ty_obj = tuple_ty.deref(ctx);
+            tuple_ty_obj
+                .downcast_ref::<dialect_mir::types::MirTupleType>()
+                .map(|mir_tuple_ty| mir_tuple_ty.get_types().to_vec())
+        };
+
+        if let Some(element_types) = element_types {
+            for (i, elem_ty) in element_types.iter().enumerate() {
+                let extract_op = Operation::new(
+                    ctx,
+                    MirExtractFieldOp::get_concrete_op_info(),
+                    vec![*elem_ty],
+                    vec![tuple_value],
+                    vec![],
+                    0,
+                );
+                extract_op.deref_mut(ctx).set_loc(loc.clone());
+
+                let mir_extract = MirExtractFieldOp::new(extract_op);
+                mir_extract.set_attr_index(ctx, dialect_mir::attributes::FieldIndexAttr(i as u32));
+
+                if let Some(prev) = last_op {
+                    extract_op.insert_after(ctx, prev);
+                } else {
+                    extract_op.insert_at_front(block_ptr, ctx);
+                }
+                last_op = Some(extract_op);
+                unpacked_args.push(extract_op.deref(ctx).get_result(0));
+            }
+        } else {
+            unpacked_args.push(tuple_value);
+        }
+    }
+
+    let call_op = Operation::new(
+        ctx,
+        MirCallOp::get_concrete_op_info(),
+        vec![return_type],
+        unpacked_args,
+        vec![],
+        0,
+    );
+    call_op.deref_mut(ctx).set_loc(loc.clone());
+
+    let callee_attr = StringAttr::new(callee);
+    call_op
+        .deref_mut(ctx)
+        .attributes
+        .set(Identifier::try_from("callee").unwrap(), callee_attr);
+
+    if let Some(prev) = last_op {
+        call_op.insert_after(ctx, prev);
+    } else {
+        call_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let result_value = call_op.deref(ctx).get_result(0);
+    let last_inserted = value_map
+        .store_local(
+            ctx,
+            destination.local,
+            result_value,
+            block_ptr,
+            Some(call_op),
+        )
+        .unwrap_or(call_op);
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(
+            ctx,
+            *target_idx,
+            last_inserted,
+            block_map,
+            loc,
+        ))
+    } else {
+        Ok(call_op)
+    }
+}
+
 /// Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call).
 ///
 /// These calls pass arguments as a tuple, but the closure body expects unpacked args:
@@ -1454,17 +1608,8 @@ fn translate_closure_call(
 
 /// True only when the rust-call receiver is itself a closure.
 fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
-    let ty = match receiver {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            let local: usize = place.local;
-            let local_decls: Vec<_> = body.local_decls().collect();
-            match local_decls.get(local).map(|(_, decl)| decl.ty) {
-                Some(ty) => ty,
-                None => return false,
-            }
-        }
-        mir::Operand::Constant(const_op) => const_op.const_.ty(),
-        _ => return false,
+    let Some(ty) = operand_type(receiver, body) else {
+        return false;
     };
 
     let inner = match ty.kind() {
@@ -1476,6 +1621,36 @@ fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
         inner.kind(),
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
     )
+}
+
+fn extract_function_item_body_name(receiver: &mir::Operand, body: &mir::Body) -> Option<String> {
+    let ty = operand_type(receiver, body)?;
+    let inner = match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
+        _ => ty,
+    };
+
+    let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, substs)) =
+        inner.kind()
+    else {
+        return None;
+    };
+
+    rustc_public::mir::mono::Instance::resolve(fn_def, &substs)
+        .ok()
+        .map(|instance| instance.mangled_name())
+}
+
+fn operand_type(receiver: &mir::Operand, body: &mir::Body) -> Option<rustc_public::ty::Ty> {
+    match receiver {
+        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
+            let local: usize = place.local;
+            let local_decls: Vec<_> = body.local_decls().collect();
+            local_decls.get(local).map(|(_, decl)| decl.ty)
+        }
+        mir::Operand::Constant(const_op) => Some(const_op.const_.ty()),
+        _ => None,
+    }
 }
 
 /// Extracts the closure body's mangled name from a closure operand.
@@ -2478,10 +2653,25 @@ fn try_dispatch_intrinsic(
         "cuda_device::warp::sync_mask" => Ok(Some(intrinsics::warp::emit_warp_sync_mask(
             ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
         )?)),
+        name if name.ends_with("::WarpShuffleValue::shuffle") => {
+            Ok(Some(intrinsics::warp::emit_warp_shuffle_value_trait(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
         "cuda_device::warp::shuffle_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
             ctx,
             body,
             dialect_nvvm::ops::ShflSyncIdxI32Op::get_concrete_op_info(),
+            0x1f,
             args,
             destination,
             target,
@@ -2495,6 +2685,7 @@ fn try_dispatch_intrinsic(
             ctx,
             body,
             dialect_nvvm::ops::ShflSyncUpI32Op::get_concrete_op_info(),
+            0,
             args,
             destination,
             target,
@@ -2509,6 +2700,7 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 dialect_nvvm::ops::ShflSyncDownI32Op::get_concrete_op_info(),
+                0x1f,
                 args,
                 destination,
                 target,
@@ -2523,6 +2715,7 @@ fn try_dispatch_intrinsic(
             ctx,
             body,
             dialect_nvvm::ops::ShflSyncBflyI32Op::get_concrete_op_info(),
+            0x1f,
             args,
             destination,
             target,
@@ -2536,6 +2729,7 @@ fn try_dispatch_intrinsic(
             ctx,
             body,
             dialect_nvvm::ops::ShflSyncIdxF32Op::get_concrete_op_info(),
+            0x1f,
             args,
             destination,
             target,
@@ -2550,6 +2744,7 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 dialect_nvvm::ops::ShflSyncUpF32Op::get_concrete_op_info(),
+                0,
                 args,
                 destination,
                 target,
@@ -2565,6 +2760,7 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 dialect_nvvm::ops::ShflSyncDownF32Op::get_concrete_op_info(),
+                0x1f,
                 args,
                 destination,
                 target,
@@ -2580,6 +2776,7 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 dialect_nvvm::ops::ShflSyncBflyF32Op::get_concrete_op_info(),
+                0x1f,
                 args,
                 destination,
                 target,

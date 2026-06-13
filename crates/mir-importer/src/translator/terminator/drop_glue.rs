@@ -45,9 +45,10 @@
 //! `UbChecks` flag, which is off for device builds) do not have to be
 //! proven; only code that can actually execute does.
 
+use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::mono::Instance;
-use rustc_public::ty::{RigidTy, Ty, TyKind};
+use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind};
 
 /// Cap on the call-chain depth the proof is willing to follow. Real
 /// no-op drop glue is shallow (the `IntoIter` case above is two levels:
@@ -62,8 +63,30 @@ const MAX_PROOF_DEPTH: usize = 16;
 /// `dropped_ty` must be fully monomorphized (no generic parameters
 /// left), which holds for every body the importer translates.
 pub(super) fn drop_glue_is_noop(dropped_ty: Ty) -> bool {
+    if array_drain_drop_is_noop(dropped_ty) {
+        return true;
+    }
+
     let instance = Instance::resolve_drop_in_place(dropped_ty);
     instance_is_noop(&instance, &mut Vec::new())
+}
+
+/// `core::array::map`/`try_map` lowers through `std::array::drain::Drain`.
+/// The destructor only matters when the source element type needs drop; for
+/// `Copy`/no-drop elements, dropping the remaining range is unobservable.
+fn array_drain_drop_is_noop(dropped_ty: Ty) -> bool {
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, args)) = dropped_ty.kind() else {
+        return false;
+    };
+    if adt_def.trimmed_name() != "Drain" {
+        return false;
+    }
+
+    let Some(GenericArgKind::Type(element_ty)) = args.0.get(2) else {
+        return false;
+    };
+    let element_drop = Instance::resolve_drop_in_place(*element_ty);
+    instance_is_noop(&element_drop, &mut Vec::new())
 }
 
 /// Proves that calling `instance` does nothing observable.
