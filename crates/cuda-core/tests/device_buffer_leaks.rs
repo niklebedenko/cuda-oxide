@@ -62,6 +62,41 @@ fn ctx_strong_count_returns_to_baseline_after_buffer_lifecycle() {
     );
 }
 
+#[test]
+fn into_raw_parts_transfers_context_without_leaking_a_clone() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+    let baseline = Arc::strong_count(&ctx);
+
+    {
+        let buf =
+            DeviceBuffer::<u8>::zeroed(&stream, 16).expect("zeroed failed before into_raw_parts");
+        stream
+            .synchronize()
+            .expect("failed to drain initialization before raw free");
+
+        let (ptr, len, raw_ctx) = buf.into_raw_parts();
+        assert_eq!(len, 16);
+        assert_eq!(
+            Arc::strong_count(&ctx),
+            baseline + 1,
+            "into_raw_parts must transfer, not clone-and-leak, the buffer context"
+        );
+
+        raw_ctx
+            .bind_to_thread()
+            .expect("failed to bind context before raw free");
+        let rc = unsafe { cuda_bindings::cuMemFree_v2(ptr) };
+        assert_eq!(rc, 0, "raw cuMemFree failed: {rc}");
+    }
+
+    assert_eq!(
+        Arc::strong_count(&ctx),
+        baseline,
+        "raw context handle must drop back to baseline"
+    );
+}
+
 /// Repeated construct/drop cycles must not bleed device memory.
 ///
 /// This cannot deterministically force the async-enqueue failure that

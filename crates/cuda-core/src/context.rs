@@ -17,7 +17,7 @@
 //! callers do not need to manage the context stack manually.
 
 use crate::error::{DriverError, IntoResult};
-use crate::stream::CudaStream;
+use crate::stream::{CudaStream, CudaStreamInner};
 use std::ffi::c_int;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -179,8 +179,10 @@ impl CudaContext {
     /// pointer, which the driver interprets as the default stream.
     pub fn default_stream(self: &Arc<Self>) -> Arc<CudaStream> {
         Arc::new(CudaStream {
-            cu_stream: std::ptr::null_mut(),
-            ctx: self.clone(),
+            inner: Arc::new(CudaStreamInner {
+                cu_stream: std::ptr::null_mut(),
+                ctx: self.clone(),
+            }),
         })
     }
 
@@ -208,8 +210,10 @@ impl CudaContext {
             cu_stream.assume_init()
         };
         Ok(Arc::new(CudaStream {
-            cu_stream,
-            ctx: self.clone(),
+            inner: Arc::new(CudaStreamInner {
+                cu_stream,
+                ctx: self.clone(),
+            }),
         }))
     }
 

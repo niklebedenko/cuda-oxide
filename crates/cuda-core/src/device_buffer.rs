@@ -7,9 +7,13 @@
 //!
 //! [`DeviceBuffer<T>`] is analogous to `Vec<T>` on the host: it owns a
 //! contiguous allocation of `len` elements on the device and frees it on
-//! drop. Unlike cudarc's `CudaSlice`, the buffer carries no stream reference
-//! and no hidden event tracking -- the stream is an explicit parameter on
-//! every transfer operation, making data-flow and synchronization transparent.
+//! drop. Synchronously allocated buffers carry no hidden stream dependency.
+//! Buffers allocated through [`DeviceBuffer::uninitialized_async`] retain a
+//! private owner for the allocation stream so a later [`Drop`] never frees
+//! through a destroyed stream handle. Ordinary [`Drop`] for async allocations
+//! synchronizes the context before freeing, so cross-stream uses complete
+//! before the allocation is released. Transfer operations still take an
+//! explicit stream, keeping data-flow and synchronization transparent.
 //!
 //! # Quick start
 //!
@@ -28,9 +32,9 @@ use std::sync::Arc;
 use cuda_bindings::{CUdeviceptr, CUstream};
 
 use crate::context::CudaContext;
-use crate::error::DriverError;
+use crate::error::{DriverError, IntoResult};
 use crate::pinned_host_buffer::PinnedHostBuffer;
-use crate::stream::CudaStream;
+use crate::stream::{CudaStream, CudaStreamInner};
 
 /// Marker trait for values that can be safely copied between host and device
 /// memory as raw bytes.
@@ -166,10 +170,11 @@ pub struct DeviceBuffer<T> {
     _marker: PhantomData<T>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum AllocationKind {
     Sync,
-    Async { stream: CUstream },
+    AsyncRaw { stream: CUstream },
+    Async { stream: Arc<CudaStreamInner> },
 }
 
 // SAFETY: CUdeviceptr is a u64 handle valid across threads when the owning
@@ -183,10 +188,17 @@ impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if self.ptr != 0 {
             self.ctx.record_err(self.ctx.bind_to_thread());
-            let result = match self.allocation {
+            let result = match &self.allocation {
                 AllocationKind::Sync => unsafe { crate::memory::free_sync(self.ptr) },
+                AllocationKind::AsyncRaw { .. } => match self.ctx.synchronize() {
+                    Ok(()) => unsafe { crate::memory::free_sync(self.ptr) },
+                    Err(err) => Err(err),
+                },
                 AllocationKind::Async { stream } => unsafe {
-                    crate::memory::free_async(self.ptr, stream)
+                    match self.ctx.synchronize() {
+                        Ok(()) => crate::memory::free_async(self.ptr, stream.cu_stream),
+                        Err(err) => Err(err),
+                    }
                 },
             };
             self.ctx.record_err(result);
@@ -251,10 +263,16 @@ impl<T> DeviceBuffer<T> {
     /// - `ptr` must have been allocated via `cuMemAllocAsync` with at least
     ///   `len * size_of::<T>()` bytes.
     /// - `ptr` must belong to the same CUDA context as `ctx`.
-    /// - `stream` must be valid for the allocation's context until the buffer
-    ///   is dropped or consumed by [`Self::drop_async`].
-    /// - The caller transfers ownership -- `ptr` will be freed with
-    ///   [`crate::memory::free_async`] on drop.
+    /// - `stream` must be the stream used to allocate `ptr`, or a stream that
+    ///   is already correctly ordered after that allocation.
+    /// - Because this raw-handle compatibility constructor cannot retain a safe
+    ///   stream owner, the caller must keep `stream` valid until the buffer is
+    ///   consumed by [`Self::drop_async`]. Ordinary [`Drop`] does not use the
+    ///   raw stream; it synchronizes the context before freeing `ptr`
+    ///   synchronously. Prefer
+    ///   [`Self::from_raw_parts_async_on_stream`] when a safe [`CudaStream`]
+    ///   reference is available and stream-ordered drop is required.
+    /// - The caller transfers ownership.
     pub unsafe fn from_raw_parts_async(
         ptr: CUdeviceptr,
         len: usize,
@@ -265,7 +283,36 @@ impl<T> DeviceBuffer<T> {
             ptr,
             len,
             ctx,
-            allocation: AllocationKind::Async { stream },
+            allocation: AllocationKind::AsyncRaw { stream },
+            _marker: PhantomData,
+        }
+    }
+
+    /// Constructs a `DeviceBuffer` from pre-existing async raw parts while
+    /// retaining the allocation stream for stream-ordered drop.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been allocated via `cuMemAllocAsync` with at least
+    ///   `len * size_of::<T>()` bytes.
+    /// - `ptr` must belong to the same CUDA context as `stream`.
+    /// - `stream` must be the stream used to allocate `ptr`, or a stream that
+    ///   is already correctly ordered after that allocation.
+    /// - The caller transfers ownership -- `ptr` will be freed with
+    ///   [`crate::memory::free_async`] on drop.
+    pub unsafe fn from_raw_parts_async_on_stream(
+        ptr: CUdeviceptr,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Self {
+        let ctx = stream.context().clone();
+        Self {
+            ptr,
+            len,
+            ctx,
+            allocation: AllocationKind::Async {
+                stream: stream.retain_inner(),
+            },
             _marker: PhantomData,
         }
     }
@@ -273,11 +320,16 @@ impl<T> DeviceBuffer<T> {
     /// Consumes the buffer and returns the raw parts without freeing.
     ///
     /// The caller is responsible for eventually freeing `ptr` with the same
-    /// allocator family used to create the buffer.
+    /// allocator family used to create the buffer. For async buffers, this
+    /// releases any retained allocation stream; callers taking raw ownership
+    /// must preserve any required stream ordering themselves.
     pub fn into_raw_parts(self) -> (CUdeviceptr, usize, Arc<CudaContext>) {
-        let parts = (self.ptr, self.len, self.ctx.clone());
-        std::mem::forget(self);
-        parts
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` will not be dropped, so move the context Arc out and
+        // explicitly drop non-raw ownership fields that are not returned.
+        let ctx = unsafe { std::ptr::read(&this.ctx) };
+        unsafe { std::ptr::drop_in_place(&mut this.allocation) };
+        (this.ptr, this.len, ctx)
     }
 }
 
@@ -606,7 +658,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             len,
             ctx,
             allocation: AllocationKind::Async {
-                stream: stream.cu_stream(),
+                stream: stream.retain_inner(),
             },
             _marker: PhantomData,
         })
@@ -683,23 +735,65 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
 
     /// Consumes the buffer and frees it asynchronously on `stream`.
     ///
-    /// Use this for buffers whose lifetime must be ordered relative to in-flight
-    /// stream work.
+    /// Use this for buffers whose lifetime must be ordered relative to
+    /// in-flight stream work. CUDA accepts stream-ordered frees for both
+    /// synchronously and asynchronously allocated device pointers.
+    ///
+    /// Fallible pre-free ordering steps return before the buffer is consumed,
+    /// so ordinary [`Drop`] remains responsible for cleanup. Once ownership is
+    /// disarmed immediately before `cuMemFreeAsync`, any enqueue failure leaks
+    /// the allocation instead of falling back to an unordered free while the
+    /// caller's stream may contain pending last-use work.
     pub fn drop_async(mut self, stream: &CudaStream) -> Result<(), DriverError> {
         if self.ptr == 0 {
             return Ok(());
         }
-
-        match self.allocation {
-            AllocationKind::Async { .. } => {
-                let ptr = self.ptr;
-                self.ptr = 0;
-                unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
-            }
-            AllocationKind::Sync => Err(DriverError(
-                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-            )),
+        if self.ctx.as_ref() != stream.context().as_ref() {
+            return Err(DriverError(
+                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_CONTEXT,
+            ));
         }
+        stream.context().bind_to_thread()?;
+        match &self.allocation {
+            AllocationKind::Sync => {}
+            AllocationKind::AsyncRaw {
+                stream: allocation_stream,
+            } => {
+                if *allocation_stream != stream.cu_stream() {
+                    let event = stream.context().new_event(None)?;
+                    unsafe {
+                        cuda_bindings::cuEventRecord(event.cu_event(), *allocation_stream)
+                            .result()?;
+                        cuda_bindings::cuStreamWaitEvent(
+                            stream.cu_stream(),
+                            event.cu_event(),
+                            cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT,
+                        )
+                        .result()?;
+                    }
+                }
+            }
+            AllocationKind::Async {
+                stream: allocation_stream,
+            } => {
+                if allocation_stream.cu_stream != stream.cu_stream() {
+                    let event = stream.context().new_event(None)?;
+                    unsafe {
+                        cuda_bindings::cuEventRecord(event.cu_event(), allocation_stream.cu_stream)
+                            .result()?;
+                        cuda_bindings::cuStreamWaitEvent(
+                            stream.cu_stream(),
+                            event.cu_event(),
+                            cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT,
+                        )
+                        .result()?;
+                    }
+                }
+            }
+        }
+        let ptr = self.ptr;
+        self.ptr = 0;
+        unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
     }
 
     /// Zeroes every byte in the buffer asynchronously on `stream`.
