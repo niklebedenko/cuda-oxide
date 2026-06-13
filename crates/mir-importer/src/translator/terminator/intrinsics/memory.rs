@@ -468,6 +468,87 @@ pub fn emit_volatile_load(
     )
 }
 
+/// Emits `core::intrinsics::volatile_store::<T>(ptr, value)`, which backs
+/// `core::ptr::write_volatile`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_volatile_store(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::MirStoreOp;
+    use dialect_mir::types::MirPtrType;
+
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "volatile_store expects 2 arguments (ptr, value), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (ptr_val, op_a) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    {
+        let ptr_ty = ptr_val.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+        if ptr_ty_obj.downcast_ref::<MirPtrType>().is_none() {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "volatile_store: expected pointer operand, got {:?}",
+                    ptr_ty_obj
+                ))
+            );
+        }
+    }
+
+    let (value, op_b) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, op_a, loc.clone())?;
+
+    let store_op = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_val, value],
+        vec![],
+        0,
+    );
+    store_op.deref_mut(ctx).set_loc(loc.clone());
+    MirStoreOp::new(store_op).set_volatile(ctx, true);
+
+    if let Some(prev) = op_b {
+        store_op.insert_after(ctx, prev);
+    } else {
+        store_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if let Some(target_idx) = target {
+        Ok(emit_goto(ctx, *target_idx, store_op, block_map, loc))
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported("volatile_store call without target block".to_string())
+        )
+    }
+}
+
 /// Emits `core::intrinsics::ptr_offset_from_unsigned::<T>(this, other) -> usize`.
 ///
 /// Computes `(this.addr() - other.addr()) / size_of::<T>()`. The intrinsic
@@ -485,6 +566,70 @@ pub fn emit_ptr_offset_from_unsigned(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
+    emit_ptr_offset_from_impl(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        false,
+        "ptr_offset_from_unsigned",
+        "ptr_offset_from_unsigned call without target block",
+    )
+}
+
+/// Emits `core::intrinsics::ptr_offset_from::<T>(this, other) -> isize`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_ptr_offset_from(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_ptr_offset_from_impl(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        true,
+        "ptr_offset_from",
+        "ptr_offset_from call without target block",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ptr_offset_from_impl(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    signed: bool,
+    intrinsic_name: &'static str,
+    no_target_msg: &'static str,
+) -> TranslationResult<Ptr<Operation>> {
     use crate::translator::types;
     use dialect_mir::ops::{MirConstantOp, MirDivOp, MirSubOp};
     use pliron::builtin::attributes::IntegerAttr;
@@ -496,7 +641,7 @@ pub fn emit_ptr_offset_from_unsigned(
         return input_err!(
             loc.clone(),
             TranslationErr::unsupported(format!(
-                "ptr_offset_from_unsigned expects 2 arguments (this, other), got {}",
+                "{intrinsic_name} expects 2 arguments (this, other), got {}",
                 args.len()
             ))
         );
@@ -519,7 +664,11 @@ pub fn emit_ptr_offset_from_unsigned(
         .unwrap_or(1)
         .max(1);
 
-    let usize_type = types::get_usize_type(ctx);
+    let result_type = if signed {
+        IntegerType::get(ctx, 64, Signedness::Signed)
+    } else {
+        types::get_usize_type(ctx)
+    };
 
     let (this_ptr, op_a) = rvalue::translate_operand(
         ctx,
@@ -533,7 +682,7 @@ pub fn emit_ptr_offset_from_unsigned(
     let cast_a = Operation::new(
         ctx,
         MirCastOp::get_concrete_op_info(),
-        vec![usize_type.to_ptr()],
+        vec![result_type.to_ptr()],
         vec![this_ptr],
         vec![],
         0,
@@ -558,7 +707,7 @@ pub fn emit_ptr_offset_from_unsigned(
     let cast_b = Operation::new(
         ctx,
         MirCastOp::get_concrete_op_info(),
-        vec![usize_type.to_ptr()],
+        vec![result_type.to_ptr()],
         vec![other_ptr],
         vec![],
         0,
@@ -571,7 +720,7 @@ pub fn emit_ptr_offset_from_unsigned(
     let sub_op = Operation::new(
         ctx,
         MirSubOp::get_concrete_op_info(),
-        vec![usize_type.to_ptr()],
+        vec![result_type.to_ptr()],
         vec![a_val, b_val],
         vec![],
         0,
@@ -581,11 +730,11 @@ pub fn emit_ptr_offset_from_unsigned(
     let diff_val = sub_op.deref(ctx).get_result(0);
 
     let size_apint = APInt::from_i64(elem_size as i64, NonZeroUsize::new(64).unwrap());
-    let size_attr = IntegerAttr::new(usize_type, size_apint);
+    let size_attr = IntegerAttr::new(result_type, size_apint);
     let size_const = Operation::new(
         ctx,
         MirConstantOp::get_concrete_op_info(),
-        vec![usize_type.to_ptr()],
+        vec![result_type.to_ptr()],
         vec![],
         vec![],
         0,
@@ -598,7 +747,7 @@ pub fn emit_ptr_offset_from_unsigned(
     let div_op = Operation::new(
         ctx,
         MirDivOp::get_concrete_op_info(),
-        vec![usize_type.to_ptr()],
+        vec![result_type.to_ptr()],
         vec![diff_val, size_val],
         vec![],
         0,
@@ -617,7 +766,7 @@ pub fn emit_ptr_offset_from_unsigned(
         value_map,
         block_map,
         loc,
-        "ptr_offset_from_unsigned call without target block",
+        no_target_msg,
     )
 }
 

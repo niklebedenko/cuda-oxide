@@ -191,6 +191,9 @@ pub mod ops {
     /// Op-attribute key used to preserve volatile load semantics through the
     /// textual LLVM exporter.
     const LOAD_VOLATILE_KEY: &str = "cuda_oxide_load_volatile";
+    /// Op-attribute key used to preserve volatile store semantics through the
+    /// textual LLVM exporter.
+    const STORE_VOLATILE_KEY: &str = "cuda_oxide_store_volatile";
 
     /// Stamp the ABI alignment (bytes) onto a memory op.
     pub fn set_op_alignment(ctx: &mut Context, op: Ptr<Operation>, align: u32) {
@@ -227,6 +230,35 @@ pub mod ops {
 
         fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
             let key = Identifier::try_new(LOAD_VOLATILE_KEY.to_string()).expect("valid identifier");
+            self.get_operation()
+                .deref_mut(ctx)
+                .attributes
+                .set(key, BoolAttr::new(volatile));
+        }
+    }
+
+    /// Volatile helpers for upstream `StoreOp`, which has no native volatile flag.
+    pub trait StoreOpExt {
+        /// True if this store should export as `store volatile`.
+        fn is_volatile(&self, ctx: &Context) -> bool;
+        /// Mark this store for `store volatile` export.
+        fn set_volatile(&self, ctx: &mut Context, volatile: bool);
+    }
+
+    impl StoreOpExt for StoreOp {
+        fn is_volatile(&self, ctx: &Context) -> bool {
+            let key =
+                Identifier::try_new(STORE_VOLATILE_KEY.to_string()).expect("valid identifier");
+            self.get_operation()
+                .deref(ctx)
+                .attributes
+                .get::<BoolAttr>(&key)
+                .is_some_and(|attr| bool::from(attr.clone()))
+        }
+
+        fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
+            let key =
+                Identifier::try_new(STORE_VOLATILE_KEY.to_string()).expect("valid identifier");
             self.get_operation()
                 .deref_mut(ctx)
                 .attributes

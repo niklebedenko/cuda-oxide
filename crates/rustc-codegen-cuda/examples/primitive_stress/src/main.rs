@@ -88,6 +88,28 @@ mod kernels {
         }
     }
 
+    /// Checks volatile load/store and pointer-distance intrinsics from libcore.
+    #[kernel]
+    pub fn test_memory_intrinsics(mut out: DisjointSlice<i64>) {
+        if thread::index_1d().get() == 0 {
+            unsafe {
+                let base = out.as_mut_ptr();
+                let far = base.add(3);
+
+                core::ptr::write_volatile(base, 101_i64);
+                let volatile_value = core::ptr::read_volatile(base);
+                let signed_forward = far.offset_from(base);
+                let signed_backward = base.offset_from(far);
+                let unsigned_forward = far.offset_from_unsigned(base);
+
+                *base.add(1) = volatile_value;
+                *base.add(2) = signed_forward as i64;
+                *base.add(3) = signed_backward as i64;
+                *base.add(4) = unsigned_forward as i64;
+            }
+        }
+    }
+
     /// Checks primitive integer methods that call rustc bit intrinsics in libcore.
     #[kernel]
     pub fn test_bit_intrinsics(a: u128, b: u64, c: u32, mut out: DisjointSlice<u64>) {
@@ -302,6 +324,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ];
         check_slice(
             "usize/isize arithmetic",
+            &result,
+            &expected,
+            &mut passed,
+            &mut failed,
+        );
+    }
+
+    {
+        let mut out = DeviceBuffer::<i64>::zeroed(&stream, 5)?;
+        module.test_memory_intrinsics(&stream, cfg, &mut out)?;
+        let result = out.to_host_vec(&stream)?;
+        let expected = [101, 101, 3, -3, 3];
+        check_slice(
+            "volatile and pointer-distance intrinsics",
             &result,
             &expected,
             &mut passed,

@@ -27,7 +27,7 @@ use crate::{
         AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, GepIndexAttr,
         ICmpPredicateAttr,
     },
-    ops::{self, LoadOpExt},
+    ops::{self, LoadOpExt, StoreOpExt},
     types::{FuncType, VoidType},
 };
 
@@ -469,7 +469,13 @@ impl<'a> ModuleExportState<'a> {
         let val_ty = val.get_type(self.ctx);
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
-        write!(output, "  store ").unwrap();
+        let volatile_kw = if op.is_volatile(self.ctx) {
+            "volatile "
+        } else {
+            ""
+        };
+
+        write!(output, "  store {volatile_kw}").unwrap();
         self.export_type(val_ty, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;

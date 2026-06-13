@@ -25,7 +25,7 @@ use std::mem::MaybeUninit;
 use std::num::Wrapping;
 use std::sync::Arc;
 
-use cuda_bindings::CUdeviceptr;
+use cuda_bindings::{CUdeviceptr, CUstream};
 
 use crate::context::CudaContext;
 use crate::error::DriverError;
@@ -162,7 +162,14 @@ pub struct DeviceBuffer<T> {
     ptr: CUdeviceptr,
     len: usize,
     ctx: Arc<CudaContext>,
+    allocation: AllocationKind,
     _marker: PhantomData<T>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllocationKind {
+    Sync,
+    Async { stream: CUstream },
 }
 
 // SAFETY: CUdeviceptr is a u64 handle valid across threads when the owning
@@ -176,8 +183,13 @@ impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if self.ptr != 0 {
             self.ctx.record_err(self.ctx.bind_to_thread());
-            self.ctx
-                .record_err(unsafe { crate::memory::free_sync(self.ptr) });
+            let result = match self.allocation {
+                AllocationKind::Sync => unsafe { crate::memory::free_sync(self.ptr) },
+                AllocationKind::Async { stream } => unsafe {
+                    crate::memory::free_async(self.ptr, stream)
+                },
+            };
+            self.ctx.record_err(result);
         }
     }
 }
@@ -217,22 +229,51 @@ impl<T> DeviceBuffer<T> {
     ///
     /// # Safety
     ///
-    /// - `ptr` must have been allocated via `cuMemAlloc*` with at least
+    /// - `ptr` must have been allocated via `cuMemAlloc` with at least
     ///   `len * size_of::<T>()` bytes.
     /// - `ptr` must belong to the same CUDA context as `ctx`.
-    /// - The caller transfers ownership -- `ptr` will be freed on drop.
+    /// - The caller transfers ownership -- `ptr` will be freed with
+    ///   [`crate::memory::free_sync`] on drop.
     pub unsafe fn from_raw_parts(ptr: CUdeviceptr, len: usize, ctx: Arc<CudaContext>) -> Self {
         Self {
             ptr,
             len,
             ctx,
+            allocation: AllocationKind::Sync,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Constructs a `DeviceBuffer` from pre-existing async raw parts.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been allocated via `cuMemAllocAsync` with at least
+    ///   `len * size_of::<T>()` bytes.
+    /// - `ptr` must belong to the same CUDA context as `ctx`.
+    /// - `stream` must be valid for the allocation's context until the buffer
+    ///   is dropped or consumed by [`Self::drop_async`].
+    /// - The caller transfers ownership -- `ptr` will be freed with
+    ///   [`crate::memory::free_async`] on drop.
+    pub unsafe fn from_raw_parts_async(
+        ptr: CUdeviceptr,
+        len: usize,
+        ctx: Arc<CudaContext>,
+        stream: CUstream,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            ctx,
+            allocation: AllocationKind::Async { stream },
             _marker: PhantomData,
         }
     }
 
     /// Consumes the buffer and returns the raw parts without freeing.
     ///
-    /// The caller is responsible for eventually freeing `ptr`.
+    /// The caller is responsible for eventually freeing `ptr` with the same
+    /// allocator family used to create the buffer.
     pub fn into_raw_parts(self) -> (CUdeviceptr, usize, Arc<CudaContext>) {
         let parts = (self.ptr, self.len, self.ctx.clone());
         std::mem::forget(self);
@@ -241,13 +282,13 @@ impl<T> DeviceBuffer<T> {
 }
 
 impl<T: DeviceCopy> DeviceBuffer<T> {
-    /// Allocates device memory and copies `data` from the host, enqueued on
-    /// `stream`.
+    /// Allocates device memory and copies `data` from the host.
     ///
-    /// The host slice must remain valid until the copy completes (i.e. until
-    /// the next synchronization point on `stream`). For pageable host memory
-    /// the driver may internally synchronize; use pinned memory for true
-    /// async overlap.
+    /// The copy is enqueued on `stream` and `stream` is synchronized before
+    /// this function returns, so `data` can be safely reused or dropped
+    /// immediately after a successful or failed call. Use
+    /// [`Self::from_pinned_host`] when the host source is pinned and the
+    /// caller wants to manage the asynchronous lifetime contract manually.
     ///
     /// An empty `data` slice yields an empty buffer without touching the
     /// driver allocator.
@@ -285,6 +326,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
                 stream.cu_stream(),
             )?;
         }
+        stream.synchronize()?;
         Ok(buf)
     }
 
@@ -324,7 +366,25 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             Arc::ptr_eq(data.context(), stream.context()),
             "pinned host buffer and stream must belong to the same CUDA context"
         );
-        Self::from_host(stream, data.as_slice())
+        let ctx = stream.context().clone();
+        let len = data.len();
+        let num_bytes = data.num_bytes();
+
+        if num_bytes == 0 {
+            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
+        }
+
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
+        unsafe {
+            crate::memory::memcpy_htod_async(
+                buf.ptr,
+                data.as_ptr(),
+                num_bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        Ok(buf)
     }
 
     /// Allocates zero-initialized device memory of `len` elements, enqueued
@@ -545,6 +605,9 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             ptr,
             len,
             ctx,
+            allocation: AllocationKind::Async {
+                stream: stream.cu_stream(),
+            },
             _marker: PhantomData,
         })
     }
@@ -577,9 +640,15 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
 
     /// Copies `src` into `self` host-to-device, enqueued on `stream`.
     ///
-    /// The host slice must remain valid until the copy completes on `stream`.
     /// Panics if `src.len() != self.len()`.
-    pub fn copy_from_host_async(
+    ///
+    /// # Safety
+    ///
+    /// This call only enqueues the host-to-device copy and returns. CUDA may
+    /// still be reading from `src` after this function returns, so the caller
+    /// must ensure `src` is not dropped, freed, mutated, or aliased until the
+    /// copy has completed on `stream`.
+    pub unsafe fn copy_from_host_async(
         &mut self,
         src: &[T],
         stream: &CudaStream,
@@ -604,16 +673,33 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         }
     }
 
+    /// Copies `src` into `self` and synchronizes `stream` before returning.
+    ///
+    /// Panics if `src.len() != self.len()`.
+    pub fn copy_from_host(&mut self, src: &[T], stream: &CudaStream) -> Result<(), DriverError> {
+        unsafe { self.copy_from_host_async(src, stream)? };
+        stream.synchronize()
+    }
+
     /// Consumes the buffer and frees it asynchronously on `stream`.
     ///
     /// Use this for buffers whose lifetime must be ordered relative to in-flight
     /// stream work.
-    pub fn drop_async(self, stream: &CudaStream) -> Result<(), DriverError> {
-        let (ptr, _len, _ctx) = self.into_raw_parts();
-        if ptr == 0 {
+    pub fn drop_async(mut self, stream: &CudaStream) -> Result<(), DriverError> {
+        if self.ptr == 0 {
             return Ok(());
         }
-        unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
+
+        match self.allocation {
+            AllocationKind::Async { .. } => {
+                let ptr = self.ptr;
+                self.ptr = 0;
+                unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
+            }
+            AllocationKind::Sync => Err(DriverError(
+                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+            )),
+        }
     }
 
     /// Zeroes every byte in the buffer asynchronously on `stream`.
