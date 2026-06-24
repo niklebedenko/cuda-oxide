@@ -664,17 +664,14 @@ pub fn translate_statement(
                         )
                     }
                     (
-                        mir::ProjectionElem::Index(_outer_index_local),
-                        mir::ProjectionElem::Index(_inner_index_local),
+                        mir::ProjectionElem::Field(..),
+                        mir::ProjectionElem::Index(_) | mir::ProjectionElem::ConstantIndex { .. },
                     ) => {
-                        // `_local[i][j] = value` for nested arrays. The shared
-                        // walk-and-store path already handles chained runtime
-                        // indexes, so delegate to it instead of re-deriving the
-                        // address here. That keeps this 2-level arm from drifting
-                        // from the (Deref, Index) arm above and the N-projection
-                        // fallback below, which use the same helper. The store
-                        // target of an assignment is always a mutable place, so
-                        // the helper's mutable-address request is correct here.
+                        // `_local.field[i] = value`, e.g. a write into an
+                        // array field inside a scalar aggregate. The generic
+                        // address walker composes the field address with the
+                        // element address, so use the same store-through path
+                        // as deeper projections.
                         store_through_place_address(
                             ctx,
                             body,
@@ -689,12 +686,17 @@ pub fn translate_statement(
                         )
                     }
                     (
-                        mir::ProjectionElem::Field(_, _),
-                        mir::ProjectionElem::ConstantIndex { .. } | mir::ProjectionElem::Index(_),
+                        mir::ProjectionElem::Index(_outer_index_local),
+                        mir::ProjectionElem::Index(_inner_index_local),
                     ) => {
-                        // `_local.field[const]` or `_local.field[i]`: step into a
-                        // struct field, then index into the resulting array. The
-                        // walk-and-store helper resolves the full address chain.
+                        // `_local[i][j] = value` for nested arrays. The shared
+                        // walk-and-store path already handles chained runtime
+                        // indexes, so delegate to it instead of re-deriving the
+                        // address here. That keeps this 2-level arm from drifting
+                        // from the (Deref, Index) arm above and the N-projection
+                        // fallback below, which use the same helper. The store
+                        // target of an assignment is always a mutable place, so
+                        // the helper's mutable-address request is correct here.
                         store_through_place_address(
                             ctx,
                             body,
