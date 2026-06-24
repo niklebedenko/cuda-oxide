@@ -717,6 +717,74 @@ fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[test]
+fn test_shuffle_i32_forwards_clamp_operand_to_intrinsic_call() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) = build_test_kernel(
+        &mut ctx,
+        vec![i32_ty.into(), i32_ty.into(), i32_ty.into(), i32_ty.into()],
+    );
+    let mask = entry.deref(&ctx).get_argument(0);
+    let value = entry.deref(&ctx).get_argument(1);
+    let lane = entry.deref(&ctx).get_argument(2);
+    let clamp = entry.deref(&ctx).get_argument(3);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::ShflSyncIdxI32Op::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![mask, value, lane, clamp],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut found_call = false;
+    let module_op = module_ptr.deref(&ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(&ctx).iter(&ctx).next().unwrap();
+    for op in block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(&ctx).to_string() != "kernel_func" {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+        for func_block in func_region.deref(&ctx).iter(&ctx) {
+            for body_op in func_block.deref(&ctx).iter(&ctx) {
+                assert!(
+                    Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx).is_none(),
+                    "32-bit shuffles must lower to NVVM intrinsics, not inline asm"
+                );
+                if let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx)
+                    && let CallOpCallable::Direct(sym) = call.callee(&ctx)
+                    && sym.to_string() == "llvm_nvvm_shfl_sync_idx_i32"
+                {
+                    found_call = true;
+                    assert_eq!(
+                        body_op.deref(&ctx).operands().count(),
+                        4,
+                        "shfl.sync.idx.i32 must forward [mask, value, lane, clamp]"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_call,
+        "Expected call to llvm_nvvm_shfl_sync_idx_i32 in lowered kernel body"
+    );
+    Ok(())
+}
+
 /// Regression cover for the per-call-site address-space coercion pass.
 ///
 /// When a caller passes a pointer in one address space to a callee whose

@@ -14,13 +14,55 @@ use crate::translator::types;
 use crate::translator::values::ValueMap;
 use dialect_nvvm::ops::{ActiveMaskOp, BarWarpSyncOp, ElectSyncOp, ReadPtxSregLaneIdOp};
 use pliron::basic_block::BasicBlock;
+use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::utils::apint::APInt;
+use pliron::value::Value;
 use rustc_public::mir;
+use std::num::NonZeroUsize;
+
+fn emit_u32_constant(
+    ctx: &mut Context,
+    value: u32,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> (Value, Ptr<Operation>) {
+    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
+    let const_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirConstantOp::get_concrete_op_info(),
+        vec![u32_type.to_handle()],
+        vec![],
+        vec![],
+        0,
+    );
+    const_op.deref_mut(ctx).set_loc(loc);
+    dialect_mir::ops::MirConstantOp::new(const_op).set_attr_value(
+        ctx,
+        IntegerAttr::new(
+            u32_type,
+            APInt::from_u64(
+                u64::from(value),
+                NonZeroUsize::new(32).expect("32 is non-zero"),
+            ),
+        ),
+    );
+
+    if let Some(prev) = prev_op {
+        const_op.insert_after(ctx, prev);
+    } else {
+        const_op.insert_at_front(block_ptr, ctx);
+    }
+
+    (const_op.deref(ctx).get_result(0), const_op)
+}
+
 /// Emits `lane_id()`: Get the lane index within the warp.
 ///
 /// Returns the thread's position within its 32-thread warp (0-31).
@@ -195,6 +237,7 @@ pub fn emit_warp_sync_mask(
 ///
 /// # Parameters
 /// - `shuffle_opid`: The NVVM opid for the specific shuffle variant
+/// - `clamp`: PTX shuffle clamp/segment operand
 /// - `args`: `[mask, value, lane/lane_mask/delta]`
 pub fn emit_warp_shuffle_i32(
     ctx: &mut Context,
@@ -203,6 +246,7 @@ pub fn emit_warp_shuffle_i32(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    clamp: u32,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -256,21 +300,19 @@ pub fn emit_warp_shuffle_i32(
     )?;
     last_op = last_op_after;
 
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
     let shuffle_op = Operation::new(
         ctx,
         shuffle_opid,
         vec![u32_type.to_handle()],
-        vec![mask, val, lane_or_delta],
+        vec![mask, val, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
 
-    if let Some(prev) = last_op {
-        shuffle_op.insert_after(ctx, prev);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
+    shuffle_op.insert_after(ctx, clamp_op);
 
     let result_value = shuffle_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
@@ -291,6 +333,7 @@ pub fn emit_warp_shuffle_i32(
 ///
 /// # Parameters
 /// - `shuffle_opid`: The NVVM opid for the specific shuffle variant
+/// - `clamp`: PTX shuffle clamp/segment operand
 /// - `args`: `[mask, value, lane/lane_mask/delta]`
 pub fn emit_warp_shuffle_f32(
     ctx: &mut Context,
@@ -299,6 +342,7 @@ pub fn emit_warp_shuffle_f32(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    clamp: u32,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -354,21 +398,19 @@ pub fn emit_warp_shuffle_f32(
     )?;
     last_op = last_op_after;
 
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
     let shuffle_op = Operation::new(
         ctx,
         shuffle_opid,
         vec![f32_type.into()],
-        vec![mask, val, lane_or_delta],
+        vec![mask, val, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
 
-    if let Some(prev) = last_op {
-        shuffle_op.insert_after(ctx, prev);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
+    shuffle_op.insert_after(ctx, clamp_op);
 
     let result_value = shuffle_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(

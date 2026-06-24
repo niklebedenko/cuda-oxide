@@ -44,29 +44,25 @@ use pliron::result::Result;
 
 /// Convert i32 shuffle operation to LLVM intrinsic call.
 ///
-/// Operand layout: `[mask, value, lane_or_delta]`. The mask reaches us
-/// already type-converted by the framework (any `u32`/`i32` carrier
-/// works); we forward it straight to the intrinsic. For full-warp ops
-/// the mask is just `0xFFFFFFFF` baked in by the caller.
+/// Operand layout: `[mask, value, lane_or_delta, clamp]`. The mask and
+/// clamp reach us already type-converted by the framework; we forward both
+/// straight to the intrinsic.
 pub(crate) fn convert_shuffle_i32(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
     intrinsic_name: &str,
-    clamp: i32,
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
-    if operands.len() != 3 {
+    if operands.len() != 4 {
         return pliron::input_err_noloc!(
-            "Warp shuffle i32 requires 3 operands [mask, value, lane_or_delta]"
+            "Warp shuffle i32 requires 4 operands [mask, value, lane_or_delta, clamp]"
         );
     }
-    let (mask, val, lane_or_delta) = (operands[0], operands[1], operands[2]);
-
-    let clamp_val = create_i32_const(ctx, rewriter, clamp);
+    let (mask, val, lane_or_delta, clamp) = (operands[0], operands[1], operands[2], operands[3]);
 
     let func_ty = llvm_types::FuncType::get(
         ctx,
@@ -81,7 +77,7 @@ pub(crate) fn convert_shuffle_i32(
         op,
         intrinsic_name,
         func_ty,
-        vec![mask, val, lane_or_delta, clamp_val],
+        vec![mask, val, lane_or_delta, clamp],
     )?;
     rewriter.replace_operation(ctx, op, call_op);
     Ok(())
@@ -89,7 +85,7 @@ pub(crate) fn convert_shuffle_i32(
 
 /// Convert f32 shuffle operation to LLVM intrinsic call.
 ///
-/// Operand layout: `[mask, value, lane_or_delta]`. See `convert_shuffle_i32`
+/// Operand layout: `[mask, value, lane_or_delta, clamp]`. See `convert_shuffle_i32`
 /// for the mask forwarding rationale.
 pub(crate) fn convert_shuffle_f32(
     ctx: &mut Context,
@@ -97,20 +93,17 @@ pub(crate) fn convert_shuffle_f32(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
     intrinsic_name: &str,
-    clamp: i32,
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let f32_ty = FP32Type::get(ctx);
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
-    if operands.len() != 3 {
+    if operands.len() != 4 {
         return pliron::input_err_noloc!(
-            "Warp shuffle f32 requires 3 operands [mask, value, lane_or_delta]"
+            "Warp shuffle f32 requires 4 operands [mask, value, lane_or_delta, clamp]"
         );
     }
-    let (mask, val, lane_or_delta) = (operands[0], operands[1], operands[2]);
-
-    let clamp_val = create_i32_const(ctx, rewriter, clamp);
+    let (mask, val, lane_or_delta, clamp) = (operands[0], operands[1], operands[2], operands[3]);
 
     let func_ty = llvm_types::FuncType::get(
         ctx,
@@ -125,7 +118,7 @@ pub(crate) fn convert_shuffle_f32(
         op,
         intrinsic_name,
         func_ty,
-        vec![mask, val, lane_or_delta, clamp_val],
+        vec![mask, val, lane_or_delta, clamp],
     )?;
     rewriter.replace_operation(ctx, op, call_op);
     Ok(())
