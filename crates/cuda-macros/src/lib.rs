@@ -3942,4 +3942,36 @@ mod tests {
             "unexpected error message: {error}"
         );
     }
+
+    #[test]
+    fn loaded_module_uses_lazy_multi_artifact_function_lookup() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn first_kernel(out: *mut u32) {}
+
+                #[kernel]
+                pub fn second_kernel(out: *mut u32) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains("pubfnfrom_modules("),
+            "expected generated bindings to accept multiple loaded modules:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("fn__load_function("),
+            "expected generated bindings to search modules lazily:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("self.__load_function(__ptx_name)?"),
+            "expected launch methods to resolve functions on demand:\n{expanded}"
+        );
+        assert!(
+            !expanded.contains("__first_kernel_function")
+                && !expanded.contains("__second_kernel_function"),
+            "generated bindings should not eagerly store per-kernel function fields:\n{expanded}"
+        );
+    }
 }
