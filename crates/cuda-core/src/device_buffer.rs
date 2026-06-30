@@ -85,7 +85,31 @@ impl_device_copy!(
     usize,
     f16,
     f32,
-    f64
+    f64,
+    // Primitive parity with the historical `cust_core::DeviceCopy` surface.
+    // `bool` and `char` have validity holes (only 0/1 for `bool`, only valid
+    // Unicode scalars for `char`), but the values that reach the device are
+    // always produced by Rust-typed host APIs, so every byte pattern that
+    // appears in practice is a valid value. Mirrors `cust_core` to keep
+    // downstream `#[derive(DeviceCopy)]` users compiling unchanged.
+    bool,
+    char,
+    // `NonZero*` are `#[repr(transparent)]` wrappers with a narrower validity
+    // invariant than their inner integer (zero is invalid). Same argument as
+    // above: host code only constructs valid `NonZero*` values, so the bytes
+    // that traverse device memory remain valid.
+    core::num::NonZeroI8,
+    core::num::NonZeroI16,
+    core::num::NonZeroI32,
+    core::num::NonZeroI64,
+    core::num::NonZeroI128,
+    core::num::NonZeroIsize,
+    core::num::NonZeroU8,
+    core::num::NonZeroU16,
+    core::num::NonZeroU32,
+    core::num::NonZeroU64,
+    core::num::NonZeroU128,
+    core::num::NonZeroUsize,
 );
 
 unsafe impl<T: DeviceCopy, const N: usize> DeviceCopy for [T; N] {}
@@ -100,6 +124,12 @@ unsafe impl<T: ?Sized> DeviceCopy for *mut T {}
 unsafe impl<T: ?Sized> DeviceCopy for PhantomData<T> {}
 unsafe impl<T: DeviceCopy> DeviceCopy for MaybeUninit<T> {}
 unsafe impl<T: DeviceCopy> DeviceCopy for Wrapping<T> {}
+
+// Option/Result preserve the validity invariants of their payloads through
+// `repr(Rust)` discriminant + payload layout. Same parity argument: host
+// code constructs them via Rust APIs.
+unsafe impl<T: DeviceCopy> DeviceCopy for Option<T> {}
+unsafe impl<L: DeviceCopy, R: DeviceCopy> DeviceCopy for Result<L, R> {}
 
 macro_rules! impl_device_copy_tuple {
     ($($name:ident),+ $(,)?) => {
