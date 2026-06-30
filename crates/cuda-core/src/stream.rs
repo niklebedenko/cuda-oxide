@@ -32,17 +32,32 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// An RAII wrapper around a `CUstream` handle.
-///
-/// Holds an `Arc<CudaContext>` to ensure the context outlives the stream.
-/// A null `cu_stream` represents the per-context default stream (stream 0).
-#[derive(Debug, PartialEq, Eq)]
-pub struct CudaStream {
+/// Shared stream state. Kept separate from [`CudaStream`] so other owners can
+/// keep the raw CUDA stream alive without requiring an `Arc<CudaStream>` API.
+#[derive(Debug)]
+pub(crate) struct CudaStreamInner {
     /// Raw CUDA stream handle. Null for the default stream.
     pub(crate) cu_stream: cuda_bindings::CUstream,
     /// Owning context. Kept alive for the lifetime of this stream.
     pub(crate) ctx: Arc<CudaContext>,
 }
+
+/// An RAII wrapper around a `CUstream` handle.
+///
+/// Holds an `Arc<CudaContext>` to ensure the context outlives the stream.
+/// A null `cu_stream` represents the per-context default stream (stream 0).
+#[derive(Debug)]
+pub struct CudaStream {
+    pub(crate) inner: Arc<CudaStreamInner>,
+}
+
+impl PartialEq for CudaStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.cu_stream == other.inner.cu_stream && self.inner.ctx == other.inner.ctx
+    }
+}
+
+impl Eq for CudaStream {}
 
 /// # Safety
 ///
@@ -58,7 +73,7 @@ unsafe impl Sync for CudaStream {}
 ///
 /// The default stream (null handle) is never destroyed. Errors during
 /// teardown are recorded on the context rather than panicking.
-impl Drop for CudaStream {
+impl Drop for CudaStreamInner {
     fn drop(&mut self) {
         self.ctx.record_err(self.ctx.bind_to_thread());
         if !self.cu_stream.is_null() {
@@ -70,21 +85,25 @@ impl Drop for CudaStream {
 }
 
 impl CudaStream {
+    pub(crate) fn retain_inner(&self) -> Arc<CudaStreamInner> {
+        self.inner.clone()
+    }
+
     /// Returns the raw `CUstream` handle (null for the default stream).
     pub fn cu_stream(&self) -> cuda_bindings::CUstream {
-        self.cu_stream
+        self.inner.cu_stream
     }
 
     /// Returns the parent [`CudaContext`].
     pub fn context(&self) -> &Arc<CudaContext> {
-        &self.ctx
+        &self.inner.ctx
     }
 
     /// Blocks the calling thread until all work enqueued on this stream
     /// completes.
     pub fn synchronize(&self) -> Result<(), DriverError> {
-        self.ctx.bind_to_thread()?;
-        unsafe { cuda_bindings::cuStreamSynchronize(self.cu_stream) }.result()
+        self.inner.ctx.bind_to_thread()?;
+        unsafe { cuda_bindings::cuStreamSynchronize(self.inner.cu_stream) }.result()
     }
 
     /// Creates a new non-blocking stream that waits on all prior work in
@@ -94,8 +113,8 @@ impl CudaStream {
     /// [`join`](Self::join) on it with `self`, establishing a fork point
     /// in the stream DAG.
     pub fn fork(&self) -> Result<Arc<Self>, DriverError> {
-        self.ctx.bind_to_thread()?;
-        self.ctx.num_streams.fetch_add(1, Ordering::Relaxed);
+        self.inner.ctx.bind_to_thread()?;
+        self.inner.ctx.num_streams.fetch_add(1, Ordering::Relaxed);
         let mut cu_stream = MaybeUninit::uninit();
         let cu_stream = unsafe {
             cuda_bindings::cuStreamCreate(
@@ -106,8 +125,10 @@ impl CudaStream {
             cu_stream.assume_init()
         };
         let stream = Arc::new(CudaStream {
-            cu_stream,
-            ctx: self.ctx.clone(),
+            inner: Arc::new(CudaStreamInner {
+                cu_stream,
+                ctx: self.inner.ctx.clone(),
+            }),
         });
         stream.join(self)?;
         Ok(stream)
@@ -132,7 +153,7 @@ impl CudaStream {
         &self,
         flags: Option<cuda_bindings::CUevent_flags>,
     ) -> Result<CudaEvent, DriverError> {
-        let event = self.ctx.new_event(flags)?;
+        let event = self.inner.ctx.new_event(flags)?;
         event.record(self)?;
         Ok(event)
     }
@@ -143,10 +164,10 @@ impl CudaStream {
     /// `event` has been recorded (i.e., all prior work on the stream that
     /// recorded `event` has completed).
     pub fn wait(&self, event: &CudaEvent) -> Result<(), DriverError> {
-        self.ctx.bind_to_thread()?;
+        self.inner.ctx.bind_to_thread()?;
         unsafe {
             cuda_bindings::cuStreamWaitEvent(
-                self.cu_stream,
+                self.inner.cu_stream,
                 event.cu_event(),
                 cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT,
             )
@@ -175,7 +196,7 @@ impl CudaStream {
         let boxed = Box::new(host_func);
         unsafe {
             cuda_bindings::cuLaunchHostFunc(
-                self.cu_stream,
+                self.inner.cu_stream,
                 Some(Self::callback_wrapper::<F>),
                 Box::into_raw(boxed) as *mut c_void,
             )

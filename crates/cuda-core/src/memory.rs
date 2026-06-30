@@ -41,14 +41,17 @@ pub unsafe fn malloc_async(
     }
 }
 
-/// Frees device memory previously allocated with [`malloc_async`].
+/// Frees device memory in stream order.
 ///
 /// The free is enqueued on `stream` and completes in stream order. The pointer
 /// must not be accessed by any work enqueued after this call on the same stream.
+/// CUDA accepts both synchronously allocated (`cuMemAlloc`) and stream-ordered
+/// (`cuMemAllocAsync`) device pointers here.
 ///
 /// # Safety
 ///
-/// - `dptr` must have been returned by [`malloc_async`] and not yet freed.
+/// - `dptr` must have been returned by `cuMemAlloc` or [`malloc_async`] and not
+///   yet freed.
 /// - `stream` must be a valid `CUstream` from the same context as the
 ///   allocation.
 pub unsafe fn free_async(
@@ -75,14 +78,15 @@ pub unsafe fn malloc_sync(num_bytes: usize) -> Result<CUdeviceptr, DriverError> 
     }
 }
 
-/// Frees device memory previously allocated with [`malloc_sync`].
+/// Frees device memory synchronously.
 ///
 /// Blocks the calling thread. All pending GPU work referencing `dptr` must have
 /// completed before this call.
 ///
 /// # Safety
 ///
-/// - `dptr` must have been returned by [`malloc_sync`] and not yet freed.
+/// - `dptr` must have been returned by [`malloc_sync`] or [`malloc_async`] and
+///   not yet freed.
 /// - No in-flight GPU operations may reference `dptr`.
 pub unsafe fn free_sync(dptr: CUdeviceptr) -> Result<(), DriverError> {
     unsafe { cuda_bindings::cuMemFree_v2(dptr) }.result()
