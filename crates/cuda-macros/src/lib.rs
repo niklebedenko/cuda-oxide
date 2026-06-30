@@ -946,26 +946,6 @@ fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<Tok
     reject_reserved_loaded_module_methods(direct_kernels, false)?;
     let module_items = cuda_module_items_with_constant_symbols(&transformed.items, &constants);
 
-    let non_generic_kernels = direct_kernels.iter().filter(|kernel| !kernel.is_generic);
-    let function_fields = non_generic_kernels.clone().map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: ::cuda_core::CudaFunction,
-        }
-    });
-
-    let function_initializers = non_generic_kernels.map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        let marker = cuda_kernel_marker_name(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: module.load_function(<#marker as ::cuda_host::CudaKernel>::PTX_NAME)?,
-        }
-    });
-
     let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&transformed.kernels)?;
     let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
     let ptx_merge_required_markers = transformed.kernels.iter().filter_map(|kernel| {
@@ -1163,12 +1143,26 @@ fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<Tok
             pub unsafe fn from_module(
                 module: ::std::sync::Arc<::cuda_core::CudaModule>,
             ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                // SAFETY: a single caller-provided module has the same ABI
+                // obligation as the vector form.
+                unsafe { from_modules(::std::vec![module]) }
+            }
+
+            /// Binds caller-provided CUDA code to this module's launch API.
+            ///
+            /// # Safety
+            ///
+            /// Every loaded kernel must have the exact ABI and resource
+            /// semantics declared by this `cuda_module`. A matching symbol
+            /// name alone is not sufficient.
+            pub unsafe fn from_modules(
+                modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
                 Ok(LoadedModule {
-                    __module: module.clone(),
+                    __modules: modules,
                     __generic_functions: ::std::sync::Arc::new(
                         ::std::sync::Mutex::new(::std::collections::HashMap::new())
                     ),
-                    #(#function_initializers)*
                     #(#constant_initializers)*
                 })
             }
@@ -1178,12 +1172,17 @@ fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<Tok
             pub fn from_module(
                 module: ::std::sync::Arc<::cuda_core::CudaModule>,
             ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                from_modules(::std::vec![module])
+            }
+
+            pub fn from_modules(
+                modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
                 Ok(LoadedModule {
-                    __module: module.clone(),
+                    __modules: modules,
                     __generic_functions: ::std::sync::Arc::new(
                         ::std::sync::Mutex::new(::std::collections::HashMap::new())
                     ),
-                    #(#function_initializers)*
                     #(#constant_initializers)*
                 })
             }
@@ -1215,13 +1214,12 @@ fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<Tok
             #[derive(Clone, Debug)]
             #[allow(non_snake_case)]
             pub struct LoadedModule {
-                __module: ::std::sync::Arc<::cuda_core::CudaModule>,
+                __modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
                 __generic_functions: ::std::sync::Arc<
                     ::std::sync::Mutex<
                         ::std::collections::HashMap<&'static str, ::cuda_core::CudaFunction>
                     >
                 >,
-                #(#function_fields)*
                 #(#constant_fields)*
             }
 
@@ -1235,7 +1233,21 @@ fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<Tok
 
             impl LoadedModule {
                 pub fn as_cuda_module(&self) -> &::std::sync::Arc<::cuda_core::CudaModule> {
-                    &self.__module
+                    &self.__modules[0]
+                }
+
+                fn __load_function(
+                    &self,
+                    __ptx_name: &'static str,
+                ) -> ::core::result::Result<::cuda_core::CudaFunction, ::cuda_core::DriverError> {
+                    let mut __last_error = None;
+                    for __module in &self.__modules {
+                        match __module.load_function(__ptx_name) {
+                            Ok(__func) => return Ok(__func),
+                            Err(__error) => __last_error = Some(__error),
+                        }
+                    }
+                    Err(__last_error.expect("cuda_module LoadedModule must contain at least one CUDA module"))
                 }
 
                 #(#launch_methods)*
@@ -1494,24 +1506,6 @@ fn generate_nested_cuda_module_support(
     let prepare_launch_methods = kernels
         .iter()
         .filter_map(generate_cuda_module_prepare_launch_methods);
-    let non_generic_kernels = kernels.iter().filter(|kernel| !kernel.is_generic);
-    let function_fields = non_generic_kernels.clone().map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: ::cuda_core::CudaFunction,
-        }
-    });
-    let function_initializers = non_generic_kernels.map(|kernel| {
-        let cfg_attrs = &kernel.cfg_attrs;
-        let field = cuda_module_function_field(&kernel.fn_name);
-        let marker = cuda_kernel_marker_name(&kernel.fn_name);
-        quote! {
-            #(#cfg_attrs)*
-            #field: module.load_function(<#marker as ::cuda_host::CudaKernel>::PTX_NAME)?,
-        }
-    });
     let launch_methods = kernels.iter().map(generate_cuda_module_launch_method);
     let async_launch_methods = if cfg!(feature = "async") {
         let borrowed = kernels.iter().map(generate_cuda_module_async_launch_method);
@@ -1537,13 +1531,12 @@ fn generate_nested_cuda_module_support(
         #[derive(Clone, Debug)]
         #[allow(non_snake_case)]
         pub struct LoadedModule {
-            __module: ::std::sync::Arc<::cuda_core::CudaModule>,
+            __modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
             __generic_functions: ::std::sync::Arc<
                 ::std::sync::Mutex<
                     ::std::collections::HashMap<&'static str, ::cuda_core::CudaFunction>
                 >
             >,
-            #(#function_fields)*
         }
 
         impl LoadedModule {
@@ -1552,16 +1545,28 @@ fn generate_nested_cuda_module_support(
             pub fn from_parent(
                 parent: &super::LoadedModule,
             ) -> ::core::result::Result<Self, ::cuda_core::DriverError> {
-                let module = parent.as_cuda_module().clone();
                 Ok(Self {
-                    __module: module.clone(),
+                    __modules: parent.__modules.clone(),
                     __generic_functions: parent.__generic_functions.clone(),
-                    #(#function_initializers)*
                 })
             }
 
             pub fn as_cuda_module(&self) -> &::std::sync::Arc<::cuda_core::CudaModule> {
-                &self.__module
+                &self.__modules[0]
+            }
+
+            fn __load_function(
+                &self,
+                __ptx_name: &'static str,
+            ) -> ::core::result::Result<::cuda_core::CudaFunction, ::cuda_core::DriverError> {
+                let mut __last_error = None;
+                for __module in &self.__modules {
+                    match __module.load_function(__ptx_name) {
+                        Ok(__func) => return Ok(__func),
+                        Err(__error) => __last_error = Some(__error),
+                    }
+                }
+                Err(__last_error.expect("cuda_module LoadedModule must contain at least one CUDA module"))
             }
 
             #(#launch_methods)*
@@ -1910,7 +1915,22 @@ fn generate_cuda_module_constant_resolver_method(constant: &CudaModuleConstant) 
                 return ::core::result::Result::Ok(handle);
             }
 
-            let (dptr, size) = self.__module.get_global(#symbol_lit)?;
+            let (dptr, size) = {
+                let mut __last_error = None;
+                let mut __resolved = ::core::option::Option::None;
+                for __module in &self.__modules {
+                    match __module.get_global(#symbol_lit) {
+                        ::core::result::Result::Ok(__global) => {
+                            __resolved = ::core::option::Option::Some(__global);
+                            break;
+                        }
+                        ::core::result::Result::Err(__error) => __last_error = ::core::option::Option::Some(__error),
+                    }
+                }
+                __resolved.ok_or_else(|| {
+                    __last_error.expect("cuda_module LoadedModule must contain at least one CUDA module")
+                })?
+            };
             assert_eq!(
                 size,
                 ::core::mem::size_of::<#inner_ty>(),
@@ -1980,7 +2000,7 @@ fn generate_cuda_module_set_constant_method(constant: &CudaModuleConstant) -> To
             // `size_of::<#inner_ty>()`.
             unsafe {
                 handle.write_blocking(
-                    &self.__module,
+                    self.as_cuda_module(),
                     value as *const #inner_ty as *const u8,
                     ::core::mem::size_of::<#inner_ty>(),
                 )
@@ -3997,7 +4017,7 @@ fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
                 if let Some(#function) = #cache.get(#ptx_name) {
                     #function.clone()
                 } else {
-                    let #function = self.__module.load_function(#ptx_name)?;
+                    let #function = self.__load_function(#ptx_name)?;
                     #cache.insert(#ptx_name, #function.clone());
                     #function
                 }
@@ -4005,9 +4025,26 @@ fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
             let #function = &#function_storage;
         }
     } else {
-        let field = cuda_module_function_field(&kernel.fn_name);
+        let marker = cuda_kernel_marker_name(&kernel.fn_name);
+        let ptx_name = internal_ident("__cuda_oxide_ptx_name");
+        let function_storage = internal_ident("__cuda_oxide_function_storage");
+        let cache = internal_ident("__cuda_oxide_function_cache");
         quote! {
-            let #function = &self.#field;
+            let #ptx_name = <#marker as ::cuda_host::CudaKernel>::PTX_NAME;
+            let #function_storage = {
+                let mut #cache = self
+                    .__generic_functions
+                    .lock()
+                    .expect("cuda_module function cache poisoned");
+                if let Some(#function) = #cache.get(#ptx_name) {
+                    #function.clone()
+                } else {
+                    let #function = self.__load_function(#ptx_name)?;
+                    #cache.insert(#ptx_name, #function.clone());
+                    #function
+                }
+            };
+            let #function = &#function_storage;
         }
     }
 }
@@ -4158,10 +4195,6 @@ fn generic_phantom_type(generics: &syn::Generics) -> TokenStream2 {
     } else {
         quote! { (#(#witnesses,)*) }
     }
-}
-
-fn cuda_module_function_field(fn_name: &Ident) -> Ident {
-    format_ident!("__{}_function", fn_name)
 }
 
 fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
