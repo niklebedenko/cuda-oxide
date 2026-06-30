@@ -3,7 +3,7 @@
 
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::num::Wrapping;
+use std::num::{NonZeroU32, Wrapping};
 
 use cuda_core::DeviceCopy;
 
@@ -11,11 +11,16 @@ fn assert_device_copy<T: DeviceCopy>() {}
 
 #[test]
 fn device_copy_covers_core_parity_types() {
-    // `bool` and `char` are intentionally NOT `DeviceCopy`: they have validity
-    // holes (only 0/1 for `bool`, only valid Unicode scalars for `char`), so a
-    // device-written byte outside that set would be UB on readback. Only the
-    // representation-preserving wrappers below are sound parity additions.
     assert_device_copy::<PhantomData<String>>();
     assert_device_copy::<MaybeUninit<u32>>();
     assert_device_copy::<Wrapping<u64>>();
+
+    // This fork keeps cust_core parity for these validity-narrow types. The
+    // enum derive still validates the concrete enum's all-zero pattern instead
+    // of assuming that field-level `DeviceCopy` is enough.
+    assert_device_copy::<bool>();
+    assert_device_copy::<char>();
+    assert_device_copy::<NonZeroU32>();
+    assert_device_copy::<Option<u32>>();
+    assert_device_copy::<Result<u32, u16>>();
 }
