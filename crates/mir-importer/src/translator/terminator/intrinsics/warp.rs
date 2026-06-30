@@ -14,13 +14,58 @@ use crate::translator::types;
 use crate::translator::values::ValueMap;
 use dialect_nvvm::ops::{ActiveMaskOp, BarWarpSyncOp, ElectSyncOp, ReadPtxSregLaneIdOp};
 use pliron::basic_block::BasicBlock;
+use pliron::builtin::attributes::IntegerAttr;
+use pliron::builtin::types::FP32Type;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::printable::Printable;
+use pliron::utils::apint::APInt;
+use pliron::value::Value;
 use rustc_public::mir;
+use rustc_public::ty::{ConstantKind, TyConstKind};
+use std::num::NonZeroUsize;
+
+fn emit_u32_constant(
+    ctx: &mut Context,
+    value: u32,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> (Value, Ptr<Operation>) {
+    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
+    let const_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirConstantOp::get_concrete_op_info(),
+        vec![u32_type.to_handle()],
+        vec![],
+        vec![],
+        0,
+    );
+    const_op.deref_mut(ctx).set_loc(loc);
+    dialect_mir::ops::MirConstantOp::new(const_op).set_attr_value(
+        ctx,
+        IntegerAttr::new(
+            u32_type,
+            APInt::from_u64(
+                u64::from(value),
+                NonZeroUsize::new(32).expect("32 is non-zero"),
+            ),
+        ),
+    );
+
+    if let Some(prev) = prev_op {
+        const_op.insert_after(ctx, prev);
+    } else {
+        const_op.insert_at_front(block_ptr, ctx);
+    }
+
+    (const_op.deref(ctx).get_result(0), const_op)
+}
+
 /// Emits `lane_id()`: Get the lane index within the warp.
 ///
 /// Returns the thread's position within its 32-thread warp (0-31).
@@ -195,6 +240,7 @@ pub fn emit_warp_sync_mask(
 ///
 /// # Parameters
 /// - `shuffle_opid`: The NVVM opid for the specific shuffle variant
+/// - `clamp`: PTX shuffle clamp/segment operand
 /// - `args`: `[mask, value, lane/lane_mask/delta]`
 pub fn emit_warp_shuffle_i32(
     ctx: &mut Context,
@@ -203,6 +249,7 @@ pub fn emit_warp_shuffle_i32(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    clamp: u32,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -256,21 +303,19 @@ pub fn emit_warp_shuffle_i32(
     )?;
     last_op = last_op_after;
 
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
     let shuffle_op = Operation::new(
         ctx,
         shuffle_opid,
         vec![u32_type.to_handle()],
-        vec![mask, val, lane_or_delta],
+        vec![mask, val, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
 
-    if let Some(prev) = last_op {
-        shuffle_op.insert_after(ctx, prev);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
+    shuffle_op.insert_after(ctx, clamp_op);
 
     let result_value = shuffle_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
@@ -291,6 +336,7 @@ pub fn emit_warp_shuffle_i32(
 ///
 /// # Parameters
 /// - `shuffle_opid`: The NVVM opid for the specific shuffle variant
+/// - `clamp`: PTX shuffle clamp/segment operand
 /// - `args`: `[mask, value, lane/lane_mask/delta]`
 pub fn emit_warp_shuffle_f32(
     ctx: &mut Context,
@@ -299,6 +345,7 @@ pub fn emit_warp_shuffle_f32(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    clamp: u32,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -308,8 +355,6 @@ pub fn emit_warp_shuffle_f32(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    use pliron::builtin::types::FP32Type;
-
     if args.len() != 3 {
         return input_err!(
             loc.clone(),
@@ -354,21 +399,19 @@ pub fn emit_warp_shuffle_f32(
     )?;
     last_op = last_op_after;
 
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
     let shuffle_op = Operation::new(
         ctx,
         shuffle_opid,
         vec![f32_type.into()],
-        vec![mask, val, lane_or_delta],
+        vec![mask, val, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
 
-    if let Some(prev) = last_op {
-        shuffle_op.insert_after(ctx, prev);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
+    shuffle_op.insert_after(ctx, clamp_op);
 
     let result_value = shuffle_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
@@ -484,6 +527,308 @@ pub fn emit_warp_shuffle_i64(
         block_map,
         loc,
         "warp shuffle u64 call without target block",
+    )
+}
+
+#[derive(Clone, Copy)]
+enum LegacyShuffleMode {
+    Up,
+    Down,
+    Xor,
+    Idx,
+}
+
+fn constant_operand_u32(
+    operand: &mir::Operand,
+    what: &str,
+    loc: &Location,
+) -> TranslationResult<u32> {
+    let mir::Operand::Constant(const_op) = operand else {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle expects constant {what}"
+            ))
+        );
+    };
+
+    let value = match const_op.const_.kind() {
+        ConstantKind::Allocated(alloc) => alloc.read_uint(),
+        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+            TyConstKind::Value(_, alloc) => alloc.read_uint(),
+            other => {
+                return input_err!(
+                    loc.clone(),
+                    TranslationErr::unsupported(format!(
+                        "WarpShuffleValue::shuffle {what} must be a value constant, got {:?}",
+                        other
+                    ))
+                );
+            }
+        },
+        other => {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "WarpShuffleValue::shuffle {what} must be a constant, got {:?}",
+                    other
+                ))
+            );
+        }
+    };
+
+    let value = value.map_err(|err| {
+        pliron::input_error!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle could not read constant {what}: {err:?}"
+            ))
+        )
+    })?;
+
+    u32::try_from(value).map_err(|_| {
+        pliron::input_error!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle {what} value {value} does not fit in u32"
+            ))
+        )
+    })
+}
+
+fn legacy_shuffle_mode(arg: &mir::Operand, loc: &Location) -> TranslationResult<LegacyShuffleMode> {
+    match constant_operand_u32(arg, "mode", loc)? {
+        0 => Ok(LegacyShuffleMode::Up),
+        1 => Ok(LegacyShuffleMode::Down),
+        2 => Ok(LegacyShuffleMode::Xor),
+        3 => Ok(LegacyShuffleMode::Idx),
+        other => input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle mode {other} is not recognized"
+            ))
+        ),
+    }
+}
+
+fn legacy_shuffle_opid(
+    mode: LegacyShuffleMode,
+    is_f32: bool,
+) -> (
+    fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+    std::any::TypeId,
+) {
+    match (mode, is_f32) {
+        (LegacyShuffleMode::Idx, false) => {
+            dialect_nvvm::ops::ShflSyncIdxI32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Up, false) => {
+            dialect_nvvm::ops::ShflSyncUpI32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Down, false) => {
+            dialect_nvvm::ops::ShflSyncDownI32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Xor, false) => {
+            dialect_nvvm::ops::ShflSyncBflyI32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Idx, true) => {
+            dialect_nvvm::ops::ShflSyncIdxF32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Up, true) => dialect_nvvm::ops::ShflSyncUpF32Op::get_concrete_op_info(),
+        (LegacyShuffleMode::Down, true) => {
+            dialect_nvvm::ops::ShflSyncDownF32Op::get_concrete_op_info()
+        }
+        (LegacyShuffleMode::Xor, true) => {
+            dialect_nvvm::ops::ShflSyncBflyF32Op::get_concrete_op_info()
+        }
+    }
+}
+
+fn legacy_shuffle_clamp(
+    mode: LegacyShuffleMode,
+    width: u32,
+    loc: &Location,
+) -> TranslationResult<u32> {
+    legacy_shuffle_clamp_bits(mode, width).ok_or_else(|| {
+        pliron::input_error!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle width {width} must be a non-zero power of two <= 32"
+            ))
+        )
+    })
+}
+
+fn legacy_shuffle_clamp_bits(mode: LegacyShuffleMode, width: u32) -> Option<u32> {
+    if width == 0 || width > 32 || !width.is_power_of_two() {
+        return None;
+    }
+
+    let base = match mode {
+        LegacyShuffleMode::Up => 0,
+        LegacyShuffleMode::Down | LegacyShuffleMode::Xor | LegacyShuffleMode::Idx => 0x1f,
+    };
+    Some(((32 - width) << 8) | base)
+}
+
+/// Emit the legacy `WarpShuffleValue::shuffle(mode, mask, value, b, width)`
+/// trait method directly.
+///
+/// The collector can otherwise leave concrete impl calls like
+/// `<f32 as WarpShuffleValue>::shuffle` undefined. Lowering the trait method
+/// here preserves the public cuda-device API for full-warp shuffles.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_warp_shuffle_value_trait(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 5 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle expects 5 arguments [mode, mask, value, b, width], got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let mode = legacy_shuffle_mode(&args[0], &loc)?;
+    let width = constant_operand_u32(&args[4], "width", &loc)?;
+    let clamp = legacy_shuffle_clamp(mode, width, &loc)?;
+    let tuple_ty = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let value_ty = {
+        let ty_ref = tuple_ty.deref(ctx);
+        let Some(tuple_ty_ref) = ty_ref.downcast_ref::<dialect_mir::types::MirTupleType>() else {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(
+                    "WarpShuffleValue::shuffle destination is not a tuple".to_string()
+                )
+            );
+        };
+        let fields = tuple_ty_ref.get_types();
+        if fields.len() != 2 {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "WarpShuffleValue::shuffle destination tuple has {} fields, expected 2",
+                    fields.len()
+                ))
+            );
+        }
+        fields[0]
+    };
+
+    let is_f32 = value_ty.deref(ctx).is::<FP32Type>();
+    let is_i32 = value_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|ty| ty.width() == 32);
+    if !is_f32 && !is_i32 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "WarpShuffleValue::shuffle direct lowering only supports f32 and 32-bit integers, got {}",
+                value_ty.disp(ctx)
+            ))
+        );
+    }
+
+    let (mask, mut last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (value, last_op_after_value) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[2],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after_value;
+    let (lane_or_delta, last_op_after_lane) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[3],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after_lane;
+
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
+    let shuffle_op = Operation::new(
+        ctx,
+        legacy_shuffle_opid(mode, is_f32),
+        vec![value_ty],
+        vec![mask, value, lane_or_delta, clamp],
+        vec![],
+        0,
+    );
+    shuffle_op.deref_mut(ctx).set_loc(loc.clone());
+    shuffle_op.insert_after(ctx, clamp_op);
+    let shuffled = shuffle_op.deref(ctx).get_result(0);
+
+    let bool_ty = types::get_bool_type(ctx);
+    let false_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirConstantOp::get_concrete_op_info(),
+        vec![bool_ty.to_handle()],
+        vec![],
+        vec![],
+        0,
+    );
+    false_op.deref_mut(ctx).set_loc(loc.clone());
+    dialect_mir::ops::MirConstantOp::new(false_op).set_attr_value(
+        ctx,
+        IntegerAttr::new(
+            bool_ty,
+            APInt::from_u64(0, NonZeroUsize::new(1).expect("1 is non-zero")),
+        ),
+    );
+    false_op.insert_after(ctx, shuffle_op);
+    let predicate = false_op.deref(ctx).get_result(0);
+
+    let tuple_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirConstructTupleOp::get_concrete_op_info(),
+        vec![tuple_ty],
+        vec![shuffled, predicate],
+        vec![],
+        0,
+    );
+    tuple_op.deref_mut(ctx).set_loc(loc.clone());
+    tuple_op.insert_after(ctx, false_op);
+    let tuple_value = tuple_op.deref(ctx).get_result(0);
+
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        tuple_value,
+        target,
+        block_ptr,
+        tuple_op,
+        value_map,
+        block_map,
+        loc,
+        "WarpShuffleValue::shuffle call without target block",
     )
 }
 

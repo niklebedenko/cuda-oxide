@@ -21,11 +21,64 @@ use super::statement;
 use super::terminator;
 use crate::error::TranslationResult;
 use crate::translator::values::ValueMap;
+use dialect_mir::ops::MirUnreachableOp;
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Legaliser;
+use pliron::location::{Located, Location};
+use pliron::op::Op;
 use pliron::operation::Operation;
+use rustc_public::CrateDef;
 use rustc_public::mir;
+use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+
+fn is_panic_entry_name(name: &str) -> bool {
+    name.contains("::panicking::") || name.contains("::rt::panic")
+}
+
+fn is_diverging_panic_call(term: &mir::Terminator) -> bool {
+    let mir::TerminatorKind::Call {
+        func, target: None, ..
+    } = &term.kind
+    else {
+        return false;
+    };
+
+    let mir::Operand::Constant(const_op) = func else {
+        return false;
+    };
+    let ConstantKind::ZeroSized = const_op.const_.kind() else {
+        return false;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = const_op.const_.ty().kind() else {
+        return false;
+    };
+
+    is_panic_entry_name(fn_def.name().as_str())
+}
+
+fn emit_unreachable(
+    ctx: &mut Context,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> Ptr<Operation> {
+    let op = Operation::new(
+        ctx,
+        MirUnreachableOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc);
+    if let Some(prev) = prev_op {
+        op.insert_after(ctx, prev);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+    op
+}
 
 /// Translates a MIR basic block's contents into the corresponding Pliron IR block.
 ///
@@ -56,6 +109,16 @@ pub fn translate_block(
     entry_prev_op: Option<Ptr<Operation>>,
 ) -> TranslationResult<()> {
     let mut prev_op: Option<Ptr<Operation>> = entry_prev_op;
+
+    if is_diverging_panic_call(&mir_block.terminator) {
+        let loc = Location::Named {
+            name: format!("{:?}", mir_block.terminator.span),
+            child_loc: Box::new(Location::Unknown),
+        };
+        emit_unreachable(ctx, block_ptr, prev_op, loc);
+        return Ok(());
+    }
+
     for stmt in &mir_block.statements {
         let op_ptr =
             statement::translate_statement(ctx, body, stmt, value_map, block_ptr, prev_op)?;
