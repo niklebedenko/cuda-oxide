@@ -127,7 +127,8 @@
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::mir::mono::{CodegenUnit, MonoItem};
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{ConstOperand, ConstValue, Location, TerminatorKind};
+use rustc_index::bit_set::DenseBitSet;
+use rustc_middle::mir::{BasicBlock, ConstOperand, ConstValue, Location, TerminatorKind, traversal};
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -894,15 +895,30 @@ impl<'tcx> DeviceCollector<'tcx> {
                     );
                 }
 
+                // Skip blocks that are unreachable after monomorphization —
+                // e.g. the const-false arm of `if S::CONST_FLAG` in a generic
+                // fn. rustc's own collector walks only mono-reachable blocks
+                // (see `Body::mono_successors`), so dead-arm callees are never
+                // instantiated anywhere else; collecting them here would
+                // demand symbols that can never resolve, and reject panic-only
+                // hooks that are never actually called. The MIR importer
+                // prunes the same blocks (`prune_const_switch_targets` in
+                // mir-importer), so collection and translation stay in sync.
+                let reachable =
+                    traversal::mono_reachable_as_bitset(mir, self.tcx, func.instance);
+
                 // Fail fast with an actionable diagnostic when this body
                 // contains panic-formatting machinery the device pipeline
                 // cannot compile (issue #76).
-                self.check_panic_machinery(mir, &func, &ctx);
+                self.check_panic_machinery(mir, &func, &ctx, &reachable);
 
-                // Walk all basic blocks looking for calls.
+                // Walk the reachable basic blocks looking for calls.
                 // Pass the caller so we can substitute its args into callees
                 // and attribute diagnostics to the right discovery path.
-                for bb_data in mir.basic_blocks.iter() {
+                for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
+                    if !reachable.contains(bb) {
+                        continue;
+                    }
                     if let Some(ref terminator) = bb_data.terminator {
                         self.process_terminator(terminator, mir, &func, &ctx);
                     }
@@ -1796,8 +1812,13 @@ impl<'tcx> DeviceCollector<'tcx> {
         mir: &rustc_middle::mir::Body<'tcx>,
         func: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
+        reachable: &DenseBitSet<BasicBlock>,
     ) {
         for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
+            // A panic in a mono-unreachable block never runs on device.
+            if !reachable.contains(bb) {
+                continue;
+            }
             let Some(term) = &bb_data.terminator else {
                 continue;
             };

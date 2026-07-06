@@ -212,16 +212,102 @@ fn detect_dynamic_shared_alignment(body: &mir::Body) -> Option<DynamicSharedAlig
     None
 }
 
-/// Return the non-unwind successors of a terminator.
+/// Try to resolve a block's `SwitchInt` discriminant to a compile-time
+/// constant.
+///
+/// This is the `rustc_public` analogue of rustc's
+/// `Body::try_const_mono_switchint`, which the mono collector uses to walk
+/// only mono-reachable blocks: in a *generic* fn, `if S::CONST_FLAG { .. }`
+/// survives to monomorphized MIR as a `SwitchInt` whose discriminant only
+/// becomes constant after substitution, and rustc never instantiates the
+/// dead arm's callees. `Instance::body()` (via `rustc_public_bridge`'s
+/// `BodyBuilder`) has already monomorphized the body and evaluated every
+/// const operand, so when the discriminant is constant it arrives as an
+/// allocation we can read directly.
+///
+/// The discriminant is either a const operand on the terminator itself, or
+/// (the shape rustc handles) a `Move`/`Copy` of a place assigned a constant
+/// by the last non-storage-marker statement of the same block.
+fn try_const_switch_discr(block: &mir::BasicBlock) -> Option<u128> {
+    use rustc_public::ty::TyConstKind;
+
+    let mir::TerminatorKind::SwitchInt { discr, .. } = &block.terminator.kind else {
+        return None;
+    };
+
+    let const_op = match discr {
+        mir::Operand::Constant(c) => Some(&c.const_),
+        mir::Operand::Move(place) | mir::Operand::Copy(place) => block
+            .statements
+            .iter()
+            .rev()
+            .find(|stmt| {
+                !matches!(
+                    stmt.kind,
+                    mir::StatementKind::StorageLive(_) | mir::StatementKind::StorageDead(_)
+                )
+            })
+            .and_then(|stmt| match &stmt.kind {
+                mir::StatementKind::Assign(lhs, mir::Rvalue::Use(mir::Operand::Constant(c)))
+                    if lhs == place =>
+                {
+                    Some(&c.const_)
+                }
+                _ => None,
+            }),
+        // Session-level flags (UB checks, contract checks): rustc resolves
+        // these from the session, but pruning on them is a size/perf
+        // optimisation, not a correctness requirement — leave the branch.
+        mir::Operand::RuntimeChecks(_) => None,
+    }?;
+
+    match const_op.kind() {
+        ConstantKind::Allocated(alloc) => alloc.read_uint().ok(),
+        ConstantKind::Ty(tc) => match tc.kind() {
+            TyConstKind::Value(_, alloc) => alloc.read_uint().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// If a block ends in a `SwitchInt` over a compile-time constant, return the
+/// single successor that branch actually takes.
+///
+/// Blocks only reachable through pruned arms never enter the reachable set,
+/// so their statements are never translated — matching rustc's collector,
+/// which never instantiates the dead arms' callees (translating them would
+/// demand symbols that cannot resolve; see [`try_const_switch_discr`]). The
+/// codegen collector applies the same rule via
+/// `traversal::mono_reachable_as_bitset` in `collector.rs`.
+fn prune_const_switch_targets(block: &mir::BasicBlock) -> Option<Vec<usize>> {
+    let mir::TerminatorKind::SwitchInt { targets, .. } = &block.terminator.kind else {
+        return None;
+    };
+    let bits = try_const_switch_discr(block)?;
+    let target = targets
+        .branches()
+        .find(|(value, _)| *value == bits)
+        .map(|(_, target)| target)
+        .unwrap_or_else(|| targets.otherwise());
+    Some(vec![target])
+}
+
+/// Return the non-unwind successors of a block's terminator.
 ///
 /// [`mir::Terminator::successors`] includes unwind cleanup blocks alongside
 /// "normal" control-flow targets. The CUDA toolchain does not support stack
 /// unwinding (hardware could, but `nvcc`/`ptxas` never wire it up), so the
 /// translator treats unwind cleanups as dead code. This helper strips them
-/// out so the worklist only visits blocks that matter on GPU.
-fn non_unwind_successors(kind: &mir::TerminatorKind) -> Vec<usize> {
+/// out so the worklist only visits blocks that matter on GPU. `SwitchInt`s
+/// over compile-time constants are likewise narrowed to the arm actually
+/// taken (see [`prune_const_switch_targets`]).
+fn non_unwind_successors(block: &mir::BasicBlock) -> Vec<usize> {
     use mir::TerminatorKind::*;
-    match kind {
+    if let Some(pruned) = prune_const_switch_targets(block) {
+        return pruned;
+    }
+    match &block.terminator.kind {
         Goto { target } => vec![*target],
         SwitchInt { targets, .. } => targets.all_targets(),
         Return | Resume | Abort | Unreachable => vec![],
@@ -242,7 +328,7 @@ fn compute_reachable_blocks(body: &mir::Body) -> std::collections::BTreeSet<usiz
     let mut frontier: Vec<usize> = vec![0];
     reachable.insert(0);
     while let Some(idx) = frontier.pop() {
-        let successors = non_unwind_successors(&body.blocks[idx].terminator.kind);
+        let successors = non_unwind_successors(&body.blocks[idx]);
         for succ in successors {
             if reachable.insert(succ) {
                 frontier.push(succ);
