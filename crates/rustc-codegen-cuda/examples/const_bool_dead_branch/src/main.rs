@@ -433,9 +433,13 @@ fn main() {
     // Control: monomorphic kernel, branch folds at MIR-opt time.
     {
         let mut dev_out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
-        module
-            .mono_transfer(&stream, LaunchConfig::for_num_elems(N as u32), &mut dev_out)
-            .expect("launch");
+        // SAFETY: the launch covers exactly N elements and the kernel writes
+        // only within the provided output buffer.
+        unsafe {
+            module
+                .mono_transfer(&stream, LaunchConfig::for_num_elems(N as u32), &mut dev_out)
+                .expect("launch");
+        }
         let host_out = dev_out.to_host_vec(&stream).unwrap();
         let pass = host_out == [21, 5, 21, 5];
         println!(
@@ -453,9 +457,13 @@ fn main() {
         &nodes::<_, Interp>(&useq),
         &nodes::<_, Interp>(&x7),
         |cfg, i, o| {
-            module
-                .generic_explicit::<Interp>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_explicit::<Interp>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
     all_pass &= check(
@@ -464,9 +472,13 @@ fn main() {
         &nodes::<_, InterpD>(&useq),
         &nodes::<_, InterpD>(&x7),
         |cfg, i, o| {
-            module
-                .generic_default::<InterpD>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_default::<InterpD>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
     all_pass &= check(
@@ -475,9 +487,13 @@ fn main() {
         &nodes::<_, Tet>(&fseq),
         &nodes::<_, Tet>(&x2),
         |cfg, i, o| {
-            module
-                .generic_sumfact::<Tet>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_sumfact::<Tet>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
 
@@ -488,9 +504,13 @@ fn main() {
         &nodes::<_, Plain>(&useq),
         &nodes::<_, Plain>(&useq),
         |cfg, i, o| {
-            module
-                .generic_explicit::<Plain>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_explicit::<Plain>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
     all_pass &= check(
@@ -499,9 +519,13 @@ fn main() {
         &nodes::<_, PlainD>(&useq),
         &nodes::<_, PlainD>(&useq),
         |cfg, i, o| {
-            module
-                .generic_default::<PlainD>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_default::<PlainD>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
     all_pass &= check(
@@ -510,9 +534,13 @@ fn main() {
         &nodes::<_, Cube>(&fseq),
         &nodes::<_, Cube>(&fseq),
         |cfg, i, o| {
-            module
-                .generic_sumfact::<Cube>(&stream, cfg, i, o)
-                .expect("launch")
+            // SAFETY: `check` launches over the input/output length and the
+            // kernel guards accesses by N.
+            unsafe {
+                module
+                    .generic_sumfact::<Cube>(&stream, cfg, i, o)
+                    .expect("launch")
+            }
         },
     );
 
