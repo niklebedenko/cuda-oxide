@@ -8,6 +8,7 @@
 //! Covered shapes:
 //! - bare `[T; N]` constants indexed by a runtime value,
 //! - nested `[[T; M]; N]` constants,
+//! - arrays of tuple constants containing no-payload enums,
 //! - pointer-to-array constants (`&[T; N]`), which predate bare-array support.
 //!
 //! Run with:
@@ -20,6 +21,25 @@ use cuda_host::cuda_module;
 const BARE_TABLE: [f32; 4] = [1.25, -2.5, 5.0, 10.5];
 const NESTED_TABLE: [[u32; 3]; 2] = [[11, 13, 17], [19, 23, 29]];
 const POINTER_TABLE: &[u32; 4] = &[31, 37, 41, 43];
+const TUPLE_TABLE: [(Side, bool); 6] = [
+    (Side::LowX, false),
+    (Side::HighX, true),
+    (Side::LowY, false),
+    (Side::HighY, true),
+    (Side::LowZ, false),
+    (Side::HighZ, true),
+];
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum Side {
+    LowX = 1,
+    HighX = 2,
+    LowY = 3,
+    HighY = 4,
+    LowZ = 5,
+    HighZ = 6,
+}
 
 #[cuda_module]
 mod kernels {
@@ -42,6 +62,12 @@ mod kernels {
         POINTER_TABLE[i & 3]
     }
 
+    #[inline(never)]
+    fn tuple_array_value(i: usize) -> u32 {
+        let (side, is_high) = TUPLE_TABLE[i % 6];
+        (side as u32) * 10 + (is_high as u32)
+    }
+
     #[kernel]
     pub fn check_array_constants(mut out_f32: DisjointSlice<f32>, mut out_u32: DisjointSlice<u32>) {
         let tid = thread::index_1d();
@@ -55,7 +81,8 @@ mod kernels {
         if let Some(slot) = out_u32.get_mut(tid_u32) {
             let nested = nested_array_value(i);
             let pointer = pointer_to_array_value(i);
-            *slot = nested * 100 + pointer;
+            let tuple = tuple_array_value(i);
+            *slot = nested * 10_000 + pointer * 100 + tuple;
         }
     }
 }
@@ -69,7 +96,9 @@ fn expected_u32(i: usize) -> u32 {
     let col = (i / 2) % 3;
     let nested = NESTED_TABLE[row][col];
     let pointer = POINTER_TABLE[i & 3];
-    nested * 100 + pointer
+    let (side, is_high) = TUPLE_TABLE[i % 6];
+    let tuple = (side as u32) * 10 + (is_high as u32);
+    nested * 10_000 + pointer * 100 + tuple
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -119,7 +148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if failures == 0 {
-        println!("array_constants: PASS ({N} threads; bare, nested, pointer-to-array constants)");
+        println!(
+            "array_constants: PASS ({N} threads; bare, nested, tuple, pointer-to-array constants)"
+        );
         Ok(())
     } else {
         println!("array_constants: FAIL ({failures} mismatches)");
