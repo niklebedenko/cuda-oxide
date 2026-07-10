@@ -787,13 +787,13 @@ fn test_elect_sync_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// The exact inline-PTX template `convert_shuffle_i64` must emit for `mode`/`clamp`.
+/// The exact inline-PTX template `convert_shuffle_i64` must emit for `mode`.
 /// Mirrors the production `format!` so a drift in either side fails the test.
-fn expected_shfl_i64_template(mode: &str, clamp: i32) -> String {
+fn expected_shfl_i64_template(mode: &str) -> String {
     format!(
         "{{ .reg .b32 lo; .reg .b32 hi; mov.b64 {{lo, hi}}, $1; \
-         shfl.sync.{mode}.b32 lo, lo, $2, {clamp}, $3; \
-         shfl.sync.{mode}.b32 hi, hi, $2, {clamp}, $3; \
+         shfl.sync.{mode}.b32 lo, lo, $2, $3, $4; \
+         shfl.sync.{mode}.b32 hi, hi, $2, $3, $4; \
          mov.b64 $0, {{lo, hi}}; }}"
     )
 }
@@ -802,9 +802,8 @@ fn expected_shfl_i64_template(mode: &str, clamp: i32) -> String {
 /// lowers to convergent inline PTX that splits the value into two halves and runs
 /// two `shfl.sync.*.b32`. Inline asm is opaque to LLVM, so a wrong mnemonic,
 /// swapped operand order, wrong clamp, or missing `convergent` would only surface
-/// as bad PTX downstream. This pins, for every mode, the exact template (incl. the
-/// per-mode clamp: 31 for idx/bfly/down, 0 for up), the `=l,l,r,r` constraints,
-/// and the convergent flag.
+/// as bad PTX downstream. This pins, for every mode, the exact template, the
+/// `=l,l,r,r,r` constraints, and the convergent flag.
 #[test]
 fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{IntegerType, Signedness};
@@ -812,14 +811,17 @@ fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = make_test_ctx();
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
     let i64_ty = IntegerType::get(&mut ctx, 64, Signedness::Signless);
-    // Kernel args: [mask (i32), value (i64), lane/delta (i32)].
-    let (module_ptr, entry) =
-        build_test_kernel(&mut ctx, vec![i32_ty.into(), i64_ty.into(), i32_ty.into()]);
+    // Kernel args: [mask (i32), value (i64), lane/delta (i32), clamp (i32)].
+    let (module_ptr, entry) = build_test_kernel(
+        &mut ctx,
+        vec![i32_ty.into(), i64_ty.into(), i32_ty.into(), i32_ty.into()],
+    );
     let mask = entry.deref(&ctx).get_argument(0);
     let value = entry.deref(&ctx).get_argument(1);
     let lane = entry.deref(&ctx).get_argument(2);
+    let clamp = entry.deref(&ctx).get_argument(3);
 
-    // One op per mode, all sharing the same [mask, value, lane] operands.
+    // One op per mode, all sharing the same [mask, value, lane, clamp] operands.
     type OpInfo = (
         fn(pliron::context::Ptr<Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
@@ -835,7 +837,7 @@ fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
             &mut ctx,
             opid,
             vec![i64_ty.into()],
-            vec![mask, value, lane],
+            vec![mask, value, lane, clamp],
             vec![],
             0,
         );
@@ -868,8 +870,8 @@ fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
                         .get_attr_inline_asm_constraints(&ctx)
                         .map(|s| String::from((*s).clone()))
                         .as_deref(),
-                    Some("=l,l,r,r"),
-                    "shfl.b64 constraints must be [out i64, value i64, lane i32, mask i32]"
+                    Some("=l,l,r,r,r"),
+                    "shfl.b64 constraints must be [out i64, value i64, lane i32, clamp i32, mask i32]"
                 );
                 assert!(
                     inline_asm
@@ -892,11 +894,11 @@ fn test_shuffle_i64_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
         4,
         "each of the 4 shfl.b64 modes must lower to one inline-asm op"
     );
-    for (_, mode, clamp) in modes {
-        let want = expected_shfl_i64_template(mode, clamp);
+    for (_, mode, _) in modes {
+        let want = expected_shfl_i64_template(mode);
         assert!(
             templates.contains(&want),
-            "missing inline PTX for shfl.sync.{mode}.b32 (clamp {clamp}); got {templates:?}"
+            "missing inline PTX for shfl.sync.{mode}.b32; got {templates:?}"
         );
     }
 

@@ -13,7 +13,8 @@ use std::num::NonZeroUsize;
 
 use llvm_export::{
     attributes::{
-        FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr, IntegerOverflowFlagsAttr,
+        AtomicRmwKindAttr, FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr,
+        IntegerOverflowFlagsAttr,
     },
     op_interfaces::{
         BinArithOp, CastOpInterface, CastOpWithNNegInterface, FastMathFlags,
@@ -46,8 +47,10 @@ const NNEG_ATTR: &str = "llvm_nneg_flag";
 
 /// Rewrite a lowered LLVM module to the LLVM 7 subset used by legacy NVVM IR.
 ///
-/// Atomic and fence operations that cuda-oxide has not yet legalized return an
-/// error instead of being emitted with unverified semantics.
+/// Atomic loads/stores/CAS and fence operations that cuda-oxide has not yet
+/// legalized return an error instead of being emitted with unverified
+/// semantics. Atomic RMW operations already lower to NVVM-compatible
+/// `atomicrmw` instructions and pass through unchanged.
 pub(crate) fn legalize_for_legacy_nvvm(ctx: &mut Context, module: Ptr<Operation>) -> Result<()> {
     let mut ops = Vec::new();
     collect_ops(ctx, module, &mut ops);
@@ -63,6 +66,11 @@ pub(crate) fn legalize_for_legacy_nvvm(ctx: &mut Context, module: Ptr<Operation>
     let mut obsolete_declarations = Vec::new();
     for op in ops {
         remove_nneg(ctx, op);
+
+        if Operation::get_op::<llvm::AtomicRmwOp>(op, ctx).is_some() {
+            rewrite_float_atomic_add(ctx, op)?;
+            continue;
+        }
 
         if Operation::get_op::<llvm::FNegOp>(op, ctx).is_some() {
             rewrite_fneg(ctx, op)?;
@@ -253,8 +261,14 @@ fn reject_unsupported_op(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
         Some("atomic loads")
     } else if Operation::get_op::<llvm::AtomicStoreOp>(op, ctx).is_some() {
         Some("atomic stores")
-    } else if Operation::get_op::<llvm::AtomicRmwOp>(op, ctx).is_some() {
-        Some("atomic read-modify-write operations")
+    } else if let Some(rmw) = Operation::get_op::<llvm::AtomicRmwOp>(op, ctx) {
+        match rmw.get_attr_llvm_rmw_kind(ctx).as_deref() {
+            Some(AtomicRmwKindAttr::FAdd) => None,
+            Some(AtomicRmwKindAttr::FSub | AtomicRmwKindAttr::FMax | AtomicRmwKindAttr::FMin) => {
+                Some("floating-point atomic operations other than add")
+            }
+            _ => None,
+        }
     } else if Operation::get_op::<llvm::AtomicCmpxchgOp>(op, ctx).is_some() {
         Some("atomic compare-exchange operations")
     } else if Operation::get_op::<llvm::FenceOp>(op, ctx).is_some() {
@@ -272,6 +286,75 @@ fn reject_unsupported_op(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// LLVM 7 predates floating-point `atomicrmw`, while NVVM exposes stable
+/// floating-point atomic-add intrinsics for generic, global, and shared
+/// pointers. Rewrite the sole portable floating RMW operation before exporting
+/// legacy typed-pointer IR.
+fn rewrite_float_atomic_add(ctx: &mut Context, op: Ptr<Operation>) -> Result<()> {
+    let rmw = Operation::get_op::<llvm::AtomicRmwOp>(op, ctx).expect("validated atomic RMW");
+    if rmw.get_attr_llvm_rmw_kind(ctx).as_deref() != Some(&AtomicRmwKindAttr::FAdd) {
+        return Ok(());
+    }
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    let (ptr, value) = (operands[0], operands[1]);
+    let width = float_width(ctx, value.get_type(ctx)).ok_or_else(|| {
+        pliron::input_error!(
+            op.deref(ctx).loc(),
+            "floating-point atomic add requires an f32 or f64 value"
+        )
+    })?;
+    if !matches!(width, 32 | 64) {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "legacy NVVM floating-point atomic add supports only f32 and f64"
+        );
+    }
+    let address_space = ptr
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_types::PointerType>()
+        .map(llvm_types::PointerType::address_space)
+        .ok_or_else(|| {
+            pliron::input_error!(
+                op.deref(ctx).loc(),
+                "floating-point atomic add requires a pointer operand"
+            )
+        })?;
+    if !matches!(address_space, 0 | 1 | 3) {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "legacy NVVM floating-point atomic add does not support address space {address_space}"
+        );
+    }
+
+    let intrinsic = format!("llvm_nvvm_atomic_load_add_f{width}_p{address_space}f{width}");
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        value.get_type(ctx),
+        vec![ptr.get_type(ctx), value.get_type(ctx)],
+        false,
+    );
+    let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
+        pliron::input_error!(op.deref(ctx).loc(), "atomic RMW has no parent block")
+    })?;
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic, func_ty)
+        .map_err(|error| pliron::input_error!(op.deref(ctx).loc(), "{error}"))?;
+    let call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(intrinsic.try_into().map_err(|error| {
+            pliron::input_error!(
+                op.deref(ctx).loc(),
+                "invalid atomic intrinsic name: {error}"
+            )
+        })?),
+        func_ty,
+        vec![ptr, value],
+    );
+    let result = insert_before(ctx, op, call.get_operation());
+    replace_one_result(ctx, op, result)
 }
 
 fn validate_rewrite_candidate(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
@@ -1246,6 +1329,7 @@ fn verify_legacy_subset(ctx: &Context, module: Ptr<Operation>) -> Result<()> {
 mod tests {
     use super::*;
     use llvm_export::{
+        attributes::AtomicOrderingAttr,
         op_interfaces::{CastOpWithNNegInterface, NNegFlag},
         types::{FuncType, PointerType, VoidType},
     };
@@ -1738,5 +1822,50 @@ mod tests {
         let error = legalize_for_legacy_nvvm(&mut ctx, module.get_operation()).unwrap_err();
         assert!(error.disp(&ctx).to_string().contains("atomic loads"));
         assert!(Operation::get_op::<llvm::AtomicLoadOp>(load.get_operation(), &ctx).is_some());
+    }
+
+    #[test]
+    fn legacy_f64_atomic_add_uses_the_nvvm_intrinsic() {
+        let mut ctx = Context::new();
+        let module = ModuleOp::new(&mut ctx, "atomic_add".try_into().unwrap());
+        let ptr_ty: TypeHandle = PointerType::get(&ctx, 1).into();
+        let f64_ty: TypeHandle = FP64Type::get(&ctx).into();
+        let (func, entry) = function(
+            &mut ctx,
+            &module,
+            "atomic_add_f64",
+            f64_ty,
+            vec![ptr_ty, f64_ty],
+        );
+        let ptr = entry.deref(&ctx).get_argument(0);
+        let value = entry.deref(&ctx).get_argument(1);
+        let rmw = llvm::AtomicRmwOp::new(
+            &mut ctx,
+            ptr,
+            value,
+            AtomicRmwKindAttr::FAdd,
+            AtomicOrderingAttr::Monotonic,
+            Some("device".to_string()),
+        );
+        rmw.get_operation().insert_at_back(entry, &ctx);
+        let result = rmw.get_operation().deref(&ctx).get_result(0);
+        llvm::ReturnOp::new(&mut ctx, Some(result))
+            .get_operation()
+            .insert_at_back(entry, &ctx);
+
+        legalize_for_legacy_nvvm(&mut ctx, module.get_operation()).unwrap();
+
+        let mut ops = Vec::new();
+        collect_ops(&ctx, module.get_operation(), &mut ops);
+        assert!(
+            !ops.iter()
+                .any(|op| Operation::get_op::<llvm::AtomicRmwOp>(*op, &ctx).is_some())
+        );
+        assert!(ops.iter().any(|op| {
+            Operation::get_op::<llvm::CallOp>(*op, &ctx).is_some_and(|call| {
+                matches!(call.callee(&ctx), CallOpCallable::Direct(name) if name.to_string() == "llvm_nvvm_atomic_load_add_f64_p1f64")
+            })
+        }));
+        func.get_operation().deref(&ctx).verify(&ctx).unwrap();
     }
 }
