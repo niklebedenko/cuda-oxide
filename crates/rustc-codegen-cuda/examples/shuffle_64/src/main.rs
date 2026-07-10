@@ -74,6 +74,29 @@ mod kernels {
         }
     }
 
+    /// Exercise the compatibility `WarpShuffleValue` trait path used by
+    /// generic numerical kernels.
+    #[kernel]
+    pub fn legacy_trait_f64_butterfly_sum(mut out: DisjointSlice<f64>) {
+        let lane = warp::lane_id();
+        let mut value = (lane as f64) + 1.0;
+        for lane_mask in [16, 8, 4, 2, 1] {
+            let (other, _) = unsafe {
+                <f64 as warp::WarpShuffleValue>::shuffle(
+                    warp::WarpShuffleMode::Xor,
+                    u32::MAX,
+                    value,
+                    lane_mask,
+                    32,
+                )
+            };
+            value += other;
+        }
+        unsafe {
+            *out.get_unchecked_mut(lane as usize) = value;
+        }
+    }
+
     /// `down`/`up` modes: each lane holds `NEIGHBOR_HI | lane` and reads its
     /// upper (`down`, lane+1) and lower (`up`, lane-1) neighbor. The PTX
     /// out-of-range rule means lane 31's `down` and lane 0's `up` keep their own
@@ -249,6 +272,20 @@ fn main() {
         println!("✓ each half shuffled within its own membermask (no cross-talk)");
     } else {
         println!("✗ masked half-warp broadcast mismatch (membermask mis-wired?)");
+        failed = true;
+    }
+
+    // ===== Test 5: compatibility WarpShuffleValue trait on f64 =====
+    println!("\n--- Test 5: WarpShuffleValue<f64> butterfly sum ---");
+    let mut legacy_dev = DeviceBuffer::<f64>::zeroed(&stream, WARP).unwrap();
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.legacy_trait_f64_butterfly_sum((stream).as_ref(), cfg, &mut legacy_dev) }
+        .expect("Kernel launch failed");
+    let legacy = legacy_dev.to_host_vec(&stream).unwrap();
+    if legacy.iter().all(|&value| (value - want_sum).abs() < 1e-9) {
+        println!("✓ compatibility trait preserves full-width f64 values");
+    } else {
+        println!("✗ compatibility trait f64 shuffle mismatch");
         failed = true;
     }
 

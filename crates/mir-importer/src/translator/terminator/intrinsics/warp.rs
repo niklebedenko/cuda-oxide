@@ -12,10 +12,12 @@ use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
 use crate::translator::types;
 use crate::translator::values::ValueMap;
+use dialect_mir::attributes::MirCastKindAttr;
+use dialect_mir::ops::MirCastOp;
 use dialect_nvvm::ops::{ActiveMaskOp, BarWarpSyncOp, ElectSyncOp, ReadPtxSregLaneIdOp};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::attributes::IntegerAttr;
-use pliron::builtin::types::FP32Type;
+use pliron::builtin::types::{FP32Type, FP64Type};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::input_err;
@@ -439,6 +441,7 @@ pub fn emit_warp_shuffle_f32(
 /// # Parameters
 /// - `shuffle_opid`: the NVVM opid for the specific 64-bit shuffle variant
 /// - `args`: `[mask, value, lane/lane_mask/delta]`
+/// - `clamp`: full-warp clamp for the shuffle mode
 pub fn emit_warp_shuffle_i64(
     ctx: &mut Context,
     body: &mir::Body,
@@ -446,6 +449,7 @@ pub fn emit_warp_shuffle_i64(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    clamp: u32,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -499,21 +503,19 @@ pub fn emit_warp_shuffle_i64(
     )?;
     last_op = last_op_after;
 
+    let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
+
     let shuffle_op = Operation::new(
         ctx,
         shuffle_opid,
         vec![u64_type.to_handle()],
-        vec![mask, val, lane_or_delta],
+        vec![mask, val, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
 
-    if let Some(prev) = last_op {
-        shuffle_op.insert_after(ctx, prev);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
+    shuffle_op.insert_after(ctx, clamp_op);
 
     let result_value = shuffle_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
@@ -644,6 +646,20 @@ fn legacy_shuffle_opid(
     }
 }
 
+fn legacy_shuffle_i64_opid(
+    mode: LegacyShuffleMode,
+) -> (
+    fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+    std::any::TypeId,
+) {
+    match mode {
+        LegacyShuffleMode::Idx => dialect_nvvm::ops::ShflSyncIdxI64Op::get_concrete_op_info(),
+        LegacyShuffleMode::Up => dialect_nvvm::ops::ShflSyncUpI64Op::get_concrete_op_info(),
+        LegacyShuffleMode::Down => dialect_nvvm::ops::ShflSyncDownI64Op::get_concrete_op_info(),
+        LegacyShuffleMode::Xor => dialect_nvvm::ops::ShflSyncBflyI64Op::get_concrete_op_info(),
+    }
+}
+
 fn legacy_shuffle_clamp(
     mode: LegacyShuffleMode,
     width: u32,
@@ -728,15 +744,16 @@ pub fn emit_warp_shuffle_value_trait(
     };
 
     let is_f32 = value_ty.deref(ctx).is::<FP32Type>();
+    let is_f64 = value_ty.deref(ctx).is::<FP64Type>();
     let is_i32 = value_ty
         .deref(ctx)
         .downcast_ref::<IntegerType>()
         .is_some_and(|ty| ty.width() == 32);
-    if !is_f32 && !is_i32 {
+    if !is_f32 && !is_f64 && !is_i32 {
         return input_err!(
             loc.clone(),
             TranslationErr::unsupported(format!(
-                "WarpShuffleValue::shuffle direct lowering only supports f32 and 32-bit integers, got {}",
+                "WarpShuffleValue::shuffle direct lowering only supports f32, f64, and 32-bit integers, got {}",
                 value_ty.disp(ctx)
             ))
         );
@@ -751,7 +768,7 @@ pub fn emit_warp_shuffle_value_trait(
         prev_op,
         loc.clone(),
     )?;
-    let (value, last_op_after_value) = rvalue::translate_operand(
+    let (mut value, last_op_after_value) = rvalue::translate_operand(
         ctx,
         body,
         &args[2],
@@ -761,6 +778,29 @@ pub fn emit_warp_shuffle_value_trait(
         loc.clone(),
     )?;
     last_op = last_op_after_value;
+    let shuffle_value_ty = if is_f64 {
+        let u64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned).to_handle();
+        let cast_op = Operation::new(
+            ctx,
+            MirCastOp::get_concrete_op_info(),
+            vec![u64_ty],
+            vec![value],
+            vec![],
+            0,
+        );
+        cast_op.deref_mut(ctx).set_loc(loc.clone());
+        MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::Transmute);
+        if let Some(last_op) = last_op {
+            cast_op.insert_after(ctx, last_op);
+        } else {
+            cast_op.insert_at_front(block_ptr, ctx);
+        }
+        value = cast_op.deref(ctx).get_result(0);
+        last_op = Some(cast_op);
+        u64_ty
+    } else {
+        value_ty
+    };
     let (lane_or_delta, last_op_after_lane) = rvalue::translate_operand(
         ctx,
         body,
@@ -774,17 +814,39 @@ pub fn emit_warp_shuffle_value_trait(
 
     let (clamp, clamp_op) = emit_u32_constant(ctx, clamp, block_ptr, last_op, loc.clone());
 
+    let shuffle_opid = if is_f64 {
+        legacy_shuffle_i64_opid(mode)
+    } else {
+        legacy_shuffle_opid(mode, is_f32)
+    };
     let shuffle_op = Operation::new(
         ctx,
-        legacy_shuffle_opid(mode, is_f32),
-        vec![value_ty],
+        shuffle_opid,
+        vec![shuffle_value_ty],
         vec![mask, value, lane_or_delta, clamp],
         vec![],
         0,
     );
     shuffle_op.deref_mut(ctx).set_loc(loc.clone());
     shuffle_op.insert_after(ctx, clamp_op);
-    let shuffled = shuffle_op.deref(ctx).get_result(0);
+    let mut shuffled = shuffle_op.deref(ctx).get_result(0);
+    let result_op = if is_f64 {
+        let cast_op = Operation::new(
+            ctx,
+            MirCastOp::get_concrete_op_info(),
+            vec![value_ty],
+            vec![shuffled],
+            vec![],
+            0,
+        );
+        cast_op.deref_mut(ctx).set_loc(loc.clone());
+        MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::Transmute);
+        cast_op.insert_after(ctx, shuffle_op);
+        shuffled = cast_op.deref(ctx).get_result(0);
+        cast_op
+    } else {
+        shuffle_op
+    };
 
     let bool_ty = types::get_bool_type(ctx);
     let false_op = Operation::new(
@@ -803,7 +865,7 @@ pub fn emit_warp_shuffle_value_trait(
             APInt::from_u64(0, NonZeroUsize::new(1).expect("1 is non-zero")),
         ),
     );
-    false_op.insert_after(ctx, shuffle_op);
+    false_op.insert_after(ctx, result_op);
     let predicate = false_op.deref(ctx).get_result(0);
 
     let tuple_op = Operation::new(

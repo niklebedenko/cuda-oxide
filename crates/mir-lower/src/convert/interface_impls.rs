@@ -1982,7 +1982,6 @@ impl MirToLlvmConversion for ShflSyncIdxI64Op {
             self.get_operation(),
             operands_info,
             "idx",
-            31,
         )
     }
 }
@@ -2001,7 +2000,6 @@ impl MirToLlvmConversion for ShflSyncBflyI64Op {
             self.get_operation(),
             operands_info,
             "bfly",
-            31,
         )
     }
 }
@@ -2020,7 +2018,6 @@ impl MirToLlvmConversion for ShflSyncDownI64Op {
             self.get_operation(),
             operands_info,
             "down",
-            31,
         )
     }
 }
@@ -2039,7 +2036,6 @@ impl MirToLlvmConversion for ShflSyncUpI64Op {
             self.get_operation(),
             operands_info,
             "up",
-            0,
         )
     }
 }

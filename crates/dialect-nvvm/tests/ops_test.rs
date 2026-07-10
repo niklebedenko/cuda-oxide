@@ -1112,18 +1112,19 @@ fn test_shfl_sync_i64_construct_and_verify() {
     let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
 
-    // A block supplies [mask (i32), value (i64), lane/delta (i32)].
+    // A block supplies [mask (i32), value (i64), lane/delta (i32), clamp (i32)].
     let block = BasicBlock::new(
         &mut ctx,
         None,
-        vec![i32_ty.into(), i64_ty.into(), i32_ty.into()],
+        vec![i32_ty.into(), i64_ty.into(), i32_ty.into(), i32_ty.into()],
     );
     let mask = block.deref(&ctx).get_argument(0);
     let value = block.deref(&ctx).get_argument(1);
     let lane = block.deref(&ctx).get_argument(2);
+    let clamp = block.deref(&ctx).get_argument(3);
 
-    // All four modes share the same shape: 3 operands [mask, value, lane], 1
-    // i64 result (NOpdsInterface<3>/NResultsInterface<1>).
+    // All four modes share the same shape: 4 operands
+    // [mask, value, lane, clamp], 1 i64 result.
     let modes: [OpInfo; 4] = [
         ShflSyncIdxI64Op::get_concrete_op_info(),
         ShflSyncBflyI64Op::get_concrete_op_info(),
@@ -1137,13 +1138,13 @@ fn test_shfl_sync_i64_construct_and_verify() {
             &mut ctx,
             opid,
             vec![i64_ty.into()],
-            vec![mask, value, lane],
+            vec![mask, value, lane, clamp],
             vec![],
             0,
         );
         assert!(verify_op(&ShflSyncIdxI64Op::new(op), &ctx).is_ok());
 
-        // Invalid: wrong operand count (2 instead of 3) must fail verification.
+        // Invalid: wrong operand count must fail verification.
         let bad = Operation::new(
             &mut ctx,
             opid,

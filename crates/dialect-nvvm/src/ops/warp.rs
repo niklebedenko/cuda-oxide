@@ -548,6 +548,7 @@ impl ShflSyncUpF32Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i64): the 64-bit value to share
 /// - `src_lane` (i32): the lane index to read from (0-31)
+/// - `clamp` (i32): lane clamp and segmentation control
 ///
 /// # Results
 ///
@@ -556,7 +557,7 @@ impl ShflSyncUpF32Op {
     name = "nvvm.shfl_sync_idx_i64",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncIdxI64Op;
 
@@ -576,6 +577,7 @@ impl ShflSyncIdxI64Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i64): the 64-bit value to exchange
 /// - `lane_mask` (i32): XOR mask for lane calculation
+/// - `clamp` (i32): lane clamp and segmentation control
 ///
 /// # Results
 ///
@@ -584,7 +586,7 @@ impl ShflSyncIdxI64Op {
     name = "nvvm.shfl_sync_bfly_i64",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncBflyI64Op;
 
@@ -604,6 +606,7 @@ impl ShflSyncBflyI64Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i64): the 64-bit value to share
 /// - `delta` (i32): offset to add to lane ID
+/// - `clamp` (i32): lane clamp and segmentation control
 ///
 /// # Results
 ///
@@ -612,7 +615,7 @@ impl ShflSyncBflyI64Op {
     name = "nvvm.shfl_sync_down_i64",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncDownI64Op;
 
@@ -632,6 +635,7 @@ impl ShflSyncDownI64Op {
 /// - `mask` (i32): warp lane participation mask (`-1` = full warp)
 /// - `value` (i64): the 64-bit value to share
 /// - `delta` (i32): offset to subtract from lane ID
+/// - `clamp` (i32): lane clamp and segmentation control
 ///
 /// # Results
 ///
@@ -640,7 +644,7 @@ impl ShflSyncDownI64Op {
     name = "nvvm.shfl_sync_up_i64",
     format,
     verifier = "succ",
-    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+    interfaces = [NOpdsInterface<4>, NResultsInterface<1>],
 )]
 pub struct ShflSyncUpI64Op;
 
