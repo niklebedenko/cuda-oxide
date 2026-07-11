@@ -9,8 +9,7 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::{
-    Data, DataEnum, DataStruct, DataUnion, DeriveInput, Field, Fields, Generics, TypeParamBound,
-    parse_str,
+    Data, DataEnum, DataStruct, DataUnion, DeriveInput, Field, Fields, Generics, parse_quote,
 };
 
 pub fn impl_device_copy(input: &DeriveInput, import: TokenStream) -> TokenStream {
@@ -70,13 +69,47 @@ pub fn impl_device_copy(input: &DeriveInput, import: TokenStream) -> TokenStream
 
 fn add_bound_to_generics(generics: &Generics, import: TokenStream) -> Generics {
     let mut new_generics = generics.clone();
-    let bound: TypeParamBound = parse_str(&quote! {#import}.to_string()).unwrap();
-
-    for type_param in &mut new_generics.type_params_mut() {
-        type_param.bounds.push(bound.clone())
+    let type_params = new_generics
+        .type_params()
+        .map(|param| param.ident.clone())
+        .collect::<Vec<_>>();
+    let where_clause = new_generics.make_where_clause();
+    for type_param in type_params {
+        where_clause
+            .predicates
+            .push(parse_quote!(#type_param: #import));
     }
 
     new_generics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_bound_to_generics;
+    use quote::{ToTokens, quote};
+    use syn::{DeriveInput, parse_quote};
+
+    #[test]
+    fn device_copy_bounds_share_the_where_clause() {
+        let input: DeriveInput = parse_quote!(
+            struct Example<T: Copy, U>(T, U)
+            where
+                U: Send;
+        );
+        let bounded = add_bound_to_generics(&input.generics, quote!(::cuda_core::DeviceCopy));
+        let params = bounded.params.to_token_stream().to_string();
+        let where_clause = bounded
+            .where_clause
+            .expect("DeviceCopy bounds require a where clause")
+            .to_token_stream()
+            .to_string();
+
+        assert_eq!(params, "T : Copy , U");
+        assert_eq!(
+            where_clause,
+            "where U : Send , T : :: cuda_core :: DeviceCopy , U : :: cuda_core :: DeviceCopy"
+        );
+    }
 }
 
 fn type_check_struct(s: &DataStruct) -> TokenStream {
