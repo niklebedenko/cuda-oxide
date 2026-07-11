@@ -13,7 +13,11 @@ use crate::target::{
 use llvm_export::export::DebugKind;
 use std::path::{Path, PathBuf};
 
-/// Runs LLVM's middle-end (`opt -O2`) on the emitted IR before `llc`.
+/// Runs LLVM's middle-end on the emitted IR before `llc`.
+///
+/// Kernel-bearing modules internalize non-entry definitions before the default
+/// O2 pipeline so fully inlined helpers are eligible for global dead-code
+/// elimination. Helper-only modules retain the historical `opt -O2` path.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
 /// LoadStoreVectorizer fuses aligned aggregate/element accesses, SROA
@@ -48,9 +52,17 @@ fn optimize_ll(
         return Ok((None, Vec::new()));
     };
 
+    // Let `opt` remain the authority for input-read diagnostics. Falling back
+    // to the historical `-O2` invocation preserves the legacy warn-and-continue
+    // behavior when the input itself is unavailable.
+    let kernel_symbols = std::fs::read_to_string(ll_path)
+        .map(|llvm_ir| ptx_kernel_symbols(&llvm_ir))
+        .unwrap_or_default();
+    let optimization_args = optimization_args(&kernel_symbols);
+
     let opt_ll = ll_path.with_extension("opt.ll");
     match std::process::Command::new(&opt.path)
-        .arg("-O2")
+        .args(&optimization_args)
         .arg(ll_path)
         .arg("-S")
         .arg("-o")
@@ -60,7 +72,14 @@ fn optimize_ll(
         Ok(output) if output.status.success() => {
             let diagnostics = opts
                 .verbose
-                .then(|| format!("opt -O2 via {}: {}", opt.path, opt_ll.display()))
+                .then(|| {
+                    format!(
+                        "opt {} via {}: {}",
+                        optimization_args.join(" "),
+                        opt.path,
+                        opt_ll.display()
+                    )
+                })
                 .into_iter()
                 .collect();
             Ok((Some(opt_ll), diagnostics))
@@ -97,6 +116,40 @@ fn optimize_ll(
             }
         }
     }
+}
+
+/// Build the middle-end arguments for a self-contained PTX module.
+///
+/// Rust helpers are collected into the same LLVM module as their entry kernels.
+/// Once ordinary inlining has copied a helper into every caller, its externally
+/// visible definition is dead. Internalizing those helpers before the default
+/// optimization pipeline lets GlobalDCE remove them instead of asking `llc` to
+/// emit hundreds of unreachable `.visible .func` bodies. Kernel symbols remain
+/// public because the host launches them by name.
+fn optimization_args(kernel_symbols: &[String]) -> Vec<String> {
+    if kernel_symbols.is_empty() {
+        return vec!["-O2".to_string()];
+    }
+
+    vec![
+        "-passes=internalize,default<O2>".to_string(),
+        format!("-internalize-public-api-list={}", kernel_symbols.join(",")),
+    ]
+}
+
+/// Extract `ptx_kernel` definition symbols from textual LLVM IR.
+fn ptx_kernel_symbols(llvm_ir: &str) -> Vec<String> {
+    llvm_ir
+        .lines()
+        .filter_map(|line| {
+            let definition = line.trim_start().strip_prefix("define ptx_kernel ")?;
+            let symbol = definition.split_once('@')?.1;
+            if let Some(quoted) = symbol.strip_prefix('"') {
+                return quoted.split_once('"').map(|(name, _)| name.to_string());
+            }
+            symbol.split_once('(').map(|(name, _)| name.to_string())
+        })
+        .collect()
 }
 
 /// Legacy rustc-pipeline result, including messages the CLI should print.
@@ -454,6 +507,38 @@ mod tests {
         let error = optimize_ll(input, &toolchain, &opts, true).unwrap_err();
         assert!(matches!(&error, PipelineError::Optimization(_)));
         assert!(error.to_string().contains("opt (/bin/false) failed"));
+    }
+
+    #[test]
+    fn ptx_optimization_internalizes_helpers_but_preserves_kernel_symbols() {
+        let llvm_ir = r#"
+define void @helper() {
+  ret void
+}
+define ptx_kernel void @first_kernel(i32 %value) {
+  ret void
+}
+define ptx_kernel void @"quoted.kernel"() {
+  ret void
+}
+"#;
+
+        let symbols = ptx_kernel_symbols(llvm_ir);
+        assert_eq!(symbols, ["first_kernel", "quoted.kernel"]);
+        assert_eq!(
+            optimization_args(&symbols),
+            [
+                "-passes=internalize,default<O2>",
+                "-internalize-public-api-list=first_kernel,quoted.kernel",
+            ]
+        );
+    }
+
+    #[test]
+    fn helper_only_modules_keep_the_existing_optimization_pipeline() {
+        let symbols = ptx_kernel_symbols("define void @helper() { ret void }");
+        assert!(symbols.is_empty());
+        assert_eq!(optimization_args(&symbols), ["-O2"]);
     }
 
     #[test]
