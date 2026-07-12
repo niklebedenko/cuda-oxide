@@ -52,11 +52,11 @@ use dialect_mir::types::{
 };
 use llvm_export::attributes::{ICmpPredicateAttr, IntegerOverflowFlagsAttr};
 use llvm_export::op_interfaces::{
-    CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
-use pliron::builtin::types::{IntegerType, Signedness};
+use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
@@ -333,6 +333,175 @@ fn union_type_of_operand(
         })
 }
 
+fn float_array_shape(ctx: &Context, ty: TypeHandle) -> Option<(u64, TypeHandle, u32)> {
+    let ty_ref = ty.deref(ctx);
+    let array = ty_ref.downcast_ref::<llvm_export::types::ArrayType>()?;
+    let element_ty = array.elem_type();
+    let element_bits = if element_ty.deref(ctx).is::<FP32Type>() {
+        32
+    } else if element_ty.deref(ctx).is::<FP64Type>() {
+        64
+    } else {
+        return None;
+    };
+    Some((array.size(), element_ty, element_bits))
+}
+
+fn union_integer_carrier(
+    ctx: &Context,
+    storage_ty: TypeHandle,
+    union_size: u64,
+) -> Option<(u32, TypeHandle, u32)> {
+    let storage_ref = storage_ty.deref(ctx);
+    let storage = storage_ref.downcast_ref::<llvm_export::types::StructType>()?;
+    storage.fields().enumerate().find_map(|(index, field_ty)| {
+        let field_ref = field_ty.deref(ctx);
+        let integer = field_ref.downcast_ref::<IntegerType>()?;
+        let width = integer.width();
+        (u64::from(width).div_ceil(8) == union_size).then_some((index as u32, field_ty, width))
+    })
+}
+
+fn integer_constant(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    width: u32,
+    value: u64,
+) -> Value {
+    let bit_width = NonZeroUsize::new(width as usize).expect("integer width is non-zero");
+    let attr = pliron::builtin::attributes::IntegerAttr::new(
+        IntegerType::get(ctx, width, Signedness::Signless),
+        APInt::from_u64(value, bit_width),
+    );
+    let constant = llvm::ConstantOp::new(ctx, attr.into());
+    rewriter.insert_operation(ctx, constant.get_operation());
+    constant.get_operation().deref(ctx).get_result(0)
+}
+
+fn try_pack_float_array_union(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    value: Value,
+    field_ty: TypeHandle,
+    storage_ty: TypeHandle,
+    union_size: u64,
+) -> Option<Value> {
+    let (length, _element_ty, element_bits) = float_array_shape(ctx, field_ty)?;
+    let (carrier_index, carrier_ty, carrier_bits) =
+        union_integer_carrier(ctx, storage_ty, union_size)?;
+    if length * u64::from(element_bits) != u64::from(carrier_bits) {
+        return None;
+    }
+
+    let element_int_ty: TypeHandle =
+        IntegerType::get(ctx, element_bits, Signedness::Signless).into();
+    let mut packed = None;
+    for index in 0..length {
+        let extract = llvm::ExtractValueOp::new(ctx, value, vec![index as u32]).ok()?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let element = extract.get_operation().deref(ctx).get_result(0);
+
+        let bits = llvm::BitcastOp::new(ctx, element, element_int_ty);
+        rewriter.insert_operation(ctx, bits.get_operation());
+        let bits = bits.get_operation().deref(ctx).get_result(0);
+        let wide = if element_bits == carrier_bits {
+            bits
+        } else {
+            let zext = llvm::ZExtOp::new_with_nneg(ctx, bits, carrier_ty, false);
+            rewriter.insert_operation(ctx, zext.get_operation());
+            zext.get_operation().deref(ctx).get_result(0)
+        };
+        let shifted = if index == 0 {
+            wide
+        } else {
+            let amount = integer_constant(
+                ctx,
+                rewriter,
+                carrier_bits,
+                index * u64::from(element_bits),
+            );
+            let shift = llvm::ShlOp::new(ctx, wide, amount);
+            rewriter.insert_operation(ctx, shift.get_operation());
+            shift.get_operation().deref(ctx).get_result(0)
+        };
+        packed = Some(match packed {
+            None => shifted,
+            Some(previous) => {
+                let or = llvm::OrOp::new(ctx, previous, shifted);
+                rewriter.insert_operation(ctx, or.get_operation());
+                or.get_operation().deref(ctx).get_result(0)
+            }
+        });
+    }
+
+    let undef = llvm::UndefOp::new(ctx, storage_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let storage = undef.get_operation().deref(ctx).get_result(0);
+    let insert = llvm::InsertValueOp::new(ctx, storage, packed?, vec![carrier_index]);
+    rewriter.insert_operation(ctx, insert.get_operation());
+    Some(insert.get_operation().deref(ctx).get_result(0))
+}
+
+fn try_unpack_float_array_union(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    union_value: Value,
+    field_ty: TypeHandle,
+    storage_ty: TypeHandle,
+    union_size: u64,
+) -> Option<Value> {
+    let (length, element_ty, element_bits) = float_array_shape(ctx, field_ty)?;
+    let (carrier_index, _carrier_ty, carrier_bits) =
+        union_integer_carrier(ctx, storage_ty, union_size)?;
+    if length * u64::from(element_bits) != u64::from(carrier_bits) {
+        return None;
+    }
+
+    let extract = llvm::ExtractValueOp::new(ctx, union_value, vec![carrier_index]).ok()?;
+    rewriter.insert_operation(ctx, extract.get_operation());
+    let carrier = extract.get_operation().deref(ctx).get_result(0);
+    let element_int_ty: TypeHandle =
+        IntegerType::get(ctx, element_bits, Signedness::Signless).into();
+    let undef = llvm::UndefOp::new(ctx, field_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let mut array = undef.get_operation().deref(ctx).get_result(0);
+
+    for index in 0..length {
+        let shifted = if index == 0 {
+            carrier
+        } else {
+            let amount = integer_constant(
+                ctx,
+                rewriter,
+                carrier_bits,
+                index * u64::from(element_bits),
+            );
+            let shift = llvm::LShrOp::new(ctx, carrier, amount);
+            rewriter.insert_operation(ctx, shift.get_operation());
+            shift.get_operation().deref(ctx).get_result(0)
+        };
+        let narrow = if element_bits == carrier_bits {
+            shifted
+        } else {
+            let trunc = llvm::TruncOp::new(ctx, shifted, element_int_ty);
+            rewriter.insert_operation(ctx, trunc.get_operation());
+            trunc.get_operation().deref(ctx).get_result(0)
+        };
+        let element = llvm::BitcastOp::new(ctx, narrow, element_ty);
+        rewriter.insert_operation(ctx, element.get_operation());
+        let element = element.get_operation().deref(ctx).get_result(0);
+        let insert = llvm::InsertValueOp::new(
+            ctx,
+            array,
+            element,
+            vec![index as u32],
+        );
+        rewriter.insert_operation(ctx, insert.get_operation());
+        array = insert.get_operation().deref(ctx).get_result(0);
+    }
+    Some(array)
+}
+
 /// Read one typed view of a union's shared bytes.
 fn convert_extract_union_field(
     ctx: &mut Context,
@@ -359,6 +528,17 @@ fn convert_extract_union_field(
     }
 
     let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
+    if let Some(value) = try_unpack_float_array_union(
+        ctx,
+        rewriter,
+        union_value,
+        field_llvm_ty,
+        storage_ty,
+        union_ty.total_size(),
+    ) {
+        rewriter.replace_operation_with_values(ctx, op, vec![value]);
+        return Ok(());
+    }
     let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
     let load = llvm::LoadOp::new(ctx, ptr, field_llvm_ty);
     llvm_export::ops::set_op_alignment(ctx, load.get_operation(), union_ty.abi_align() as u32);
@@ -392,6 +572,17 @@ fn convert_insert_union_field(
     }
 
     let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
+    if let Some(value) = try_pack_float_array_union(
+        ctx,
+        rewriter,
+        new_value,
+        field_llvm_ty,
+        storage_ty,
+        union_ty.total_size(),
+    ) {
+        rewriter.replace_operation_with_values(ctx, op, vec![value]);
+        return Ok(());
+    }
     let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
     let store = llvm::StoreOp::new(ctx, new_value, ptr);
     llvm_export::ops::set_op_alignment(ctx, store.get_operation(), union_ty.abi_align() as u32);
@@ -1886,6 +2077,61 @@ mod tests {
         );
 
         (struct_ty.into(), zst_ty)
+    }
+
+    #[test]
+    fn float_array_union_bitcast_stays_in_ssa() {
+        let mut ctx = make_ctx();
+        let f32_ty: TypeHandle = FP32Type::get(&ctx).into();
+        let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let pair_ty: TypeHandle = MirArrayType::get(&mut ctx, f32_ty, 2).into();
+        let union_ty: TypeHandle = MirUnionType::get(
+            &mut ctx,
+            "FloatPairBits".into(),
+            vec!["floats".into(), "bits".into()],
+            vec![pair_ty, u64_ty],
+            8,
+            8,
+        )
+        .into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![pair_ty], vec![]);
+        let pair = block.deref(&ctx).get_argument(0);
+        let undef = mir::MirUndefOp::new(&mut ctx, union_ty);
+        undef.get_operation().insert_at_back(block, &ctx);
+        let union = undef.get_operation().deref(&ctx).get_result(0);
+
+        let insert = Operation::new(
+            &mut ctx,
+            MirInsertFieldOp::get_concrete_op_info(),
+            vec![union_ty],
+            vec![union, pair],
+            vec![],
+            0,
+        );
+        MirInsertFieldOp::new(insert).set_attr_insert_index(&ctx, FieldIndexAttr(0));
+        insert.insert_at_back(block, &ctx);
+        let union = insert.deref(&ctx).get_result(0);
+
+        let extract = Operation::new(
+            &mut ctx,
+            MirExtractFieldOp::get_concrete_op_info(),
+            vec![pair_ty],
+            vec![union],
+            vec![],
+            0,
+        );
+        MirExtractFieldOp::new(extract).set_attr_index(&ctx, FieldIndexAttr(0));
+        extract.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module_ptr);
+
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::BitcastOp>(&ctx, &body), 4);
     }
 
     fn append_empty_struct_value(
