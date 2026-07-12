@@ -9,7 +9,8 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::{
-    Data, DataEnum, DataStruct, DataUnion, DeriveInput, Field, Fields, Generics, parse_quote,
+    Data, DataEnum, DataStruct, DataUnion, DeriveInput, Field, Fields, Generics, Type,
+    WherePredicate, parse_quote,
 };
 
 pub fn impl_device_copy(input: &DeriveInput, import: TokenStream) -> TokenStream {
@@ -73,9 +74,39 @@ fn add_bound_to_generics(generics: &Generics, import: TokenStream) -> Generics {
         .type_params()
         .map(|param| param.ident.clone())
         .collect::<Vec<_>>();
-    let where_clause = new_generics.make_where_clause();
+
     for type_param in type_params {
-        where_clause
+        let inline_param = new_generics
+            .type_params_mut()
+            .find(|param| param.ident == type_param)
+            .expect("collected type parameter must still exist");
+        if !inline_param.bounds.is_empty() {
+            inline_param.bounds.push(parse_quote!(#import));
+            continue;
+        }
+
+        let existing_where_predicate = new_generics
+            .where_clause
+            .iter_mut()
+            .flat_map(|clause| clause.predicates.iter_mut())
+            .find_map(|predicate| match predicate {
+                WherePredicate::Type(predicate)
+                    if matches!(
+                        &predicate.bounded_ty,
+                        Type::Path(path) if path.qself.is_none() && path.path.is_ident(&type_param)
+                    ) =>
+                {
+                    Some(predicate)
+                }
+                _ => None,
+            });
+        if let Some(predicate) = existing_where_predicate {
+            predicate.bounds.push(parse_quote!(#import));
+            continue;
+        }
+
+        new_generics
+            .make_where_clause()
             .predicates
             .push(parse_quote!(#type_param: #import));
     }
@@ -90,9 +121,9 @@ mod tests {
     use syn::{DeriveInput, parse_quote};
 
     #[test]
-    fn device_copy_bounds_share_the_where_clause() {
+    fn device_copy_bounds_preserve_existing_bound_locations() {
         let input: DeriveInput = parse_quote!(
-            struct Example<T: Copy, U>(T, U)
+            struct Example<T: Copy, U, V>(T, U, V)
             where
                 U: Send;
         );
@@ -104,10 +135,10 @@ mod tests {
             .to_token_stream()
             .to_string();
 
-        assert_eq!(params, "T : Copy , U");
+        assert_eq!(params, "T : Copy + :: cuda_core :: DeviceCopy , U , V");
         assert_eq!(
             where_clause,
-            "where U : Send , T : :: cuda_core :: DeviceCopy , U : :: cuda_core :: DeviceCopy"
+            "where U : Send + :: cuda_core :: DeviceCopy , V : :: cuda_core :: DeviceCopy"
         );
     }
 }
