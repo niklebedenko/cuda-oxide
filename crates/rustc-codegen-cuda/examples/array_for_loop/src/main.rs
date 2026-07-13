@@ -20,9 +20,9 @@
 //!   `drop_in_place` calls.
 //!
 //! Two kernels cover the shapes from the issue: a `for` loop over a
-//! plain `[u32; 4]` and one over an array of Copy structs. A third kernel
-//! covers the reachable-but-dead uninhabited-enum paths retained by
-//! `array::from_fn` and `array::map`. All results are verified on the host.
+//! plain `[u32; 4]` and one over an array of Copy structs. Additional kernels
+//! cover impossible residual-enum paths in `array::from_fn`/`array::map` and
+//! the fork's small-array SSA lowering. All results are verified on the host.
 //!
 //! Run: cargo oxide run array_for_loop
 
@@ -39,6 +39,39 @@ mod kernels {
     pub struct Point {
         pub x: u32,
         pub y: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C, align(32))]
+    struct ScalarPair {
+        values: [f32; 2],
+        padding: [u8; 24],
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C, align(32))]
+    struct VectorPair {
+        values: [[f32; 3]; 2],
+        padding: [u8; 8],
+    }
+
+    #[derive(Clone, Copy)]
+    enum Side {
+        Low,
+        High,
+    }
+
+    #[inline(always)]
+    fn triple(x: u32) -> u32 {
+        x * 3
+    }
+
+    #[inline(never)]
+    fn scale_pair(source: ScalarPair, factor: f32) -> ScalarPair {
+        ScalarPair {
+            values: [source.values[0] * factor, source.values[1] * factor],
+            padding: [0; 24],
+        }
     }
 
     /// Sum a by-value `[u32; 4]` with a `for` loop (the issue-138 shape).
@@ -88,6 +121,168 @@ mod kernels {
             *out_elem = mapped.into_iter().sum();
         }
     }
+
+    /// `from_fn` and `map` exercise zero-capture closure and function-item
+    /// constants in `core::array` helpers. `SIDES` covers fieldless enum array
+    /// constants such as Impulse's `LowHigh::ALL`.
+    #[kernel]
+    pub fn array_helper_constants(mut out: DisjointSlice<u32>) {
+        let tid = thread::index_1d();
+        let t = tid.get() as u32;
+        if let Some(out_elem) = out.get_mut(tid) {
+            let generated: [u32; 4] = core::array::from_fn(|i| t + i as u32);
+            let tripled = generated.map(triple);
+            let shifted = generated.map(|x| x + 7);
+
+            const SIDES: [Side; 2] = [Side::Low, Side::High];
+            let mut side_score = 0;
+            for side in SIDES {
+                side_score += match side {
+                    Side::Low => 11,
+                    Side::High => 19,
+                };
+            }
+
+            *out_elem = tripled[0]
+                + tripled[1]
+                + tripled[2]
+                + tripled[3]
+                + shifted[0]
+                + shifted[1]
+                + shifted[2]
+                + shifted[3]
+                + side_score;
+        }
+    }
+
+    /// Keep fixed-axis aggregate arrays in SSA through constant-trip loops.
+    #[kernel]
+    pub fn fixed_axis_aggregate_arrays(mut out: DisjointSlice<f32>) {
+        let tid = thread::index_1d();
+        let index = tid.get();
+        let t = index as f32;
+        if let Some(out_elem) = out.get_mut(tid) {
+            let operand = VectorPair {
+                values: [[t, t + 1.0, t + 2.0], [t + 3.0, t + 4.0, t + 5.0]],
+                padding: [0; 8],
+            };
+            let components = [
+                ScalarPair {
+                    values: [operand.values[0][0], operand.values[1][0]],
+                    padding: [0; 24],
+                },
+                ScalarPair {
+                    values: [operand.values[0][1], operand.values[1][1]],
+                    padding: [0; 24],
+                },
+                ScalarPair {
+                    values: [operand.values[0][2], operand.values[1][2]],
+                    padding: [0; 24],
+                },
+            ];
+            let zero_vector = VectorPair {
+                values: [[0.0; 3]; 2],
+                padding: [0; 8],
+            };
+            let mut rows = [zero_vector; 3];
+
+            let mut row = 0;
+            while row < 3 {
+                let mut row_components = components;
+                let mut component = 0;
+                while component < 3 {
+                    let source = components[component];
+                    let factor = (row + component + 1) as f32;
+                    row_components[component] = scale_pair(source, factor);
+                    component += 1;
+                }
+                rows[row] = VectorPair {
+                    values: [
+                        [
+                            row_components[0].values[0],
+                            row_components[1].values[0],
+                            row_components[2].values[0],
+                        ],
+                        [
+                            row_components[0].values[1],
+                            row_components[1].values[1],
+                            row_components[2].values[1],
+                        ],
+                    ],
+                    padding: [0; 8],
+                };
+                row += 1;
+            }
+
+            let mut sum = 0.0;
+            let mut row = 0;
+            while row < 3 {
+                let mut lane = 0;
+                while lane < 2 {
+                    let mut component = 0;
+                    while component < 3 {
+                        sum += rows[row].values[lane][component];
+                        component += 1;
+                    }
+                    lane += 1;
+                }
+                row += 1;
+            }
+            *out_elem = sum;
+        }
+    }
+
+    /// A runtime index into a small aggregate array must remain in SSA rather
+    /// than creating a per-thread local-memory copy of the whole array.
+    #[kernel]
+    pub fn runtime_aggregate_array_index(mut out: DisjointSlice<f32>) {
+        let tid = thread::index_1d();
+        let index = tid.get();
+        let t = index as f32;
+        if let Some(out_elem) = out.get_mut(tid) {
+            let components = [
+                ScalarPair {
+                    values: [t, t + 3.0],
+                    padding: [0; 24],
+                },
+                ScalarPair {
+                    values: [t + 1.0, t + 4.0],
+                    padding: [0; 24],
+                },
+                ScalarPair {
+                    values: [t + 2.0, t + 5.0],
+                    padding: [0; 24],
+                },
+            ];
+            let selected = components[index % components.len()];
+            *out_elem = selected.values[0] + selected.values[1];
+        }
+    }
+}
+
+fn kernel_body<'a>(ptx: &'a str, kernel_prefix: &str) -> &'a str {
+    let marker = format!(".entry {kernel_prefix}(");
+    let entry = ptx
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing PTX entry with prefix {kernel_prefix}"));
+    let body_start = ptx[entry..]
+        .find('{')
+        .map(|offset| entry + offset)
+        .expect("kernel entry has a body");
+    let mut depth = 0_u32;
+    for (offset, byte) in ptx.as_bytes()[body_start..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &ptx[body_start..=body_start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated PTX body for {kernel_prefix}");
 }
 
 fn main() {
@@ -131,6 +326,45 @@ fn main() {
         .expect("launch map_generated_array");
     let got_mapped = d_mapped.to_host_vec(&stream).unwrap();
 
+    let mut d_helpers = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    // SAFETY: the 32-thread 1D block matches the kernel's indexing model and
+    // the 32-element output allocation.
+    unsafe { module.array_helper_constants(stream.as_ref(), cfg, &mut d_helpers) }
+        .expect("launch array_helper_constants");
+    let got_helpers = d_helpers.to_host_vec(&stream).unwrap();
+
+    let mut d_fixed_axes = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    // SAFETY: the 32-thread 1D block matches the kernel's indexing model and
+    // the 32-element output allocation.
+    unsafe { module.fixed_axis_aggregate_arrays(stream.as_ref(), cfg, &mut d_fixed_axes) }
+        .expect("launch fixed_axis_aggregate_arrays");
+    let got_fixed_axes = d_fixed_axes.to_host_vec(&stream).unwrap();
+
+    let mut d_runtime_index = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    // SAFETY: the 32-thread 1D block matches the kernel's indexing model and
+    // the 32-element output allocation.
+    unsafe {
+        module.runtime_aggregate_array_index(stream.as_ref(), cfg, &mut d_runtime_index)
+    }
+    .expect("launch runtime_aggregate_array_index");
+    let got_runtime_index = d_runtime_index.to_host_vec(&stream).unwrap();
+
+    let ptx = std::fs::read_to_string(ptx_path).expect("read generated PTX");
+    let fixed_axis_ptx = kernel_body(&ptx, "fixed_axis_aggregate_arrays");
+    assert!(
+        !fixed_axis_ptx.contains(".local")
+            && !fixed_axis_ptx.contains("ld.local")
+            && !fixed_axis_ptx.contains("st.local"),
+        "constant-trip aggregate indexing must not use local memory:\n{fixed_axis_ptx}"
+    );
+    let runtime_index_ptx = kernel_body(&ptx, "runtime_aggregate_array_index");
+    assert!(
+        !runtime_index_ptx.contains(".local")
+            && !runtime_index_ptx.contains("ld.local")
+            && !runtime_index_ptx.contains("st.local"),
+        "small runtime aggregate indexing must not use local memory:\n{runtime_index_ptx}"
+    );
+
     let mut failures = 0usize;
     for tid in 0..N {
         let t = tid as u32;
@@ -161,10 +395,51 @@ fn main() {
             );
             failures += 1;
         }
+        let want_helpers = 16 * t + 82;
+        if got_helpers[tid] != want_helpers {
+            println!(
+                "FAIL tid={tid}: array_helper_constants={} expected={want_helpers}",
+                got_helpers[tid]
+            );
+            failures += 1;
+        }
+        let t = t as f32;
+        let values = [t, t + 1.0, t + 2.0, t + 3.0, t + 4.0, t + 5.0];
+        let want_fixed_axes: f32 = (0..3)
+            .map(|row| {
+                values
+                    .chunks_exact(3)
+                    .map(|lane| {
+                        lane.iter()
+                            .enumerate()
+                            .map(|(component, value)| *value * (row + component + 1) as f32)
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>()
+            })
+            .sum();
+        if (got_fixed_axes[tid] - want_fixed_axes).abs() > 1.0e-4 {
+            println!(
+                "FAIL tid={tid}: fixed_axis_aggregate_arrays={} expected={want_fixed_axes}",
+                got_fixed_axes[tid]
+            );
+            failures += 1;
+        }
+        let component = tid % 3;
+        let want_runtime_index = 2.0 * t + 3.0 + 2.0 * component as f32;
+        if (got_runtime_index[tid] - want_runtime_index).abs() > 1.0e-4 {
+            println!(
+                "FAIL tid={tid}: runtime_aggregate_array_index={} expected={want_runtime_index}",
+                got_runtime_index[tid]
+            );
+            failures += 1;
+        }
     }
 
     if failures == 0 {
-        println!("array_for_loop: PASS ({N} threads, array loops and infallible helpers agree)");
+        println!(
+            "array_for_loop: PASS ({N} threads, array iteration/helpers translated correctly)"
+        );
     } else {
         println!("array_for_loop: FAIL ({failures} mismatches)");
         std::process::exit(1);
