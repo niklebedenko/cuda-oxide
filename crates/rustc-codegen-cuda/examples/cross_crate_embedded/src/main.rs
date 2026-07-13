@@ -11,21 +11,35 @@
 //!
 //! When `kernel_lib::kernels::load(&ctx)` is called, the macro-generated
 //! `load` function uses `load_all_ptx_bundles_merged` (because the module
-//! contains generic kernels). This merges all PTX bundles in the process,
-//! including the binary crate's bundle where the monomorphized PTX for
-//! `scale::<f32>` and `scale::<i32>` actually lives.
-//!
-//! Before the fix this would panic with:
-//!   DriverError(500, "named symbol not found")
-//! because `load_embedded_module("kernel-lib")` only searched that library's
-//! own bundle, which has no monomorphized entry points.
+//! contains generic kernels). This merges all PTX bundles in the process, so
+//! specializations remain visible regardless of which crate owns their
+//! monomorphized entry points. The example deliberately owns `scale::<f32>` in
+//! the library as an archive-retention regression and instantiates its other
+//! launch types downstream.
 //!
 //! Run: cargo oxide run cross_crate_embedded
+//! No-CUDA linkage check: run the built binary with `--verify-bundles`.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use kernel_lib::kernels;
 
 fn main() {
+    assert_eq!(kernel_lib::host_probe::linked_value(), 0x0cda_0a1d_e222);
+    // Force the generic specialization owned by kernel-lib.
+    let _ = kernel_lib::scale_f32_ptx_name();
+    if std::env::args().any(|arg| arg == "--verify-bundles") {
+        // Verify the selected owner's archive-carried artifact before touching
+        // the CUDA driver. This mode is built with an explicit owner filter.
+        let bundles = cuda_host::embedded::artifact_bundles_from_current_exe()
+            .expect("read embedded artifact bundles");
+        assert!(
+            bundles.iter().any(|bundle| bundle.name == "kernel-lib"),
+            "generic-only kernel-lib artifact is missing from the final ELF"
+        );
+        println!("SUCCESS: generic-only library artifact survived archive linking");
+        return;
+    }
+
     let ctx = CudaContext::new(0).expect("CUDA context");
     let stream = ctx.default_stream();
 

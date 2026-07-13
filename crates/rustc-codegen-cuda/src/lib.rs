@@ -554,22 +554,29 @@ impl CodegenBackend for CudaCodegenBackend {
                 );
             }
 
-            // Older `#[cuda_module]` expansions always reference the legacy
-            // package-level anchor. An owner filter deliberately suppresses
-            // this crate's device artifact, but mixed-version host code must
-            // still link. Supply a weak legacy anchor-only object without an
-            // `.oxart` bundle. New owner-aware macros omit the reference for
-            // unselected crates and do not need the fallback.
-            if kernel_count > 0 && !owner_selected {
+            // An explicit owner filter activates a target-specific anchor
+            // handshake between `#[cuda_module]` and the backend. A selected
+            // target with no monomorphized device code still defines that
+            // anchor in a placeholder, so generic-only modules can safely
+            // reference it. An unselected crate with kernels defines only the
+            // weak legacy placeholder needed by older macro expansions.
+            let anchor_placeholder = artifact_anchor_placeholder_kind(
+                self.config.device_codegen_crates.is_some(),
+                owner_selected,
+                contains_device_code,
+                kernel_count,
+            );
+            if let Some(anchor_placeholder) = anchor_placeholder {
                 let output_dir = self
                     .config
                     .ptx_output_dir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-                match write_filtered_artifact_anchor_object(
+                match write_artifact_anchor_placeholder(
                     &output_dir,
                     crate_name.as_str(),
                     tcx.sess.target.llvm_target.as_ref(),
+                    anchor_placeholder,
                 ) {
                     Ok(path) => artifact_objects.push(path),
                     Err(error) => tcx.dcx().fatal(format!(
@@ -1009,16 +1016,58 @@ fn materialize_artifact_for_embedding(
     }))
 }
 
-fn write_filtered_artifact_anchor_object(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactAnchorPlaceholderKind {
+    SelectedTarget,
+    UnselectedLegacy,
+}
+
+fn artifact_anchor_placeholder_kind(
+    owner_filter_active: bool,
+    owner_selected: bool,
+    contains_device_code: bool,
+    kernel_count: usize,
+) -> Option<ArtifactAnchorPlaceholderKind> {
+    if !owner_filter_active {
+        None
+    } else if owner_selected && !contains_device_code {
+        Some(ArtifactAnchorPlaceholderKind::SelectedTarget)
+    } else if !owner_selected && kernel_count > 0 {
+        Some(ArtifactAnchorPlaceholderKind::UnselectedLegacy)
+    } else {
+        None
+    }
+}
+
+fn write_artifact_anchor_placeholder(
     output_dir: &Path,
     output_name: &str,
     host_target: &str,
+    kind: ArtifactAnchorPlaceholderKind,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
     let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let anchor_symbol =
+    let legacy_anchor =
         reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name, &package_version);
-    let object = oxide_artifacts::build_host_anchor_object_for_target(host_target, &anchor_symbol)?;
+    let object = match kind {
+        ArtifactAnchorPlaceholderKind::SelectedTarget => {
+            let binary_name = std::env::var("CARGO_BIN_NAME").ok();
+            let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
+                &bundle_name,
+                &package_version,
+                output_name,
+                binary_name.as_deref(),
+            );
+            oxide_artifacts::build_host_anchor_object_for_target_with_legacy_anchor(
+                host_target,
+                &target_anchor,
+                &legacy_anchor,
+            )?
+        }
+        ArtifactAnchorPlaceholderKind::UnselectedLegacy => {
+            oxide_artifacts::build_host_anchor_object_for_target(host_target, &legacy_anchor)?
+        }
+    };
     write_artifact_object(output_dir, output_name, host_target, &object, "anchor")
 }
 
@@ -1235,6 +1284,28 @@ mod tests {
         assert_eq!(
             parsed.payload(oxide_artifacts::ArtifactPayloadKind::Ptx),
             Some(&b"ptx"[..])
+        );
+    }
+
+    #[test]
+    fn owner_anchor_placeholder_policy_matches_artifact_production() {
+        use ArtifactAnchorPlaceholderKind::{SelectedTarget, UnselectedLegacy};
+
+        assert_eq!(
+            artifact_anchor_placeholder_kind(true, true, false, 0),
+            Some(SelectedTarget)
+        );
+        assert_eq!(
+            artifact_anchor_placeholder_kind(true, false, true, 1),
+            Some(UnselectedLegacy)
+        );
+        assert_eq!(
+            artifact_anchor_placeholder_kind(true, true, true, 1),
+            None
+        );
+        assert_eq!(
+            artifact_anchor_placeholder_kind(false, true, false, 0),
+            None
         );
     }
 }

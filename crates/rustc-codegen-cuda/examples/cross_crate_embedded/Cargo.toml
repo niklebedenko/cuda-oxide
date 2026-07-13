@@ -14,3 +14,6 @@ kernel-lib   = { path = "kernel-lib" }
 cuda-device  = { path = "../../../cuda-device" }
 cuda-host    = { path = "../../../cuda-host" }
 cuda-core    = { path = "../../../cuda-core" }
+
+[profile.release]
+codegen-units = 8
