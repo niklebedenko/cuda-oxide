@@ -97,8 +97,8 @@ fn link_libdevice(
 ///
 /// Modules with explicit `@llvm.used` roots internalize every other definition
 /// before the default O2 pipeline so fully inlined helpers are eligible for
-/// global dead-code elimination. Modules without an explicit root set retain
-/// the historical `opt -O2` path.
+/// global dead-code elimination. A bounded full-unroll pass then handles small
+/// loops exposed by inlining before a final cleanup pipeline.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
 /// LoadStoreVectorizer fuses aligned aggregate/element accesses, SROA
@@ -204,8 +204,13 @@ fn optimize_ll(
 /// internalization lets GlobalDCE remove it instead of asking `llc` to emit an
 /// unreachable `.visible .func` body.
 fn optimization_args(public_symbols: &[String]) -> Result<Vec<String>, PipelineError> {
+    const BOUNDED_PIPELINE: &str = "default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>";
+
     if public_symbols.is_empty() {
-        return Ok(vec!["-O2".to_string()]);
+        return Ok(vec![
+            format!("-passes={BOUNDED_PIPELINE}"),
+            "-unroll-threshold=512".to_string(),
+        ]);
     }
 
     if let Some(symbol) = public_symbols.iter().find(|symbol| symbol.contains(',')) {
@@ -215,7 +220,8 @@ fn optimization_args(public_symbols: &[String]) -> Result<Vec<String>, PipelineE
     }
 
     Ok(vec![
-        "-passes=internalize,default<O2>".to_string(),
+        format!("-passes=internalize,{BOUNDED_PIPELINE}"),
+        "-unroll-threshold=512".to_string(),
         format!("-internalize-public-api-list={}", public_symbols.join(",")),
     ])
 }
