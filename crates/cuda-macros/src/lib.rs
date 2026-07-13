@@ -1722,17 +1722,10 @@ fn cuda_module_artifact_anchor_statements_for_target(
         .filter(|kernel| !kernel.is_generic || reference_generic_kernels)
         .map(|kernel| {
             let cfg_attrs = &kernel.effective_cfg_attrs;
+            let reference = artifact_anchor_reference_statement(&anchor_name);
             quote! {
                 #(#cfg_attrs)*
-                let _artifact_anchor: *const ::core::primitive::u8 = {
-                    unsafe extern "C" {
-                        #[link_name = #anchor_name]
-                        static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
-                    }
-                    ::std::hint::black_box(unsafe {
-                        ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
-                    })
-                };
+                #reference
             }
         });
     quote! {
@@ -1740,6 +1733,42 @@ fn cuda_module_artifact_anchor_statements_for_target(
         // crate's `cuda_module_artifact_anchor_statements` for details.
         #(#references)*
     }
+}
+
+fn artifact_anchor_reference_statement(anchor_name: &LitStr) -> TokenStream2 {
+    quote! {
+        let _artifact_anchor: *const ::core::primitive::u8 = {
+            unsafe extern "C" {
+                #[link_name = #anchor_name]
+                static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
+            }
+            ::std::hint::black_box(unsafe {
+                ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
+            })
+        };
+    }
+}
+
+fn selected_owner_artifact_anchor_symbol() -> Option<String> {
+    let (Ok(package_name), Ok(package_version), Ok(crate_name)) = (
+        std::env::var("CARGO_PKG_NAME"),
+        std::env::var("CARGO_PKG_VERSION"),
+        std::env::var("CARGO_CRATE_NAME"),
+    ) else {
+        return None;
+    };
+    let owner_filter = std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok();
+    (device_codegen_owner_selection(owner_filter.as_deref(), &crate_name) == Some(true)).then(
+        || {
+            let binary_name = std::env::var("CARGO_BIN_NAME").ok();
+            artifact_anchor_symbol_v2(
+                &package_name,
+                &package_version,
+                &crate_name,
+                binary_name.as_deref(),
+            )
+        },
+    )
 }
 
 fn device_codegen_owner_selection(raw: Option<&str>, crate_name: &str) -> Option<bool> {
@@ -5611,6 +5640,25 @@ fn generate_generic_cuda_kernel_impl(
     where_clause: &Option<syn::WhereClause>,
     cfg_attrs: &[syn::Attribute],
 ) -> TokenStream2 {
+    let artifact_anchor = selected_owner_artifact_anchor_symbol();
+    generate_generic_cuda_kernel_impl_for_anchor(
+        fn_name,
+        vis,
+        generics,
+        where_clause,
+        cfg_attrs,
+        artifact_anchor.as_deref(),
+    )
+}
+
+fn generate_generic_cuda_kernel_impl_for_anchor(
+    fn_name: &Ident,
+    vis: &syn::Visibility,
+    generics: &syn::Generics,
+    where_clause: &Option<syn::WhereClause>,
+    cfg_attrs: &[syn::Attribute],
+    artifact_anchor: Option<&str>,
+) -> TokenStream2 {
     let marker_name = format_ident!("__{}_CudaKernel", fn_name);
     let ptx_name_fn = format_ident!("{}_ptx_name", fn_name);
     let kernel_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
@@ -5633,6 +5681,9 @@ fn generate_generic_cuda_kernel_impl(
     let hash = internal_ident("__cuda_oxide_kernel_hash");
     let kernel_ptr = internal_ident("__cuda_oxide_kernel_ptr");
     let force_mono = internal_ident("__cuda_oxide_force_mono");
+    let artifact_anchor_statement = artifact_anchor.map_or_else(TokenStream2::new, |anchor| {
+        artifact_anchor_reference_statement(&LitStr::new(anchor, proc_macro2::Span::call_site()))
+    });
 
     quote! {
         /// Marker type for a generic kernel; implements `GenericCudaKernel`.
@@ -5660,6 +5711,7 @@ fn generate_generic_cuda_kernel_impl(
         #(#cfg_attrs)*
         #[inline(never)]
         #vis fn #ptx_name_fn #generics () -> &'static str #where_clause {
+            #artifact_anchor_statement
             let #kernel_ptr = #kernel_name #kernel_turbofish as *const ();
             unsafe {
                 let mut #force_mono: *const () = ::core::ptr::null();
@@ -8295,6 +8347,38 @@ mod tests {
         );
         assert!(statements.contains("#[cfg(feature=\"concrete-kernel\")]"));
         assert!(statements.contains("#[cfg(feature=\"generic-kernel\")]"));
+    }
+
+    #[test]
+    fn generic_ptx_name_retention_references_only_selected_owner_anchor() {
+        let kernel: ItemFn = parse_quote! {
+            pub fn scale<T: Copy>(value: T) {}
+        };
+        let anchor = artifact_anchor_symbol_v2("gpu-package", "1.2.3", "gpu_lib", None);
+        let with_anchor = generate_generic_cuda_kernel_impl_for_anchor(
+            &kernel.sig.ident,
+            &kernel.vis,
+            &kernel.sig.generics,
+            &kernel.sig.generics.where_clause,
+            &[],
+            Some(&anchor),
+        )
+        .to_string()
+        .replace(' ', "");
+        let without_anchor = generate_generic_cuda_kernel_impl_for_anchor(
+            &kernel.sig.ident,
+            &kernel.vis,
+            &kernel.sig.generics,
+            &kernel.sig.generics.where_clause,
+            &[],
+            None,
+        )
+        .to_string()
+        .replace(' ', "");
+
+        assert!(with_anchor.contains("fnscale_ptx_name<T:Copy>()"));
+        assert!(with_anchor.contains(&format!("#[link_name=\"{anchor}\"]")));
+        assert!(!without_anchor.contains("cuda_oxide_artifact_anchor_"));
     }
 
     #[test]
