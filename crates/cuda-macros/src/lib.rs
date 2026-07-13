@@ -1648,20 +1648,16 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 /// no reference at all. The backend also keeps a weak legacy alias for older
 /// macro expansions in mixed-version builds.
 ///
-/// Without an owner filter, the reference is only emitted when the module is
-/// guaranteed to produce an artifact for this crate. Generic kernels are
-/// monomorphized (and their PTX embedded) in a consuming crate, so the legacy
-/// behavior continues to skip generic-only modules. An explicit owner filter
-/// makes the target responsible for its specializations and activates the v2
-/// anchor protocol. A selected generic-only module therefore emits a v2
-/// reference too; the backend defines it in either the normal artifact or an
-/// anchor-only placeholder when this target has no monomorphized device code.
-///
-/// Root `load()` emits equivalent guarded references for the relevant kernels
-/// in the complete inline tree. Each reference carries the kernel's effective
-/// ancestor-plus-local availability attributes, so a module containing only
-/// nested kernels remains independently loadable while no anchor is referenced
-/// when every relevant kernel is absent.
+/// The reference is only emitted when the module is guaranteed to produce
+/// an artifact for this crate. Generic kernels are monomorphized (and
+/// their PTX embedded) in the *consuming* crate, so a module with only
+/// generic kernels yields no artifact here, and an anchor reference would
+/// be an undefined-symbol link error. The same reasoning extends to
+/// cfg-gated kernels: root `load()` emits one equivalent guarded reference per
+/// concrete kernel in the complete inline tree. Each reference carries the
+/// kernel's effective ancestor-plus-local availability attributes, so a module
+/// containing only nested kernels is still independently loadable while no
+/// anchor is referenced when every concrete kernel is absent.
 fn cuda_module_artifact_anchor_statements(
     kernels: &[CudaModuleKernel],
 ) -> syn::Result<TokenStream2> {
@@ -1679,96 +1675,52 @@ fn cuda_module_artifact_anchor_statements(
 
     let owner_filter = proc_macro::tracked::env_var(DEVICE_CODEGEN_CRATE_ENV).ok();
     let owner_selection = device_codegen_owner_selection(owner_filter.as_deref(), &crate_name);
-    let binary_name = std::env::var("CARGO_BIN_NAME").ok();
-    Ok(cuda_module_artifact_anchor_statements_for_target(
-        kernels,
-        &package_name,
-        &package_version,
-        &crate_name,
-        binary_name.as_deref(),
-        owner_selection,
-    ))
-}
-
-fn cuda_module_artifact_anchor_statements_for_target(
-    kernels: &[CudaModuleKernel],
-    package_name: &str,
-    package_version: &str,
-    crate_name: &str,
-    binary_name: Option<&str>,
-    owner_selection: Option<bool>,
-) -> TokenStream2 {
     if owner_selection == Some(false) {
         // The backend deliberately omits this crate's artifact. Omitting the
         // reference as well keeps the host link valid without pretending that
         // a loadable bundle exists.
-        return TokenStream2::new();
+        return Ok(TokenStream2::new());
     }
 
-    let has_concrete_kernel = kernels.iter().any(|kernel| !kernel.is_generic);
-    let reference_generic_kernels = owner_selection == Some(true);
-    if !has_concrete_kernel && !reference_generic_kernels {
-        return TokenStream2::new();
+    if !kernels.iter().any(|kernel| !kernel.is_generic) {
+        return Ok(TokenStream2::new());
     }
 
+    let binary_name = std::env::var("CARGO_BIN_NAME").ok();
     let anchor = if owner_selection.is_some() {
-        artifact_anchor_symbol_v2(package_name, package_version, crate_name, binary_name)
+        artifact_anchor_symbol_v2(
+            &package_name,
+            &package_version,
+            &crate_name,
+            binary_name.as_deref(),
+        )
     } else {
-        artifact_anchor_symbol(package_name, package_version)
+        artifact_anchor_symbol(&package_name, &package_version)
     };
     let anchor_name = LitStr::new(&anchor, proc_macro2::Span::call_site());
     let references = kernels
         .iter()
-        .filter(|kernel| !kernel.is_generic || reference_generic_kernels)
+        .filter(|kernel| !kernel.is_generic)
         .map(|kernel| {
             let cfg_attrs = &kernel.effective_cfg_attrs;
-            let reference = artifact_anchor_reference_statement(&anchor_name);
             quote! {
                 #(#cfg_attrs)*
-                #reference
+                let _artifact_anchor: *const ::core::primitive::u8 = {
+                    unsafe extern "C" {
+                        #[link_name = #anchor_name]
+                        static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
+                    }
+                    ::std::hint::black_box(unsafe {
+                        ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
+                    })
+                };
             }
         });
-    quote! {
+    Ok(quote! {
         // Keep-alive handshake with the codegen backend: see the macro
         // crate's `cuda_module_artifact_anchor_statements` for details.
         #(#references)*
-    }
-}
-
-fn artifact_anchor_reference_statement(anchor_name: &LitStr) -> TokenStream2 {
-    quote! {
-        let _artifact_anchor: *const ::core::primitive::u8 = {
-            unsafe extern "C" {
-                #[link_name = #anchor_name]
-                static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
-            }
-            ::std::hint::black_box(unsafe {
-                ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
-            })
-        };
-    }
-}
-
-fn selected_owner_artifact_anchor_symbol() -> Option<String> {
-    let (Ok(package_name), Ok(package_version), Ok(crate_name)) = (
-        std::env::var("CARGO_PKG_NAME"),
-        std::env::var("CARGO_PKG_VERSION"),
-        std::env::var("CARGO_CRATE_NAME"),
-    ) else {
-        return None;
-    };
-    let owner_filter = std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok();
-    (device_codegen_owner_selection(owner_filter.as_deref(), &crate_name) == Some(true)).then(
-        || {
-            let binary_name = std::env::var("CARGO_BIN_NAME").ok();
-            artifact_anchor_symbol_v2(
-                &package_name,
-                &package_version,
-                &crate_name,
-                binary_name.as_deref(),
-            )
-        },
-    )
+    })
 }
 
 fn device_codegen_owner_selection(raw: Option<&str>, crate_name: &str) -> Option<bool> {
@@ -5640,25 +5592,6 @@ fn generate_generic_cuda_kernel_impl(
     where_clause: &Option<syn::WhereClause>,
     cfg_attrs: &[syn::Attribute],
 ) -> TokenStream2 {
-    let artifact_anchor = selected_owner_artifact_anchor_symbol();
-    generate_generic_cuda_kernel_impl_for_anchor(
-        fn_name,
-        vis,
-        generics,
-        where_clause,
-        cfg_attrs,
-        artifact_anchor.as_deref(),
-    )
-}
-
-fn generate_generic_cuda_kernel_impl_for_anchor(
-    fn_name: &Ident,
-    vis: &syn::Visibility,
-    generics: &syn::Generics,
-    where_clause: &Option<syn::WhereClause>,
-    cfg_attrs: &[syn::Attribute],
-    artifact_anchor: Option<&str>,
-) -> TokenStream2 {
     let marker_name = format_ident!("__{}_CudaKernel", fn_name);
     let ptx_name_fn = format_ident!("{}_ptx_name", fn_name);
     let kernel_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
@@ -5681,9 +5614,6 @@ fn generate_generic_cuda_kernel_impl_for_anchor(
     let hash = internal_ident("__cuda_oxide_kernel_hash");
     let kernel_ptr = internal_ident("__cuda_oxide_kernel_ptr");
     let force_mono = internal_ident("__cuda_oxide_force_mono");
-    let artifact_anchor_statement = artifact_anchor.map_or_else(TokenStream2::new, |anchor| {
-        artifact_anchor_reference_statement(&LitStr::new(anchor, proc_macro2::Span::call_site()))
-    });
 
     quote! {
         /// Marker type for a generic kernel; implements `GenericCudaKernel`.
@@ -5711,7 +5641,6 @@ fn generate_generic_cuda_kernel_impl_for_anchor(
         #(#cfg_attrs)*
         #[inline(never)]
         #vis fn #ptx_name_fn #generics () -> &'static str #where_clause {
-            #artifact_anchor_statement
             let #kernel_ptr = #kernel_name #kernel_turbofish as *const ();
             unsafe {
                 let mut #force_mono: *const () = ::core::ptr::null();
@@ -8270,115 +8199,6 @@ mod tests {
             device_codegen_owner_selection(Some("gpu-lib, math_gpu"), "host_app"),
             Some(false)
         );
-    }
-
-    fn generic_only_anchor_statements(owner_selection: Option<bool>) -> String {
-        let module: ItemMod = parse_quote! {
-            mod kernels {
-                #[cfg(feature = "generic-kernel")]
-                #[kernel]
-                pub fn scale<T: Copy>(value: T) {}
-            }
-        };
-        let items = &module.content.expect("inline module").1;
-        let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false).unwrap();
-        cuda_module_artifact_anchor_statements_for_target(
-            &transformed.kernels,
-            "gpu-package",
-            "1.2.3",
-            "gpu_lib",
-            None,
-            owner_selection,
-        )
-        .to_string()
-        .replace(' ', "")
-    }
-
-    #[test]
-    fn selected_generic_only_module_references_target_anchor() {
-        let statements = generic_only_anchor_statements(Some(true));
-        let anchor = artifact_anchor_symbol_v2("gpu-package", "1.2.3", "gpu_lib", None);
-
-        assert!(
-            statements.contains(&format!("#[link_name=\"{anchor}\"]")),
-            "selected generic-only module did not reference its v2 anchor: {statements}"
-        );
-        assert!(statements.contains("#[cfg(feature=\"generic-kernel\")]"));
-    }
-
-    #[test]
-    fn generic_only_module_without_selected_owner_skips_anchor() {
-        assert!(generic_only_anchor_statements(None).is_empty());
-        assert!(generic_only_anchor_statements(Some(false)).is_empty());
-    }
-
-    #[test]
-    fn selected_mixed_module_guards_concrete_and_generic_anchor_references() {
-        let module: ItemMod = parse_quote! {
-            mod kernels {
-                #[cfg(feature = "concrete-kernel")]
-                #[kernel]
-                pub fn concrete() {}
-
-                #[cfg(feature = "generic-kernel")]
-                #[kernel]
-                pub fn generic<T: Copy>(value: T) {}
-            }
-        };
-        let items = &module.content.expect("inline module").1;
-        let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false).unwrap();
-        let statements = cuda_module_artifact_anchor_statements_for_target(
-            &transformed.kernels,
-            "gpu-package",
-            "1.2.3",
-            "gpu_lib",
-            None,
-            Some(true),
-        )
-        .to_string()
-        .replace(' ', "");
-        let anchor = artifact_anchor_symbol_v2("gpu-package", "1.2.3", "gpu_lib", None);
-
-        assert_eq!(
-            statements
-                .matches(&format!("#[link_name=\"{anchor}\"]"))
-                .count(),
-            2
-        );
-        assert!(statements.contains("#[cfg(feature=\"concrete-kernel\")]"));
-        assert!(statements.contains("#[cfg(feature=\"generic-kernel\")]"));
-    }
-
-    #[test]
-    fn generic_ptx_name_retention_references_only_selected_owner_anchor() {
-        let kernel: ItemFn = parse_quote! {
-            pub fn scale<T: Copy>(value: T) {}
-        };
-        let anchor = artifact_anchor_symbol_v2("gpu-package", "1.2.3", "gpu_lib", None);
-        let with_anchor = generate_generic_cuda_kernel_impl_for_anchor(
-            &kernel.sig.ident,
-            &kernel.vis,
-            &kernel.sig.generics,
-            &kernel.sig.generics.where_clause,
-            &[],
-            Some(&anchor),
-        )
-        .to_string()
-        .replace(' ', "");
-        let without_anchor = generate_generic_cuda_kernel_impl_for_anchor(
-            &kernel.sig.ident,
-            &kernel.vis,
-            &kernel.sig.generics,
-            &kernel.sig.generics.where_clause,
-            &[],
-            None,
-        )
-        .to_string()
-        .replace(' ', "");
-
-        assert!(with_anchor.contains("fnscale_ptx_name<T:Copy>()"));
-        assert!(with_anchor.contains(&format!("#[link_name=\"{anchor}\"]")));
-        assert!(!without_anchor.contains("cuda_oxide_artifact_anchor_"));
     }
 
     #[test]

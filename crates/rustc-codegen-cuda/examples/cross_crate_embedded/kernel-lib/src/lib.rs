@@ -31,14 +31,14 @@ pub mod kernels {
 
 /// Own one concrete specialization in this library crate. The library's
 /// device artifact therefore contains only a monomorphized generic kernel and
-/// exercises target-specific anchor retention for a generic-only library.
+/// exercises backend retention for a generic-only library.
 pub fn scale_f32_ptx_name() -> &'static str {
     kernels::scale_ptx_name::<f32>()
 }
 
 /// Ordinary host code kept in a separate module from the generated loader.
 /// The regression example references this with multiple host CGUs enabled, so
-/// artifact retention cannot depend on merging into an arbitrary host object.
+/// the artifact must be carried by whichever archive member is extracted.
 pub mod host_probe {
     #[inline(never)]
     pub fn linked_value() -> u64 {

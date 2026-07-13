@@ -362,7 +362,12 @@ pub struct CudaCodegenBackend {
 
 struct CudaOngoingCodegen {
     host: Box<dyn Any>,
-    artifact_objects: Vec<PathBuf>,
+    artifact_objects: Vec<ArtifactObject>,
+}
+
+struct ArtifactObject {
+    path: PathBuf,
+    retain_in_host_cgus: bool,
 }
 
 static ARTIFACT_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -578,7 +583,10 @@ impl CodegenBackend for CudaCodegenBackend {
                     tcx.sess.target.llvm_target.as_ref(),
                     anchor_placeholder,
                 ) {
-                    Ok(path) => artifact_objects.push(path),
+                    Ok(path) => artifact_objects.push(ArtifactObject {
+                        path,
+                        retain_in_host_cgus: false,
+                    }),
                     Err(error) => tcx.dcx().fatal(format!(
                         "[rustc_codegen_cuda] Failed to write filtered artifact anchor: {error}"
                     )),
@@ -744,7 +752,7 @@ impl CodegenBackend for CudaCodegenBackend {
                                     if self.config.verbose {
                                         eprintln!(
                                             "[rustc_codegen_cuda] Embedded artifact object complete: {}",
-                                            path.display()
+                                            path.path.display()
                                         );
                                     }
                                     artifact_objects.push(path);
@@ -802,11 +810,22 @@ impl CodegenBackend for CudaCodegenBackend {
             .expect("rustc_codegen_cuda received unexpected ongoing codegen state");
         let (mut compiled_modules, work_products) =
             self.llvm_backend.join_codegen(ongoing.host, sess, outputs);
-        for (index, object) in ongoing.artifact_objects.into_iter().enumerate() {
+        let (retained, standalone): (Vec<_>, Vec<_>) = ongoing
+            .artifact_objects
+            .into_iter()
+            .partition(|artifact| artifact.retain_in_host_cgus);
+        if !retained.is_empty()
+            && let Err(error) = merge_artifacts_into_host_cgus(sess, &mut compiled_modules, &retained)
+        {
+            sess.dcx().fatal(format!(
+                "[rustc_codegen_cuda] Failed to retain generic device artifact: {error}"
+            ));
+        }
+        for (index, artifact) in standalone.into_iter().enumerate() {
             compiled_modules.modules.push(CompiledModule {
                 name: format!("oxide_artifact_embed_{index}"),
                 kind: ModuleKind::Regular,
-                object: Some(object),
+                object: Some(artifact.path),
                 dwarf_object: None,
                 bytecode: None,
                 assembly: None,
@@ -840,7 +859,7 @@ fn write_device_artifact_object(
     functions: &[collector::CollectedFunction<'_>],
     use_target_specific_anchor: bool,
     materialization_request: Option<materialize::MaterializationRequest>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<ArtifactObject, Box<dyn std::error::Error>> {
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
     let materialized_artifact;
     let (artifact, was_materialized) = match materialize_artifact_for_embedding(
@@ -915,7 +934,29 @@ fn write_device_artifact_object(
     let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let legacy_anchor =
         reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name, &package_version);
-    let object = if use_target_specific_anchor {
+    let generic_only = artifact_contains_only_generic_kernels(functions);
+    // A generic specialization can be emitted in a downstream crate that has
+    // no matching `#[cuda_module]` anchor reference. Put generic-only bundles
+    // in a COMDAT group and attach that object to every host CGU below. Any
+    // archive member selected by a consumer then carries the bundle, and the
+    // final linker keeps one copy when it selects several members.
+    let object = if generic_only {
+        let binary_name = std::env::var("CARGO_BIN_NAME").ok();
+        let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
+            &bundle_name,
+            &package_version,
+            output_name,
+            binary_name.as_deref(),
+        );
+        let comdat_symbol = generic_artifact_comdat_symbol(&blob);
+        oxide_artifacts::build_host_object_for_target_with_legacy_anchor_and_comdat(
+            &blob,
+            host_target,
+            &target_anchor,
+            &legacy_anchor,
+            &comdat_symbol,
+        )?
+    } else if use_target_specific_anchor {
         let binary_name = std::env::var("CARGO_BIN_NAME").ok();
         let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
             &bundle_name,
@@ -932,7 +973,10 @@ fn write_device_artifact_object(
     } else {
         oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&legacy_anchor))?
     };
-    write_artifact_object(output_dir, output_name, host_target, &object, "embed")
+    Ok(ArtifactObject {
+        path: write_artifact_object(output_dir, output_name, host_target, &object, "embed")?,
+        retain_in_host_cgus: generic_only,
+    })
 }
 
 fn embedded_compile_options(
@@ -1020,6 +1064,82 @@ fn materialize_artifact_for_embedding(
 enum ArtifactAnchorPlaceholderKind {
     SelectedTarget,
     UnselectedLegacy,
+}
+
+fn artifact_contains_only_generic_kernels(
+    functions: &[collector::CollectedFunction<'_>],
+) -> bool {
+    generic_kernel_exports_require_cgu_retention(
+        functions
+            .iter()
+            .filter(|function| function.is_kernel)
+            .map(|function| function.export_name.as_str()),
+    )
+}
+
+fn generic_kernel_exports_require_cgu_retention<'a>(
+    export_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut export_names = export_names.into_iter().peekable();
+    export_names.peek().is_some() && export_names.all(|name| name.contains("_TID_"))
+}
+
+fn generic_artifact_comdat_symbol(blob: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    blob.hash(&mut hasher);
+    format!(
+        "cuda_oxide_artifact_comdat_246e25db_{:016x}",
+        hasher.finish()
+    )
+}
+
+fn merge_artifacts_into_host_cgus(
+    sess: &Session,
+    compiled_modules: &mut CompiledModules,
+    artifacts: &[ArtifactObject],
+) -> Result<(), String> {
+    let rust_lld = sess
+        .get_tools_search_paths(false)
+        .into_iter()
+        .map(|directory| directory.join("rust-lld"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "rust-lld was not found in the compiler tool paths".to_string())?;
+    let mut host_object_count = 0;
+    for module in &mut compiled_modules.modules {
+        if !matches!(module.kind, ModuleKind::Regular) {
+            continue;
+        }
+        let Some(host_object) = module.object.as_ref() else {
+            continue;
+        };
+        host_object_count += 1;
+        let merge_id = ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let merged_object = host_object.with_extension(format!("oxide-merge-{merge_id}.o"));
+        let output = std::process::Command::new(&rust_lld)
+            .args(["-flavor", "gnu", "-r"])
+            .arg(&host_object)
+            .args(artifacts.iter().map(|artifact| artifact.path.as_path()))
+            .arg("-o")
+            .arg(&merged_object)
+            .output()
+            .map_err(|error| format!("could not run {}: {error}", rust_lld.display()))?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&merged_object);
+            return Err(format!(
+                "{} failed while merging {}: {}",
+                rust_lld.display(),
+                host_object.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        module.object = Some(merged_object);
+    }
+    if host_object_count == 0 {
+        return Err("host LLVM codegen produced no regular object files".to_string());
+    }
+    Ok(())
 }
 
 fn artifact_anchor_placeholder_kind(
@@ -1307,5 +1427,18 @@ mod tests {
             artifact_anchor_placeholder_kind(false, true, false, 0),
             None
         );
+    }
+
+    #[test]
+    fn only_generic_kernel_exports_require_cgu_retention() {
+        assert!(generic_kernel_exports_require_cgu_retention([
+            "scale_TID_0123456789abcdef0123456789abcdef",
+            "map_TID_fedcba9876543210fedcba9876543210",
+        ]));
+        assert!(!generic_kernel_exports_require_cgu_retention([
+            "scale_TID_0123456789abcdef0123456789abcdef",
+            "concrete",
+        ]));
+        assert!(!generic_kernel_exports_require_cgu_retention([]));
     }
 }

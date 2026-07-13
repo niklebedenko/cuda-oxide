@@ -32,10 +32,12 @@ fn main() {
         // the CUDA driver. This mode is built with an explicit owner filter.
         let bundles = cuda_host::embedded::artifact_bundles_from_current_exe()
             .expect("read embedded artifact bundles");
-        assert!(
-            bundles.iter().any(|bundle| bundle.name == "kernel-lib"),
-            "generic-only kernel-lib artifact is missing from the final ELF"
+        assert_eq!(
+            bundles.len(),
+            1,
+            "owner-filtered final ELF must contain exactly one artifact"
         );
+        assert_eq!(bundles[0].name, "kernel-lib");
         println!("SUCCESS: generic-only library artifact survived archive linking");
         return;
     }

@@ -743,6 +743,37 @@ pub fn build_host_object_for_target_with_legacy_anchor(
     )
 }
 
+/// Wrap an artifact blob in an ELF COMDAT group.
+///
+/// The CUDA backend merges the returned object into every host CGU for an
+/// artifact containing only generic kernel specializations. Any host CGU that
+/// an archive consumer extracts therefore carries the bundle, while the shared
+/// COMDAT signature makes the final linker retain exactly one copy.
+#[cfg(feature = "object-write")]
+pub fn build_host_object_for_target_with_legacy_anchor_and_comdat(
+    section_data: &[u8],
+    target: &str,
+    anchor_symbol: &str,
+    legacy_anchor_symbol: &str,
+    comdat_symbol: &str,
+) -> Result<Vec<u8>, ArtifactError> {
+    if section_data.is_empty() {
+        return Err(ArtifactError::EmptyPayload);
+    }
+    if comdat_symbol.is_empty() {
+        return Err(ArtifactError::Malformed(
+            "embedded artifact COMDAT symbol is empty".to_string(),
+        ));
+    }
+    build_host_object_with_section_and_comdat(
+        ARTIFACT_SECTION_NAME,
+        section_data,
+        target,
+        &[(anchor_symbol, false), (legacy_anchor_symbol, true)],
+        Some(comdat_symbol),
+    )
+}
+
 /// Build a host object that only defines an artifact link-anchor symbol.
 ///
 /// The CUDA backend uses this when an owner filter deliberately suppresses a
@@ -770,32 +801,6 @@ pub fn build_host_anchor_object_for_target(
     )
 }
 
-/// Build an anchor-only object with a target-specific symbol and weak legacy alias.
-///
-/// Owner-filtered CUDA targets use this placeholder when no device artifact is
-/// produced. New macros reference the strong target-specific anchor, while the
-/// weak package-level alias preserves the compatibility contract for older
-/// macro expansions without making the object look like a device bundle.
-#[cfg(feature = "object-write")]
-pub fn build_host_anchor_object_for_target_with_legacy_anchor(
-    target: &str,
-    anchor_symbol: &str,
-    legacy_anchor_symbol: &str,
-) -> Result<Vec<u8>, ArtifactError> {
-    if anchor_symbol.is_empty() || legacy_anchor_symbol.is_empty() {
-        return Err(ArtifactError::Malformed(
-            "embedded artifact anchor symbol is empty".to_string(),
-        ));
-    }
-
-    build_host_object_with_section(
-        ARTIFACT_ANCHOR_SECTION_NAME,
-        &[0],
-        target,
-        &[(anchor_symbol, false), (legacy_anchor_symbol, true)],
-    )
-}
-
 #[cfg(feature = "object-write")]
 fn build_host_object_with_section(
     section_name: &str,
@@ -803,11 +808,33 @@ fn build_host_object_with_section(
     target: &str,
     anchor_symbols: &[(&str, bool)],
 ) -> Result<Vec<u8>, ArtifactError> {
-    use object::write::{Object, Symbol, SymbolSection};
-    use object::{SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+    build_host_object_with_section_and_comdat(
+        section_name,
+        section_data,
+        target,
+        anchor_symbols,
+        None,
+    )
+}
+
+#[cfg(feature = "object-write")]
+fn build_host_object_with_section_and_comdat(
+    section_name: &str,
+    section_data: &[u8],
+    target: &str,
+    anchor_symbols: &[(&str, bool)],
+    comdat_symbol: Option<&str>,
+) -> Result<Vec<u8>, ArtifactError> {
+    use object::write::{Comdat, Object, Symbol, SymbolSection};
+    use object::{ComdatKind, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 
     let target = HostObjectTarget::parse(target)?;
     let mut object = Object::new(target.format, target.architecture, target.endianness);
+    object.flags = object::FileFlags::Elf {
+        os_abi: elf::ELFOSABI_GNU,
+        abi_version: 0,
+        e_flags: 0,
+    };
     let section_id = object.add_section(
         Vec::new(),
         section_name.as_bytes().to_vec(),
@@ -816,7 +843,13 @@ fn build_host_object_with_section(
     let section = object.section_mut(section_id);
     section.set_data(section_data.to_vec(), 8);
     section.flags = SectionFlags::Elf {
-        sh_flags: elf::SHF_ALLOC | elf::SHF_GNU_RETAIN,
+        sh_flags: elf::SHF_ALLOC
+            | elf::SHF_GNU_RETAIN
+            | if comdat_symbol.is_some() {
+                elf::SHF_GROUP
+            } else {
+                0
+            },
     };
 
     for (anchor_symbol, weak) in anchor_symbols {
@@ -833,6 +866,24 @@ fn build_host_object_with_section(
             weak: *weak,
             section: SymbolSection::Section(section_id),
             flags: SymbolFlags::None,
+        });
+    }
+
+    if let Some(comdat_symbol) = comdat_symbol {
+        let symbol = object.add_symbol(Symbol {
+            name: comdat_symbol.as_bytes().to_vec(),
+            value: 0,
+            size: section_data.len() as u64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(section_id),
+            flags: SymbolFlags::None,
+        });
+        object.add_comdat(Comdat {
+            kind: ComdatKind::Any,
+            symbol,
+            sections: vec![section_id],
         });
     }
 
@@ -880,7 +931,9 @@ impl HostObjectTarget {
 
 #[cfg(feature = "object-write")]
 mod elf {
+    pub const ELFOSABI_GNU: u8 = 3;
     pub const SHF_ALLOC: u64 = 0x2;
+    pub const SHF_GROUP: u64 = 0x200;
     pub const SHF_GNU_RETAIN: u64 = 0x20_0000;
 }
 
@@ -1332,38 +1385,6 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "object-read", feature = "object-write"))]
-    #[test]
-    fn target_anchor_only_object_also_defines_weak_legacy_alias() {
-        use object::{Object, ObjectSymbol};
-
-        let bytes = build_host_anchor_object_for_target_with_legacy_anchor(
-            "x86_64-unknown-linux-gnu",
-            "target_anchor",
-            "legacy_anchor",
-        )
-        .unwrap();
-        let file = object::File::parse(bytes.as_slice()).unwrap();
-        let target = file
-            .symbols()
-            .find(|symbol| symbol.name() == Ok("target_anchor"))
-            .expect("target-specific anchor missing");
-        let legacy = file
-            .symbols()
-            .find(|symbol| symbol.name() == Ok("legacy_anchor"))
-            .expect("legacy anchor alias missing");
-
-        assert!(target.is_definition());
-        assert!(!target.is_weak());
-        assert!(legacy.is_definition());
-        assert!(legacy.is_weak());
-        assert!(
-            read_artifact_bundles_from_object_bytes(&bytes)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
     #[cfg(feature = "object-write")]
     #[test]
     fn anchor_only_object_rejects_empty_symbol() {
@@ -1406,6 +1427,178 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(all(feature = "object-read", feature = "object-write"))]
+    #[test]
+    fn generic_artifact_object_places_oxart_in_comdat_group() {
+        use object::{Object, ObjectComdat, ObjectSection};
+
+        let bytes = build_host_object_for_target_with_legacy_anchor_and_comdat(
+            &sample_blob(),
+            "x86_64-unknown-linux-gnu",
+            "target_anchor",
+            "legacy_anchor",
+            "generic_artifact_comdat",
+        )
+        .unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let oxart = file
+            .section_by_name(ARTIFACT_SECTION_NAME)
+            .expect("artifact section missing")
+            .index();
+        let mut comdats = file.comdats();
+        let comdat = comdats.next().expect("artifact COMDAT group missing");
+
+        assert_eq!(comdat.name(), Ok("generic_artifact_comdat"));
+        assert_eq!(comdat.sections().collect::<Vec<_>>(), [oxart]);
+        assert!(comdats.next().is_none());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "object-read",
+        feature = "object-write"
+    ))]
+    fn assert_comdat_artifact_survives_archive_link(referenced_cgus: usize) {
+        use std::fmt::Write as _;
+        use std::process::Command;
+
+        assert!((1..=2).contains(&referenced_cgus));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide_artifact_comdat_archive_{}_{}_{}",
+            std::process::id(),
+            referenced_cgus,
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let artifact = build_host_object_for_target_with_legacy_anchor_and_comdat(
+            &sample_blob(),
+            "x86_64-unknown-linux-gnu",
+            "target_anchor",
+            "legacy_anchor",
+            "generic_artifact_comdat",
+        )
+        .unwrap();
+        let artifact_path = root.join("artifact.o");
+        let archive_path = root.join("libhost.a");
+        let binary_path = root.join("app");
+        std::fs::write(&artifact_path, artifact).unwrap();
+        let target_libdir = Command::new("rustc")
+            .args(["--print", "target-libdir"])
+            .output()
+            .expect("rustc is required for the COMDAT archive test");
+        assert!(target_libdir.status.success());
+        let rust_lld =
+            std::path::PathBuf::from(String::from_utf8(target_libdir.stdout).unwrap().trim())
+                .parent()
+                .expect("rustc target libdir has no parent")
+                .join("bin/rust-lld");
+        assert!(
+            rust_lld.is_file(),
+            "rust-lld missing at {}",
+            rust_lld.display()
+        );
+
+        let mut merged_cgus = Vec::new();
+        for index in 0..2 {
+            let source = root.join(format!("host{index}.c"));
+            let host_object = root.join(format!("host{index}.o"));
+            let merged_object = root.join(format!("host{index}.merged.o"));
+            std::fs::write(
+                &source,
+                format!("int retained_host_cgu_{index}(void) {{ return {index}; }}\n"),
+            )
+            .unwrap();
+            let cc = Command::new("cc")
+                .args(["-c", "-ffunction-sections", "-fdata-sections"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&host_object)
+                .status()
+                .expect("a C compiler is required for the COMDAT archive test");
+            assert!(cc.success(), "failed to compile synthetic host CGU");
+            let merge = Command::new(&rust_lld)
+                .args(["-flavor", "gnu", "-r"])
+                .arg(&host_object)
+                .arg(&artifact_path)
+                .arg("-o")
+                .arg(&merged_object)
+                .status()
+                .expect("failed to run rust-lld for the COMDAT archive test");
+            assert!(merge.success(), "failed to merge artifact into host CGU");
+            merged_cgus.push(merged_object);
+        }
+
+        let ar = Command::new("ar")
+            .arg("crs")
+            .arg(&archive_path)
+            .args(&merged_cgus)
+            .status()
+            .expect("`ar` is required for the COMDAT archive test");
+        assert!(ar.success(), "failed to create synthetic host archive");
+
+        let mut main_source = String::new();
+        for index in 0..referenced_cgus {
+            writeln!(main_source, "extern int retained_host_cgu_{index}(void);").unwrap();
+        }
+        main_source.push_str("int main(void) {\n");
+        for index in 0..referenced_cgus {
+            writeln!(main_source, "  (void)retained_host_cgu_{index}();").unwrap();
+        }
+        main_source.push_str("  return 0;\n}\n");
+        let main_path = root.join("main.c");
+        std::fs::write(&main_path, main_source).unwrap();
+        let link = Command::new("cc")
+            .arg(&main_path)
+            .arg(&archive_path)
+            .args(["-Wl,--gc-sections", "-Wl,-z,noexecstack"])
+            .arg("-o")
+            .arg(&binary_path)
+            .status()
+            .expect("a C linker driver is required for the COMDAT archive test");
+        assert!(
+            link.success(),
+            "duplicate artifact COMDAT groups did not link"
+        );
+
+        let executable = std::fs::read(&binary_path).unwrap();
+        let bundles = read_artifact_bundles_from_object_bytes(&executable).unwrap();
+        assert_eq!(
+            bundles.len(),
+            1,
+            "final executable must contain exactly one generic artifact"
+        );
+        assert_eq!(bundles[0].name, "demo");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "object-read",
+        feature = "object-write"
+    ))]
+    #[test]
+    fn one_extracted_host_cgu_retains_generic_artifact() {
+        assert_comdat_artifact_survives_archive_link(1);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "object-read",
+        feature = "object-write"
+    ))]
+    #[test]
+    fn multiple_extracted_host_cgus_deduplicate_generic_artifact() {
+        assert_comdat_artifact_survives_archive_link(2);
     }
 
     /// A strong undefined reference must pull an archive member whose matching
