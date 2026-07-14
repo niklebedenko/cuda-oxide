@@ -716,15 +716,22 @@ mod tests {
         assert_eq!(
             optimization_args(&symbols).unwrap(),
             [
-                "-passes=internalize,default<O2>",
+                "-passes=internalize,default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>",
+                "-unroll-threshold=512",
                 "-internalize-public-api-list=constant_data,first_kernel",
             ]
         );
     }
 
     #[test]
-    fn modules_without_public_roots_keep_the_existing_optimization_pipeline() {
-        assert_eq!(optimization_args(&[]).unwrap(), ["-O2"]);
+    fn modules_without_public_roots_use_the_bounded_optimization_pipeline() {
+        assert_eq!(
+            optimization_args(&[]).unwrap(),
+            [
+                "-passes=default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>",
+                "-unroll-threshold=512",
+            ]
+        );
     }
 
     #[test]
