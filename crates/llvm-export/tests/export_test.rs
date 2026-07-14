@@ -2218,6 +2218,87 @@ fn export_alwaysinline_function_attribute_uses_llvm_define_syntax() {
         ir.contains("attributes #0 = { convergent }"),
         "convergent attribute group must still be emitted:\n{ir}"
     );
+
+    let nvvm_ir = export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+        .expect("NVVM export succeeds");
+    let nvvm_define_line = nvvm_ir
+        .lines()
+        .find(|line| line.starts_with("define void @inline_helper("))
+        .expect("inline helper definition");
+    assert!(
+        nvvm_define_line.contains("alwaysinline"),
+        "NVVM export must preserve mandatory Rust inlining:\n{nvvm_ir}"
+    );
+}
+
+#[test]
+fn export_device_alwaysinline_reaches_nvvm_ir() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "device_builtin".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "device_alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+        .expect("NVVM IR export succeeds");
+    let define_line = ir
+        .lines()
+        .find(|line| line.starts_with("define void @device_builtin("))
+        .expect("device built-in definition");
+    assert_eq!(
+        define_line, "define void @device_builtin() alwaysinline #0 {",
+        "device built-ins must retain mandatory inlining through NVVM export:\n{ir}"
+    );
+}
+
+#[test]
+fn export_inlinehint_function_attribute_reaches_nvvm_ir() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "inline_helper".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "inlinehint".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    for ir in [
+        export_module_to_string(&ctx, &module).expect("PTX IR export succeeds"),
+        export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+            .expect("NVVM IR export succeeds"),
+    ] {
+        let define_line = ir
+            .lines()
+            .find(|line| line.starts_with("define void @inline_helper("))
+            .expect("inline helper definition");
+        assert_eq!(
+            define_line, "define void @inline_helper() inlinehint #0 {",
+            "`inlinehint` must reach each LLVM export path:\n{ir}"
+        );
+    }
 }
 
 #[test]

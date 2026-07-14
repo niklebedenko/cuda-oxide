@@ -111,6 +111,78 @@ enum DeviceExternTypePosition {
     Pointee,
 }
 
+fn inline_attr_for_device_function(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+) -> mir_importer::InlineAttr {
+    match tcx.codegen_fn_attrs(def_id).inline {
+        rustc_hir::attrs::InlineAttr::Hint
+            if is_primitive_float_operator(tcx, def_id) || is_tiny_inline_helper(tcx, def_id) =>
+        {
+            mir_importer::InlineAttr::DeviceAlways
+        }
+        rustc_hir::attrs::InlineAttr::Hint => mir_importer::InlineAttr::Hint,
+        rustc_hir::attrs::InlineAttr::Always
+        | rustc_hir::attrs::InlineAttr::Force { .. }
+            if is_tiny_inline_helper(tcx, def_id) =>
+        {
+            mir_importer::InlineAttr::DeviceAlways
+        }
+        rustc_hir::attrs::InlineAttr::Always
+        | rustc_hir::attrs::InlineAttr::Force { .. } => mir_importer::InlineAttr::Always,
+        rustc_hir::attrs::InlineAttr::None | rustc_hir::attrs::InlineAttr::Never => {
+            mir_importer::InlineAttr::None
+        }
+    }
+}
+
+fn is_tiny_inline_helper(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    if !tcx.is_mir_available(def_id) {
+        return false;
+    }
+
+    // libNVVM's bounded -opt=1 pipeline often leaves even explicitly inlined
+    // generic leaf helpers as device calls. Requiring inlining only for very
+    // small MIR bodies preserves vectorized loads and scalar shims without the
+    // compile-time explosion caused by forcing every `#[inline(always)]` body.
+    let body = tcx.optimized_mir(def_id);
+    body.basic_blocks.len() <= 2
+        && body
+            .basic_blocks
+            .iter()
+            .map(|block| block.statements.len())
+            .sum::<usize>()
+            <= 16
+}
+
+fn is_primitive_float_operator(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    let Some(impl_def_id) = tcx.trait_impl_of_assoc(def_id) else {
+        return false;
+    };
+    let trait_ref = tcx.impl_trait_ref(impl_def_id).instantiate_identity();
+    if !matches!(trait_ref.self_ty().kind(), TyKind::Float(_)) {
+        return false;
+    }
+
+    let lang = tcx.lang_items();
+    [
+        lang.add_trait(),
+        lang.sub_trait(),
+        lang.mul_trait(),
+        lang.div_trait(),
+        lang.rem_trait(),
+        lang.neg_trait(),
+        lang.add_assign_trait(),
+        lang.sub_assign_trait(),
+        lang.mul_assign_trait(),
+        lang.div_assign_trait(),
+        lang.rem_assign_trait(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|operator_trait| operator_trait == trait_ref.def_id)
+}
+
 /// Convert a Rust device-extern type to the LLVM type supported at the
 /// external function boundary.
 ///
@@ -650,19 +722,13 @@ pub fn generate_device_code<'tcx>(
     // 2. Sets up thread-local CompilerCtxt
     // 3. Runs our closure with access to stable() conversion
     // 4. Tears down the context and returns our result
-    // Pre-compute `#[inline(always)]` flags before entering the stable_mir
+    // Pre-compute inline attributes before entering the stable_mir
     // context, since the query lives on `rustc_middle::TyCtxt` and is not
     // exposed through stable_mir. Preserving this hint avoids making helper
     // boundaries depend entirely on later optimizer heuristics.
-    let inline_always_flags: Vec<bool> = functions
+    let inline_attrs: Vec<mir_importer::InlineAttr> = functions
         .iter()
-        .map(|func| {
-            let def_id = func.instance.def_id();
-            matches!(
-                tcx.codegen_fn_attrs(def_id).inline,
-                rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
-            )
-        })
+        .map(|func| inline_attr_for_device_function(tcx, func.instance.def_id()))
         .collect();
     let device_mono_reachability: Vec<crate::collector::DeviceMonoReachability> = functions
         .iter()
@@ -684,11 +750,11 @@ pub fn generate_device_code<'tcx>(
             .iter()
             .zip(export_names.iter())
             .zip(debug_scope_maps.iter())
-            .zip(inline_always_flags.iter())
+            .zip(inline_attrs.iter())
             .zip(device_mono_reachability.iter())
             .filter_map(
                 |(
-                    (((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always),
+                    (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
                     reachability,
                 )| {
                     // Use rustc_internal::stable() to convert the Instance.
@@ -713,7 +779,7 @@ pub fn generate_device_code<'tcx>(
                         is_kernel: *is_kernel,
                         export_name: export_name.clone(),
                         debug_source_scopes: Some(debug_source_scopes.clone()),
-                        is_inline_always: *is_inline_always,
+                        inline_attr: *inline_attr,
                     })
                 },
             )

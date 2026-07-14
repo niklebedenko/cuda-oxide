@@ -60,6 +60,16 @@ fn stderr_pipeline_trace(message: &str) {
 /// Represents a monomorphized function instance that will be translated to PTX.
 /// For generic functions like `add::<f32>`, the instance contains the concrete
 /// type substitutions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InlineAttr {
+    #[default]
+    None,
+    Hint,
+    Always,
+    /// A backend-selected helper that must not remain a device call.
+    DeviceAlways,
+}
+
 #[derive(Debug, Clone)]
 pub struct CollectedFunction {
     /// The monomorphized stable_mir instance (includes concrete generic args).
@@ -76,19 +86,10 @@ pub struct CollectedFunction {
     pub export_name: String,
     /// rustc MIR source-scope data used to build inlined debug scopes.
     pub debug_source_scopes: Option<llvm_export::ops::DebugSourceScopeMap>,
-    /// True if the function is marked `#[inline(always)]` in rustc's
-    /// `CodegenFnAttrs`. The stable_mir API does not expose inline hints, so
-    /// this is queried via `rustc_middle::TyCtxt::codegen_fn_attrs` in
-    /// `rustc-codegen-cuda` and threaded through.
-    ///
-    /// When true, the LLVM `alwaysinline` attribute is emitted on the
-    /// function definition. The existing matched LLVM middle-end (`opt -O2`),
-    /// when available, can then honor the attribute before PTX generation;
-    /// this flag does not add a separate mandatory inliner pass.
-    ///
-    /// This preserves Rust's inline intent for device helpers and avoids
-    /// making helper boundaries depend entirely on later optimizer heuristics.
-    pub is_inline_always: bool,
+    /// Rust's inline intent from `CodegenFnAttrs`. The stable_mir API does not
+    /// expose this, so `rustc-codegen-cuda` queries it before entering the
+    /// stable MIR context and threads it through the pipeline.
+    pub inline_attr: InlineAttr,
 }
 
 /// Device artifact format produced by a successful pipeline run.
@@ -293,7 +294,7 @@ pub fn run_pipeline(
             func.rustc_mir_block_count,
             &func.rustc_mono_successors,
             func.is_kernel,
-            func.is_inline_always,
+            func.inline_attr,
             Some(&func.export_name),
             &mut legaliser,
             config.debug_kind,

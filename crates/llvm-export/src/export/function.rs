@@ -661,13 +661,22 @@ impl<'a> ModuleExportState<'a> {
             .iter(self.ctx)
             .next();
 
-        // Check for alwaysinline attribute (from #[inline(always)]).
+        // Check for Rust inline attributes.
+        let inlinehint_key: pliron::identifier::Identifier = "inlinehint".try_into().unwrap();
+        let is_inlinehint = attrs
+            .get::<pliron::builtin::attributes::StringAttr>(&inlinehint_key)
+            .is_some();
         // Emitted as a function attribute keyword between the parameter
         // list and the body open brace.
         let alwaysinline_key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
+        let device_alwaysinline_key: pliron::identifier::Identifier =
+            "device_alwaysinline".try_into().unwrap();
         let is_alwaysinline = attrs
             .get::<pliron::builtin::attributes::StringAttr>(&alwaysinline_key)
-            .is_some();
+            .is_some()
+            || attrs
+                .get::<pliron::builtin::attributes::StringAttr>(&device_alwaysinline_key)
+                .is_some();
 
         if let Some(entry_block) = entry_block_opt {
             let func_loc = func.get_operation().deref(self.ctx).loc();
@@ -723,10 +732,15 @@ impl<'a> ModuleExportState<'a> {
             // gets its `bar.sync.aligned` pushed into a `tid`-dependent branch
             // and deadlocks. opt's FunctionAttrs strips `convergent` from
             // functions it proves never reach a convergent op.
-            // alwaysinline (from #[inline(always)]) and !dbg are independent:
-            // either, both, or neither can be present. Emit the inline keyword
+            // Inline intent and !dbg are independent. Emit the inline keyword
             // before the convergent attr group #0, then the debug scope.
-            let inline_attr = if is_alwaysinline { "alwaysinline " } else { "" };
+            let inline_attr = if is_alwaysinline {
+                "alwaysinline "
+            } else if is_inlinehint {
+                "inlinehint "
+            } else {
+                ""
+            };
             if let Some(scope_id) = debug_scope {
                 writeln!(output, ") {inline_attr}#0 !dbg !{scope_id} {{").unwrap();
             } else {

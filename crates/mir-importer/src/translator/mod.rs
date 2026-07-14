@@ -130,9 +130,8 @@ pub fn translate_function(
     register_dialects(ctx);
 
     // Translate the function body. This helper is for tests/utilities that
-    // don't have access to rustc's CodegenFnAttrs, so `is_inline_always` is
-    // always false here. The real pipeline call (in `pipeline.rs`) threads
-    // the flag through from `rustc-codegen-cuda`.
+    // doesn't have access to rustc's CodegenFnAttrs, so the inline attribute is
+    // absent here. The real pipeline call threads it from `rustc-codegen-cuda`.
     // This utility does not participate in rustc-codegen-cuda's collector,
     // so it deliberately translates every block. The production pipeline
     // passes rustc's exact per-instance reachability instead.
@@ -148,7 +147,7 @@ pub fn translate_function(
         body.blocks.len(),
         &all_successors,
         is_kernel,
-        /* is_inline_always */ false,
+        crate::pipeline::InlineAttr::None,
         None,
         legaliser,
         DebugKind::Off,
