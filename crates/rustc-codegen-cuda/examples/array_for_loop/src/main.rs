@@ -258,6 +258,26 @@ mod kernels {
             *out_elem = selected.values[0] + selected.values[1];
         }
     }
+
+    /// `array::map` uses `[MaybeUninit<U>; N]` internally. Keep that union
+    /// usable when `U` has stronger alignment than NVPTX's scalar types.
+    #[kernel]
+    pub fn map_over_aligned_array(mut out: DisjointSlice<f32>) {
+        let tid = thread::index_1d();
+        let t = tid.get() as f32;
+        if let Some(out_elem) = out.get_mut(tid) {
+            let components = [0.0_f32, 1.0, 2.0].map(|offset| ScalarPair {
+                values: [t + offset, t + offset + 3.0],
+                padding: [0; 24],
+            });
+            *out_elem = components[0].values[0]
+                + components[0].values[1]
+                + components[1].values[0]
+                + components[1].values[1]
+                + components[2].values[0]
+                + components[2].values[1];
+        }
+    }
 }
 
 fn kernel_body<'a>(ptx: &'a str, kernel_prefix: &str) -> &'a str {
@@ -349,6 +369,13 @@ fn main() {
     .expect("launch runtime_aggregate_array_index");
     let got_runtime_index = d_runtime_index.to_host_vec(&stream).unwrap();
 
+    let mut d_aligned_map = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    // SAFETY: the 32-thread 1D block matches the kernel's indexing model and
+    // the 32-element output allocation.
+    unsafe { module.map_over_aligned_array(stream.as_ref(), cfg, &mut d_aligned_map) }
+        .expect("launch map_over_aligned_array");
+    let got_aligned_map = d_aligned_map.to_host_vec(&stream).unwrap();
+
     let ptx = std::fs::read_to_string(ptx_path).expect("read generated PTX");
     let fixed_axis_ptx = kernel_body(&ptx, "fixed_axis_aggregate_arrays");
     assert!(
@@ -363,6 +390,13 @@ fn main() {
             && !runtime_index_ptx.contains("ld.local")
             && !runtime_index_ptx.contains("st.local"),
         "small runtime aggregate indexing must not use local memory:\n{runtime_index_ptx}"
+    );
+    let aligned_map_ptx = kernel_body(&ptx, "map_over_aligned_array");
+    assert!(
+        !aligned_map_ptx.contains(".local")
+            && !aligned_map_ptx.contains("ld.local")
+            && !aligned_map_ptx.contains("st.local"),
+        "over-aligned array::map must not use local memory:\n{aligned_map_ptx}"
     );
 
     let mut failures = 0usize;
@@ -431,6 +465,14 @@ fn main() {
             println!(
                 "FAIL tid={tid}: runtime_aggregate_array_index={} expected={want_runtime_index}",
                 got_runtime_index[tid]
+            );
+            failures += 1;
+        }
+        let want_aligned_map = 6.0 * t + 15.0;
+        if (got_aligned_map[tid] - want_aligned_map).abs() > 1.0e-4 {
+            println!(
+                "FAIL tid={tid}: map_over_aligned_array={} expected={want_aligned_map}",
+                got_aligned_map[tid]
             );
             failures += 1;
         }

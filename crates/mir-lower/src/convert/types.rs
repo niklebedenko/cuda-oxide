@@ -1353,6 +1353,7 @@ pub(crate) fn build_enum_slot_map(
 ) -> Result<EnumSlotMap, anyhow::Error> {
     let (
         name,
+        variant_count,
         discriminant_ty,
         all_field_types,
         all_field_offsets,
@@ -1373,6 +1374,7 @@ pub(crate) fn build_enum_slot_map(
             .ok_or_else(|| anyhow::anyhow!("build_enum_slot_map: expected MirEnumType"))?;
         (
             enum_ty.name().to_string(),
+            enum_ty.variant_count(),
             enum_ty.discriminant_ty,
             enum_ty.all_field_types.clone(),
             enum_ty.all_field_offsets.clone(),
@@ -1388,6 +1390,17 @@ pub(crate) fn build_enum_slot_map(
             enum_ty.carrier_address_space,
         )
     };
+
+    if variant_count == 0 {
+        return Ok(EnumSlotMap {
+            llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, vec![]).into(),
+            carrier_slot: None,
+            carrier_llvm_ty: None,
+            field_slots: vec![],
+            field_offsets: vec![],
+            field_llvm_types: vec![],
+        });
+    }
 
     if layout_kind == EnumLayoutKind::Unknown {
         return Err(anyhow::anyhow!(
@@ -3579,6 +3592,18 @@ mod tests {
         let array: TypeHandle = MirArrayType::get(&mut ctx, union_handle, 3).into();
         let llvm_array = convert_type(&mut ctx, array).unwrap();
         assert_eq!(llvm_type_size_align(&ctx, llvm_array), Some((96, 16)));
+    }
+
+    #[test]
+    fn uninhabited_enum_lowers_to_zero_sized_storage() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 8);
+        let never: TypeHandle =
+            MirEnumType::get(&mut ctx, "Never".into(), discr, vec![], vec![]).into();
+
+        let storage = convert_type(&mut ctx, never).unwrap();
+        assert!(is_zero_sized_type(&ctx, storage));
+        assert_eq!(llvm_type_size_align(&ctx, storage), Some((0, 1)));
     }
 
     #[test]
