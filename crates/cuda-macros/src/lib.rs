@@ -226,6 +226,8 @@ fn track_codegen_environment() {
     let _ = proc_macro::tracked::env_var(MATERIALIZER_PROVENANCE_ENV);
 }
 
+const CODEGEN_ACTIVE_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_ACTIVE";
+
 /// Build a private identifier that cannot capture, or be captured by, a name
 /// written in the user's kernel signature.
 fn internal_ident(name: &str) -> Ident {
@@ -1671,6 +1673,11 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 /// no reference at all. The backend also keeps a weak legacy alias for older
 /// macro expansions in mixed-version builds.
 ///
+/// A plain Cargo build does not run the CUDA Oxide backend and therefore has no
+/// artifact object that could define an anchor. `cargo oxide` marks its child
+/// compiler processes explicitly; ordinary builds omit the reference so host
+/// binaries that reuse `from_modules()` continue to link.
+///
 /// The reference is only emitted when the module is guaranteed to produce
 /// an artifact for this crate. Generic kernels are monomorphized (and
 /// their PTX embedded) in the *consuming* crate, so a module with only
@@ -1684,6 +1691,10 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 fn cuda_module_artifact_anchor_statements(
     kernels: &[CudaModuleKernel],
 ) -> syn::Result<TokenStream2> {
+    if !codegen_is_active(std::env::var_os(CODEGEN_ACTIVE_ENV).as_deref()) {
+        return Ok(TokenStream2::new());
+    }
+
     let (Ok(package_name), Ok(package_version), Ok(crate_name)) = (
         std::env::var("CARGO_PKG_NAME"),
         std::env::var("CARGO_PKG_VERSION"),
@@ -1744,6 +1755,10 @@ fn cuda_module_artifact_anchor_statements(
         // crate's `cuda_module_artifact_anchor_statements` for details.
         #(#references)*
     })
+}
+
+fn codegen_is_active(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 fn device_codegen_owner_selection(raw: Option<&str>, crate_name: &str) -> Option<bool> {
@@ -8253,6 +8268,14 @@ mod tests {
             device_codegen_owner_selection(Some("gpu-lib, math_gpu"), "host_app"),
             Some(false)
         );
+    }
+
+    #[test]
+    fn artifact_anchor_requires_explicit_codegen_activation() {
+        assert!(!codegen_is_active(None));
+        assert!(!codegen_is_active(Some(std::ffi::OsStr::new(""))));
+        assert!(!codegen_is_active(Some(std::ffi::OsStr::new("0"))));
+        assert!(codegen_is_active(Some(std::ffi::OsStr::new("1"))));
     }
 
     #[test]

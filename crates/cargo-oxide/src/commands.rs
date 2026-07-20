@@ -23,6 +23,7 @@ const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CR
 const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
 const LEGACY_CODEGEN_FINGERPRINT_CFG: &str = "cuda_oxide_internal_codegen_env";
 const LEGACY_MATERIALIZER_PROVENANCE_CFG: &str = "cuda_oxide_internal_materializer_provenance";
+const CODEGEN_ACTIVE_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_ACTIVE";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MaterializationMode {
@@ -5297,6 +5298,7 @@ fn apply_codegen_rustflags(
         "CARGO_ENCODED_RUSTFLAGS",
         build_encoded_rustflags(ctx, profile, device_cfgs),
     )
+    .env(CODEGEN_ACTIVE_ENV, "1")
     .env_remove("RUSTFLAGS");
 }
 
@@ -7282,6 +7284,7 @@ path = "src/other.rs"
             command_env(&cmd, CODEGEN_FINGERPRINT_ENV).as_deref(),
             Some(fingerprint.as_str())
         );
+        assert_eq!(command_env(&cmd, CODEGEN_ACTIVE_ENV).as_deref(), Some("1"));
     }
 
     #[test]
