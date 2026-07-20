@@ -634,6 +634,13 @@ enum CudaModuleParamMarshal {
 }
 
 fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
+    expand_cuda_module_with_artifact_anchor(module, None)
+}
+
+fn expand_cuda_module_with_artifact_anchor(
+    module: ItemMod,
+    artifact_anchor_override: Option<TokenStream2>,
+) -> syn::Result<TokenStream2> {
     let module_attrs = &module.attrs;
     let vis = &module.vis;
     let ident = &module.ident;
@@ -659,7 +666,10 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     reject_reserved_loaded_module_methods(direct_kernels, false)?;
     let module_items = cuda_module_items_with_constant_symbols(&transformed.items, &constants);
 
-    let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&transformed.kernels)?;
+    let artifact_anchor_statements = artifact_anchor_override.map_or_else(
+        || cuda_module_artifact_anchor_statements(&transformed.kernels),
+        Ok,
+    )?;
     let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
     let has_launch_contract = transformed
         .kernels
@@ -791,7 +801,6 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
                 name: &str,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
-                #artifact_anchor_statements
                 #module_loader
                 // SAFETY: upheld by this function's caller.
                 unsafe { from_module(module) }.map_err(::cuda_host::EmbeddedModuleError::Driver)
@@ -803,7 +812,6 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
                 name: &str,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
-                #artifact_anchor_statements
                 #module_loader
                 from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
             }
@@ -836,6 +844,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
             pub unsafe fn from_modules(
                 modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
             ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                #artifact_anchor_statements
                 Ok(LoadedModule {
                     __modules: modules,
                     __generic_functions: ::std::sync::Arc::new(
@@ -856,6 +865,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
             pub fn from_modules(
                 modules: ::std::vec::Vec<::std::sync::Arc<::cuda_core::CudaModule>>,
             ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                #artifact_anchor_statements
                 Ok(LoadedModule {
                     __modules: modules,
                     __generic_functions: ::std::sync::Arc::new(
@@ -1274,11 +1284,12 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 /// symbol that some already-linked object references. The backend defines
 /// a global anchor symbol inside the artifact object for exactly this
 /// purpose; here we emit the matching reference. Reading the anchor's
-/// address through `black_box` inside `load_named()` means that any
-/// program calling `load()` carries an undefined reference to the anchor,
-/// which forces the linker to pull the artifact member out of the rlib.
-/// Without this handshake the bundle was silently dropped and `load()`
-/// failed at runtime with `ModuleNotFound` (issue #72).
+/// address through `black_box` inside `from_modules()` means that every
+/// generated module-binding path carries an undefined reference to the anchor,
+/// which forces the linker to pull the artifact member out of the rlib. This
+/// includes callers that discover a shared final-target module set themselves
+/// before constructing several typed launch surfaces. Without this handshake
+/// the bundle is silently dropped and kernel lookup fails at runtime.
 ///
 /// Without an owner filter, both sides keep using the legacy package+version
 /// anchor for compatibility with older wrappers and backends. A non-empty
@@ -1293,7 +1304,7 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 /// their PTX embedded) in the *consuming* crate, so a module with only
 /// generic kernels yields no artifact here, and an anchor reference would
 /// be an undefined-symbol link error. The same reasoning extends to
-/// cfg-gated kernels: root `load()` emits one equivalent guarded reference per
+/// cfg-gated kernels: module binding emits one equivalent guarded reference per
 /// concrete kernel in the complete inline tree. Each reference carries the
 /// kernel's effective ancestor-plus-local availability attributes, so a module
 /// containing only nested kernels is still independently loadable while no
@@ -6002,6 +6013,37 @@ mod tests {
             .replace(' ', "")
     }
 
+    fn expand_with_test_artifact_anchor(module: ItemMod) -> String {
+        expand_cuda_module_with_artifact_anchor(
+            module,
+            Some(quote! {
+                let __cuda_oxide_test_artifact_anchor = 17usize;
+            }),
+        )
+        .expect("cuda_module expansion with test artifact anchor failed")
+        .to_string()
+        .replace(' ', "")
+    }
+
+    fn assert_artifact_anchor_is_in_from_modules(expanded: &str, signature: &str) {
+        const ANCHOR: &str = "let__cuda_oxide_test_artifact_anchor=17usize;";
+        assert_eq!(expanded.matches(ANCHOR).count(), 1, "{expanded}");
+        let from_modules = expanded
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing `{signature}` in expansion: {expanded}"));
+        let anchor = expanded
+            .find(ANCHOR)
+            .expect("test artifact anchor missing from expansion");
+        let loaded_module = expanded[from_modules..]
+            .find("Ok(LoadedModule{")
+            .map(|offset| from_modules + offset)
+            .expect("from_modules omitted LoadedModule construction");
+        assert!(
+            from_modules < anchor && anchor < loaded_module,
+            "artifact anchor must execute inside from_modules before constructing the launch handle: {expanded}"
+        );
+    }
+
     #[test]
     fn generated_kernel_siblings_preserve_qualified_paths_and_generics() {
         let kernel: syn::Path = parse_quote! { kernels::map::<_, 4> };
@@ -6490,6 +6532,20 @@ mod tests {
     }
 
     #[test]
+    fn contracted_from_modules_retains_the_concrete_kernel_artifact() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn map(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_with_test_artifact_anchor(module);
+
+        assert_artifact_anchor_is_in_from_modules(&expanded, "pubunsafefnfrom_modules(");
+    }
+
+    #[test]
     fn uncontracted_module_preserves_safe_custom_loaders() {
         let module: ItemMod = parse_quote! {
             mod kernels {
@@ -6505,6 +6561,19 @@ mod tests {
         assert!(!expanded.contains("pubunsafefnfrom_module("));
         #[cfg(feature = "async")]
         assert!(expanded.contains("pubfnload_async_named("));
+    }
+
+    #[test]
+    fn safe_from_modules_retains_the_concrete_kernel_artifact() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn map(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_with_test_artifact_anchor(module);
+
+        assert_artifact_anchor_is_in_from_modules(&expanded, "pubfnfrom_modules(");
     }
 
     #[test]
