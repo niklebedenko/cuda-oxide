@@ -82,9 +82,14 @@ impl FinalizationOptions {
     }
 
     pub(crate) fn nvvm_ptx_options(&self) -> Vec<String> {
+        let optimization = if self.debug == DebugPolicy::Full {
+            "-opt=0"
+        } else {
+            "-opt=3"
+        };
         let mut options = vec![
             format!("-arch={}", self.target.compute()),
-            "-opt=0".to_string(),
+            optimization.to_string(),
             self.fma_option().to_string(),
         ];
         if self.debug == DebugPolicy::Full {
@@ -175,7 +180,7 @@ mod tests {
         );
         assert_eq!(
             base.nvvm_ptx_options(),
-            ["-arch=compute_90a", "-opt=0", "-fma=0"]
+            ["-arch=compute_90a", "-opt=3", "-fma=0"]
         );
         assert_eq!(
             base.nvjitlink_ltoir_options(FinalizerOutput::Cubin),

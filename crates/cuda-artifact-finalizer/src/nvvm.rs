@@ -80,8 +80,9 @@ impl NvvmCompiler {
 
     /// Compile one NVVM IR module plus libdevice into linkable PTX.
     ///
-    /// libNVVM optimization is disabled deliberately. The final nvJitLink
-    /// invocation owns optimization after seeing every kernel in the module.
+    /// libNVVM performs LLVM-level optimization before the final nvJitLink
+    /// invocation performs target-specific optimization on the complete PTX
+    /// module.
     pub fn compile_nvvm_ir_to_ptx(
         &self,
         module_name: &str,
