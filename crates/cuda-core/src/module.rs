@@ -31,8 +31,38 @@ use crate::context::CudaContext;
 use crate::error::{DriverError, IntoResult};
 use std::borrow::Cow;
 use std::ffi::{CString, c_void};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+const LOADED_KERNEL_MANIFEST_ENV: &str = "CUDA_OXIDE_LOADED_KERNEL_MANIFEST";
+static LOADED_KERNEL_MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn record_loaded_kernel(fn_name: &str) {
+    let Some(path) = std::env::var_os(LOADED_KERNEL_MANIFEST_ENV) else {
+        return;
+    };
+    append_loaded_kernel(Path::new(&path), fn_name).unwrap_or_else(|error| {
+        panic!(
+            "failed to record loaded CUDA kernel `{fn_name}` in {}: {error}",
+            Path::new(&path).display()
+        )
+    });
+}
+
+fn append_loaded_kernel(path: &Path, fn_name: &str) -> std::io::Result<()> {
+    assert!(
+        !fn_name.contains(['\n', '\r']),
+        "CUDA kernel names written to the loaded-kernel manifest must be single-line"
+    );
+    let _guard = LOADED_KERNEL_MANIFEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut manifest = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(manifest, "{fn_name}")
+}
 
 /// An RAII wrapper around a `CUmodule` handle.
 ///
@@ -251,10 +281,37 @@ impl CudaModule {
             .result()?;
             cu_function.assume_init()
         };
+        record_loaded_kernel(fn_name);
         Ok(CudaFunction {
             cu_function,
             module: self.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod loaded_kernel_manifest_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loaded_kernel_manifest_appends_one_symbol_per_line() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must follow the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cuda-oxide-loaded-kernels-{}-{nonce}.txt",
+            std::process::id()
+        ));
+
+        append_loaded_kernel(&path, "first_kernel").expect("append first symbol");
+        append_loaded_kernel(&path, "generic_kernel_TID_0123").expect("append generic symbol");
+        let contents = fs::read_to_string(&path).expect("read loaded-kernel manifest");
+        fs::remove_file(&path).expect("remove loaded-kernel manifest");
+
+        assert_eq!(contents, "first_kernel\ngeneric_kernel_TID_0123\n");
     }
 }
 
