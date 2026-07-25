@@ -79,7 +79,7 @@ impl LtoLinker {
         options: &FinalizationOptions,
         output: FinalizerOutput,
     ) -> Result<Vec<u8>, FinalizerError> {
-        validate_inputs(inputs)?;
+        validate_inputs(inputs, input_kind)?;
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
@@ -156,7 +156,10 @@ fn current_linker_tool_digest(tool: &LoadedLinkerTool) -> Option<[u8; 32]> {
     digest_file_handle(file).ok()
 }
 
-fn validate_inputs(inputs: &[NamedInput<'_>]) -> Result<(), FinalizerError> {
+fn validate_inputs(
+    inputs: &[NamedInput<'_>],
+    input_kind: LinkInputKind,
+) -> Result<(), FinalizerError> {
     if inputs.is_empty() {
         return Err(FinalizerError::NoLinkInputs);
     }
@@ -165,6 +168,15 @@ fn validate_inputs(inputs: &[NamedInput<'_>]) -> Result<(), FinalizerError> {
         if input.bytes.is_empty() {
             return Err(FinalizerError::EmptyInput {
                 name: input.name.to_string(),
+            });
+        }
+        if matches!(input_kind, LinkInputKind::Ptx)
+            && let Some(offset) = input.bytes.iter().position(|byte| *byte == 0)
+            && offset + 1 != input.bytes.len()
+        {
+            return Err(FinalizerError::InteriorNulPtx {
+                name: input.name.to_string(),
+                offset,
             });
         }
     }
@@ -335,16 +347,46 @@ mod tests {
     #[test]
     fn input_validation_rejects_zero_inputs_empty_data_and_nul_names() {
         assert!(matches!(
-            validate_inputs(&[]),
+            validate_inputs(&[], LinkInputKind::Ltoir),
             Err(FinalizerError::NoLinkInputs)
         ));
         assert!(matches!(
-            validate_inputs(&[NamedInput::new("empty", b"")]),
+            validate_inputs(&[NamedInput::new("empty", b"")], LinkInputKind::Ltoir),
             Err(FinalizerError::EmptyInput { .. })
         ));
         assert!(matches!(
-            validate_inputs(&[NamedInput::new("bad\0name", b"x")]),
+            validate_inputs(&[NamedInput::new("bad\0name", b"x")], LinkInputKind::Ltoir),
             Err(FinalizerError::InvalidInputName { .. })
         ));
+    }
+
+    #[test]
+    fn ptx_validation_allows_only_an_optional_trailing_nul() {
+        for bytes in [&b"ptx"[..], &b"ptx\0"[..]] {
+            validate_inputs(&[NamedInput::new("kernel.ptx", bytes)], LinkInputKind::Ptx).unwrap();
+        }
+
+        for (bytes, expected_offset) in [
+            (&b"ptx\0ignored"[..], 3),
+            (&b"ptx\0\0"[..], 3),
+            (&b"\0ptx"[..], 0),
+        ] {
+            let error =
+                validate_inputs(&[NamedInput::new("kernel.ptx", bytes)], LinkInputKind::Ptx)
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                FinalizerError::InteriorNulPtx {
+                    ref name,
+                    offset
+                } if name == "kernel.ptx" && offset == expected_offset
+            ));
+        }
+
+        validate_inputs(
+            &[NamedInput::new("kernel.ltoir", b"lto\0ir")],
+            LinkInputKind::Ltoir,
+        )
+        .unwrap();
     }
 }

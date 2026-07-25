@@ -1023,8 +1023,8 @@ fn embedded_compile_options(
 /// trade-offs.
 struct MaterializedEmbeddingArtifact {
     artifact: device_codegen::DeviceCodegenArtifact,
-    /// Exact PTX input used to produce `artifact`, when the selected route has
-    /// a PTX link stage. LTOIR-to-cubin has no such byte sequence.
+    /// Exact upstream PTX source used to produce `artifact`, when the selected
+    /// route has a PTX link stage. LTOIR-to-cubin has no such byte sequence.
     ptx_sidecar: Option<Vec<u8>>,
 }
 
@@ -1101,7 +1101,7 @@ fn materialized_nvvm_embedding(
 
 fn materialized_ptx_embedding(
     bundle_name: &str,
-    ptx_input: Vec<u8>,
+    ptx_source: Vec<u8>,
     cubin: Vec<u8>,
 ) -> MaterializedEmbeddingArtifact {
     MaterializedEmbeddingArtifact {
@@ -1110,7 +1110,7 @@ fn materialized_ptx_embedding(
             name: format!("{bundle_name}.cubin"),
             bytes: cubin,
         },
-        ptx_sidecar: Some(ptx_input),
+        ptx_sidecar: Some(ptx_source),
     }
 }
 
@@ -1450,14 +1450,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_ptx_materialization_preserves_exact_linker_input_and_cubin() {
-        let linker_input = b".version 8.7\n.visible .entry demo() { ret; }\n\0".to_vec();
+    fn direct_ptx_materialization_preserves_exact_source_and_cubin() {
+        let ptx_source = b".version 8.7\n.visible .entry demo() { ret; }\n".to_vec();
         let cubin = b"final cubin".to_vec();
 
         let materialized =
-            materialized_ptx_embedding("demo", linker_input.clone(), cubin.clone());
+            materialized_ptx_embedding("demo", ptx_source.clone(), cubin.clone());
 
-        assert_eq!(materialized.ptx_sidecar, Some(linker_input));
+        assert_eq!(materialized.ptx_sidecar, Some(ptx_source));
         assert_eq!(
             materialized.artifact.kind,
             device_codegen::DeviceCodegenArtifactKind::Cubin
@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_ptx_sidecar_preserves_exact_linker_input_bytes() {
+    fn non_nul_ptx_sidecar_preserves_exact_source_bytes() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1478,11 +1478,13 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let ptx_path = temp_dir.join("demo.ptx");
-        let linker_input = b".version 8.7\n.visible .entry demo() { ret; }\n\0";
+        let ptx_source = b".version 8.7\n.visible .entry demo() { ret; }\n";
 
-        write_materialized_ptx_sidecar(&ptx_path, linker_input).unwrap();
+        write_materialized_ptx_sidecar(&ptx_path, ptx_source).unwrap();
 
-        assert_eq!(std::fs::read(&ptx_path).unwrap(), linker_input);
+        let sidecar = std::fs::read(&ptx_path).unwrap();
+        assert_eq!(sidecar, ptx_source);
+        assert_ne!(sidecar.last(), Some(&0));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

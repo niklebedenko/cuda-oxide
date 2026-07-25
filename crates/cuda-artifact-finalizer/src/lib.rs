@@ -80,6 +80,15 @@ pub enum FinalizerError {
     #[error("CUDA artifact input is empty: {name}")]
     EmptyInput { name: String },
 
+    /// nvJitLink may parse PTX as a C string and ignore bytes after a NUL.
+    #[error("CUDA PTX input {name:?} contains an interior NUL byte at offset {offset}")]
+    InteriorNulPtx {
+        /// Diagnostic input name supplied by the caller.
+        name: String,
+        /// Byte offset of the first non-trailing NUL.
+        offset: usize,
+    },
+
     /// nvJitLink was invoked without an input module.
     #[error("at least one ordered linker input is required")]
     NoLinkInputs,
@@ -102,13 +111,14 @@ pub enum FinalizerError {
 
 /// Outputs from one NVVM IR materialization plan.
 ///
-/// `ptx_input` is the exact whole-module byte sequence passed to nvJitLink to
-/// produce `cubin`. Keeping both outputs from the same invocation lets callers
-/// publish an audit sidecar without recompiling the NVVM IR or guessing which
-/// PTX policy produced the embedded image.
+/// `ptx_input` is the exact whole-module PTX source produced by libNVVM.
+/// nvJitLink may receive separate trailing-NUL FFI backing without changing
+/// these source bytes. Keeping the source and cubin from the same invocation
+/// lets callers publish an audit sidecar without recompiling the NVVM IR or
+/// guessing which PTX policy produced the embedded image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedNvvmIr {
-    /// Exact whole-module PTX input passed to nvJitLink.
+    /// Exact whole-module PTX source produced by libNVVM.
     pub ptx_input: Vec<u8>,
     /// Validated target-specific cubin produced from `ptx_input`.
     pub cubin: Vec<u8>,
@@ -143,7 +153,7 @@ impl Finalizer {
     }
 
     /// Compile one NVVM IR module and return both the exact whole-module PTX
-    /// linker input and the validated target-specific cubin it produced.
+    /// source and the validated target-specific cubin produced from it.
     pub fn materialize_nvvm_ir_with_ptx(
         &self,
         module_name: &str,
