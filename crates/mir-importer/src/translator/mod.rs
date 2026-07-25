@@ -148,6 +148,7 @@ pub fn translate_function(
         &all_successors,
         is_kernel,
         crate::pipeline::InlineAttr::None,
+        false,
         None,
         legaliser,
         DebugKind::Off,

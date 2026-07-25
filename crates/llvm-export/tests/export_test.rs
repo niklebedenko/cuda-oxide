@@ -2265,6 +2265,62 @@ fn export_device_alwaysinline_reaches_nvvm_ir() {
 }
 
 #[test]
+fn export_device_link_alwaysinline_only_reaches_nvvm_ir() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "device_link_helper".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    func.get_operation().insert_at_back(module_block, &ctx);
+    let inlinehint_key: pliron::identifier::Identifier = "inlinehint".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(inlinehint_key, StringAttr::new("true".to_string()));
+    let baseline_ptx = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig)
+        .expect("baseline PTX export succeeds");
+
+    let key: pliron::identifier::Identifier = "device_link_alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+
+    let ptx_ir = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig)
+        .expect("PTX export succeeds");
+    assert_eq!(
+        ptx_ir, baseline_ptx,
+        "device-link inline intent must not change direct PTX IR"
+    );
+    let ptx_define = ptx_ir
+        .lines()
+        .find(|line| line.starts_with("define void @device_link_helper("))
+        .expect("device-link helper definition");
+    assert!(
+        ptx_define.contains("inlinehint") && !ptx_define.contains("alwaysinline"),
+        "direct PTX compilation must retain the original hint and helper boundary:\n{ptx_ir}"
+    );
+
+    let nvvm_ir = export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+        .expect("NVVM IR export succeeds");
+    let nvvm_define = nvvm_ir
+        .lines()
+        .find(|line| line.starts_with("define void @device_link_helper("))
+        .expect("device-link helper definition");
+    assert_eq!(
+        nvvm_define, "define void @device_link_helper() alwaysinline #0 {",
+        "the device linker must receive mandatory-inline intent:\n{nvvm_ir}"
+    );
+}
+
+#[test]
 fn export_inlinehint_function_attribute_reaches_nvvm_ir() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());

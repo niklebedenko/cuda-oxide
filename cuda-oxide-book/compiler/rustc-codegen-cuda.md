@@ -384,6 +384,30 @@ reads the stable MIR for each instance, translates it into pliron's MIR
 dialect, and runs the full lowering pipeline through to PTX. That process is
 covered in [The MIR Importer](mir-importer.md).
 
+### Device-link-only array callback inlining
+
+The NVVM IR path marks bounded closures passed directly to
+`core::array::from_fn` and `core::array::try_from_fn` as mandatory inline.
+This removes repeated callback frames in array-heavy numerical kernels without
+changing Rust's source-level inline intent. The concrete array length, output
+layout, callback body, and captured environment are bounded to keep native
+link work finite.
+
+The marker is deliberately narrower than `#[inline(always)]`:
+
+- the final NVVM IR exporter upgrades it to LLVM `alwaysinline`;
+- direct PTX export retains the original `inlinehint` or lack of an attribute;
+- core array scaffolds keep their ordinary Rust inline hints; and
+- returned closures, function items, oversized captures, and similarly named
+  user functions are not selected. If one callback instance is shared by both
+  an accepted and a rejected builder, rejection wins because function
+  attributes apply to every call site.
+
+The backend computes this intent before lowering because the shared pipeline
+can discover libdevice calls and select NVVM IR later. Only the NVVM exporter
+honours the marker; the direct PTX exporter ignores it. This is a deterministic
+production policy rather than an environment-selectable optimization mode.
+
 ---
 
 (rustc-codegen-environment-variables)=
@@ -402,6 +426,8 @@ quiet, production-oriented build.
 | `CUDA_OXIDE_PTX_DIR`        | Override the output directory for `.ptx` files (default: next to the host binary)      |
 | `CUDA_OXIDE_TARGET`         | Override the GPU target architecture (e.g., `sm_90a` for Hopper)                       |
 | `CUDA_OXIDE_SHOW_RUSTC_MIR` | Dump the raw rustc MIR before translation to pliron (useful for debugging import bugs) |
+| `CUDA_OXIDE_INLINE_STATS`   | Report device inline-plan counts and classification time                              |
+| `CUDA_OXIDE_INLINE_TRACE`   | Print each array callback candidate and its resource-bound decision                   |
 
 These are intentionally environment variables rather than command-line flags.
 The codegen backend receives very limited information from rustc's argument

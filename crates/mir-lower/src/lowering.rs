@@ -368,7 +368,12 @@ fn propagate_kernel_attrs(
 /// CUDA backend's bounded mandatory-inline classification. The LLVM exporter
 /// maps these attributes onto the applicable LLVM function keywords.
 fn propagate_inline_attrs(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_func: &llvm::FuncOp) {
-    for name in ["inlinehint", "alwaysinline", "device_alwaysinline"] {
+    for name in [
+        "inlinehint",
+        "alwaysinline",
+        "device_alwaysinline",
+        "device_link_alwaysinline",
+    ] {
         let key: pliron::identifier::Identifier = name.try_into().unwrap();
         let attr_opt = mir_op
             .deref(ctx)

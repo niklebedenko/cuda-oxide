@@ -90,6 +90,12 @@ pub struct CollectedFunction {
     /// expose this, so `rustc-codegen-cuda` queries it before entering the
     /// stable MIR context and threads it through the pipeline.
     pub inline_attr: InlineAttr,
+    /// Backend-selected mandatory-inline intent for the final device linker.
+    ///
+    /// This is independent from `inline_attr`: direct PTX compilation retains
+    /// the original Rust hint, while NVVM IR additionally receives the
+    /// device-link requirement.
+    pub device_link_always: bool,
 }
 
 /// Device artifact format produced by a successful pipeline run.
@@ -295,6 +301,7 @@ pub fn run_pipeline(
             &func.rustc_mono_successors,
             func.is_kernel,
             func.inline_attr,
+            func.device_link_always,
             Some(&func.export_name),
             &mut legaliser,
             config.debug_kind,

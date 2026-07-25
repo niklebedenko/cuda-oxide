@@ -992,6 +992,7 @@ fn emit_entry_allocas(
 ///   rustc's monomorphization rules under the device runtime-check policy
 /// * `is_kernel` - Add `gpu_kernel` attribute for kernel entry points
 /// * `inline_attr` - Preserve Rust inline intent on non-kernel functions
+/// * `device_link_always` - Add orthogonal NVVM-link mandatory-inline intent
 /// * `override_name` - Custom export name (defaults to instance name)
 pub fn translate_body(
     ctx: &mut Context,
@@ -1001,6 +1002,7 @@ pub fn translate_body(
     rustc_mono_successors: &[Vec<usize>],
     is_kernel: bool,
     inline_attr: crate::pipeline::InlineAttr,
+    device_link_always: bool,
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
     debug_kind: DebugKind,
@@ -1339,7 +1341,13 @@ pub fn translate_body(
         llvm_export::ops::set_debug_source_scope_map(ctx, op_ptr, scope_map);
     }
 
-    set_inline_attr(ctx, &mir_func_op, is_kernel, inline_attr);
+    set_inline_attrs(
+        ctx,
+        &mir_func_op,
+        is_kernel,
+        inline_attr,
+        device_link_always,
+    );
 
     // Get the function body region (region 0)
     let region_ptr = op_ptr.deref(ctx).get_region(0);
@@ -1443,28 +1451,34 @@ pub fn translate_body(
 
 /// Preserve Rust's inline attribute for device functions. Kernel entry points
 /// are excluded because they are never callees.
-fn set_inline_attr(
+fn set_inline_attrs(
     ctx: &mut Context,
     mir_func_op: &MirFuncOp,
     is_kernel: bool,
     inline_attr: crate::pipeline::InlineAttr,
+    device_link_always: bool,
 ) {
     if is_kernel {
         return;
     }
-    let key = match inline_attr {
-        crate::pipeline::InlineAttr::None => return,
-        crate::pipeline::InlineAttr::Hint => "inlinehint",
-        crate::pipeline::InlineAttr::Always => "alwaysinline",
-        crate::pipeline::InlineAttr::DeviceAlways => "device_alwaysinline",
+    let source_key = match inline_attr {
+        crate::pipeline::InlineAttr::None => None,
+        crate::pipeline::InlineAttr::Hint => Some("inlinehint"),
+        crate::pipeline::InlineAttr::Always => Some("alwaysinline"),
+        crate::pipeline::InlineAttr::DeviceAlways => Some("device_alwaysinline"),
     };
-    let attr = pliron::builtin::attributes::StringAttr::new("true".to_string());
-    let key: Identifier = key.try_into().unwrap();
-    mir_func_op
-        .get_operation()
-        .deref_mut(ctx)
-        .attributes
-        .set(key, attr);
+    for key in source_key
+        .into_iter()
+        .chain(device_link_always.then_some("device_link_alwaysinline"))
+    {
+        let attr = pliron::builtin::attributes::StringAttr::new("true".to_string());
+        let key: Identifier = key.try_into().unwrap();
+        mir_func_op
+            .get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(key, attr);
+    }
 }
 
 #[cfg(test)]
@@ -1523,12 +1537,26 @@ mod tests {
 
     #[test]
     fn inline_attributes_reach_llvm_func_before_export() {
-        for (inline_attr, attr_name) in [
-            (crate::pipeline::InlineAttr::Hint, "inlinehint"),
-            (crate::pipeline::InlineAttr::Always, "alwaysinline"),
+        for (inline_attr, device_link_always, attr_names) in [
+            (
+                crate::pipeline::InlineAttr::Hint,
+                false,
+                &["inlinehint"][..],
+            ),
+            (
+                crate::pipeline::InlineAttr::Always,
+                false,
+                &["alwaysinline"][..],
+            ),
             (
                 crate::pipeline::InlineAttr::DeviceAlways,
-                "device_alwaysinline",
+                false,
+                &["device_alwaysinline"][..],
+            ),
+            (
+                crate::pipeline::InlineAttr::Hint,
+                true,
+                &["inlinehint", "device_link_alwaysinline"][..],
             ),
         ] {
             let mut ctx = Context::new();
@@ -1567,7 +1595,7 @@ mod tests {
                 func
             };
 
-            set_inline_attr(&mut ctx, &mir_func, false, inline_attr);
+            set_inline_attrs(&mut ctx, &mir_func, false, inline_attr, device_link_always);
             mir_func.get_operation().insert_at_back(module_block, &ctx);
 
             mir_lower::register(&mut ctx);
@@ -1582,16 +1610,19 @@ mod tests {
                     .expect("lowered LLVM function")
             };
 
-            let key: Identifier = attr_name.try_into().unwrap();
-            assert!(
-                llvm_func
-                    .get_operation()
-                    .deref(&ctx)
-                    .attributes
-                    .0
-                    .contains_key(&key),
-                "{inline_attr:?} must become an LLVM dialect {attr_name} attribute before export",
-            );
+            for attr_name in attr_names {
+                let key: Identifier = (*attr_name).try_into().unwrap();
+                assert!(
+                    llvm_func
+                        .get_operation()
+                        .deref(&ctx)
+                        .attributes
+                        .0
+                        .contains_key(&key),
+                    "{inline_attr:?} plus device_link_always={device_link_always} must become an \
+                     LLVM dialect {attr_name} attribute before export",
+                );
+            }
         }
     }
 }

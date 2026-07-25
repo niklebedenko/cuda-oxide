@@ -98,10 +98,12 @@ use llvm_export::ops::{
     DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
     DebugSourceScopeMap,
 };
-use rustc_middle::ty::{EarlyBinder, InstanceKind, TypingEnv};
+use rustc_middle::ty::{EarlyBinder, Instance, InstanceKind, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_session::config::DebugInfo;
 use rustc_span::{Span, hygiene};
+use std::collections::HashSet;
+use std::hash::Hash;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,8 +115,9 @@ enum DeviceExternTypePosition {
 
 fn inline_attr_for_device_function(
     tcx: TyCtxt<'_>,
-    def_id: rustc_hir::def_id::DefId,
+    instance: Instance<'_>,
 ) -> mir_importer::InlineAttr {
+    let def_id = instance.def_id();
     match tcx.codegen_fn_attrs(def_id).inline {
         rustc_hir::attrs::InlineAttr::Hint
             if is_primitive_float_operator(tcx, def_id) || is_tiny_inline_helper(tcx, def_id) =>
@@ -122,17 +125,356 @@ fn inline_attr_for_device_function(
             mir_importer::InlineAttr::DeviceAlways
         }
         rustc_hir::attrs::InlineAttr::Hint => mir_importer::InlineAttr::Hint,
-        rustc_hir::attrs::InlineAttr::Always
-        | rustc_hir::attrs::InlineAttr::Force { .. }
+        rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
             if is_tiny_inline_helper(tcx, def_id) =>
         {
             mir_importer::InlineAttr::DeviceAlways
         }
-        rustc_hir::attrs::InlineAttr::Always
-        | rustc_hir::attrs::InlineAttr::Force { .. } => mir_importer::InlineAttr::Always,
+        rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. } => {
+            mir_importer::InlineAttr::Always
+        }
         rustc_hir::attrs::InlineAttr::None | rustc_hir::attrs::InlineAttr::Never => {
             mir_importer::InlineAttr::None
         }
+    }
+}
+
+#[derive(Default)]
+struct DeviceInlinePlan<'tcx> {
+    array_closures: HashSet<Instance<'tcx>>,
+    considered_array_builders: usize,
+    rejected_array_builders: usize,
+    conflicting_array_closures: usize,
+}
+
+// These are compile-resource guards rather than semantic limits. Mandatory
+// device-link inlining is restricted to concrete array callbacks; the core
+// array scaffolds retain their ordinary Rust inline hints.
+const MAX_DEVICE_LINK_INLINE_BLOCKS: usize = 24;
+const MAX_DEVICE_LINK_INLINE_STATEMENTS: usize = 128;
+const MAX_DEVICE_LINK_CLOSURE_CAPTURE_BYTES: u64 = 256;
+const MAX_DEVICE_LINK_ARRAY_EXTENT: usize = 128;
+const MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES: u64 = 32 * 1024;
+
+fn build_device_inline_plan<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[CollectedFunction<'tcx>],
+) -> DeviceInlinePlan<'tcx> {
+    let trace_plan = std::env::var_os("CUDA_OXIDE_INLINE_TRACE").is_some();
+    let mut plan = DeviceInlinePlan::default();
+    let mut accepted_closures = HashSet::new();
+    let mut rejected_closures = HashSet::new();
+    for function in functions {
+        let instance = function.instance;
+        let def_id = instance.def_id();
+        let path = tcx.def_path_str(def_id);
+        if !tcx.is_mir_available(def_id)
+            || !is_core_def(tcx, def_id)
+            || !is_concrete_array_builder_path(&path)
+        {
+            continue;
+        }
+        plan.considered_array_builders += 1;
+        let closures = closure_instances_in_args(tcx, instance);
+        if closures.len() != 1 {
+            plan.rejected_array_builders += 1;
+            if trace_plan {
+                trace_array_inline_seed(tcx, instance, &path, &closures, false);
+            }
+            continue;
+        }
+        let closure = *closures.iter().next().expect("checked exact closure count");
+        let accepted = is_bounded_inline_body(tcx, def_id)
+            && array_extents_within_budget(tcx, instance)
+            && array_output_layout_within_budget(tcx, instance)
+            && is_bounded_inline_body(tcx, closure.def_id())
+            && closure_capture_layout_bytes(tcx, closure)
+                .is_some_and(closure_capture_size_within_budget);
+        if trace_plan {
+            trace_array_inline_seed(tcx, instance, &path, &closures, accepted);
+        }
+        if accepted {
+            accepted_closures.insert(closure);
+        } else {
+            rejected_closures.insert(closure);
+            plan.rejected_array_builders += 1;
+        }
+    }
+    plan.conflicting_array_closures =
+        retain_uncontested_closures(&mut accepted_closures, &rejected_closures);
+    plan.array_closures = accepted_closures;
+    plan
+}
+
+fn retain_uncontested_closures<T: Eq + Hash>(
+    accepted: &mut HashSet<T>,
+    rejected: &HashSet<T>,
+) -> usize {
+    let conflicts = accepted.intersection(rejected).count();
+    accepted.retain(|closure| !rejected.contains(closure));
+    conflicts
+}
+
+fn trace_array_inline_seed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    path: &str,
+    closures: &HashSet<Instance<'tcx>>,
+    accepted: bool,
+) {
+    let (closure_path, capture_bytes) = closures.iter().next().copied().map_or_else(
+        || ("<none>".to_string(), None),
+        |closure| {
+            (
+                tcx.def_path_str(closure.def_id()),
+                closure_capture_layout_bytes(tcx, closure),
+            )
+        },
+    );
+    eprintln!(
+        "[rustc_codegen_cuda] array callback inline candidate: builder={path} \
+         builder_symbol={} accepted={accepted} \
+         closures={} closure={closure_path} \
+         capture_bytes={capture_bytes:?} output_bytes={:?}",
+        tcx.symbol_name(instance).name,
+        closures.len(),
+        array_output_layout_bytes(tcx, instance)
+    );
+}
+
+fn closure_capture_layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, closure: Instance<'tcx>) -> Option<u64> {
+    let captures = closure.args.as_closure().tupled_upvars_ty();
+    tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(captures))
+        .ok()
+        .map(|layout| layout.size.bytes())
+}
+
+fn closure_capture_size_within_budget(bytes: u64) -> bool {
+    bytes <= MAX_DEVICE_LINK_CLOSURE_CAPTURE_BYTES
+}
+
+fn closure_instances_in_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> HashSet<Instance<'tcx>> {
+    let path = tcx.def_path_str(instance.def_id());
+    let generic_types: Vec<_> = instance
+        .args
+        .iter()
+        .filter_map(|argument| argument.as_type())
+        .collect();
+    let Some(root) = array_callable_type(&path, &generic_types) else {
+        return HashSet::new();
+    };
+    closure_instances_in_type(tcx, *root)
+}
+
+fn array_callable_type<'a, T>(path: &str, generic_types: &'a [T]) -> Option<&'a T> {
+    // Both concrete builders carry their callable F as the final type
+    // parameter. `try_from_fn` may wrap F in core's `Wrapped` adapter;
+    // `closure_instance_in_callable_type` unwraps that adapter.
+    is_concrete_array_builder_path(path)
+        .then(|| generic_types.last())
+        .flatten()
+}
+
+fn closure_instances_in_type<'tcx>(tcx: TyCtxt<'tcx>, root: Ty<'tcx>) -> HashSet<Instance<'tcx>> {
+    let mut closures = HashSet::new();
+    if let Some(closure) = closure_instance_in_callable_type(tcx, root) {
+        closures.insert(closure);
+    }
+    closures
+}
+
+fn closure_instance_in_callable_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callable: Ty<'tcx>,
+) -> Option<Instance<'tcx>> {
+    let closure = match callable.kind() {
+        TyKind::Closure(closure_def_id, closure_args) => Instance::try_resolve(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            *closure_def_id,
+            closure_args,
+        )
+        .ok()
+        .flatten()?,
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
+            return closure_instance_in_callable_type(tcx, *pointee);
+        }
+        TyKind::Adt(definition, arguments) if is_core_wrapped_type(tcx, definition.did()) => {
+            let callable = arguments
+                .iter()
+                .filter_map(|argument| argument.as_type())
+                .next_back()?;
+            return closure_instance_in_callable_type(tcx, callable);
+        }
+        _ => return None,
+    };
+
+    tcx.is_mir_available(closure.def_id()).then_some(closure)
+}
+
+fn is_core_wrapped_type(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    is_core_def(tcx, def_id)
+        && tcx
+            .def_path_str(def_id)
+            .ends_with("::ops::try_trait::Wrapped")
+}
+
+fn is_core_def(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    tcx.lang_items()
+        .add_trait()
+        .is_some_and(|core_item| core_item.krate == def_id.krate)
+}
+
+fn array_extents_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    let mut saw_concrete_extent = false;
+    for arg in instance.args.iter() {
+        let Some(value) = arg.as_const() else {
+            continue;
+        };
+        let Some(extent) = value.try_to_target_usize(tcx) else {
+            return false;
+        };
+        saw_concrete_extent = true;
+        if !array_extent_within_budget(extent) {
+            return false;
+        }
+    }
+
+    saw_concrete_extent
+}
+
+fn array_output_layout_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    array_output_layout_bytes(tcx, instance).is_some_and(array_output_size_within_budget)
+}
+
+fn array_output_layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<u64> {
+    let signature = tcx
+        .fn_sig(instance.def_id())
+        .instantiate(tcx, instance.args);
+    let output = signature.skip_binder().output();
+    tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(output))
+        .ok()
+        .map(|layout| layout.size.bytes())
+}
+
+fn array_output_size_within_budget(bytes: u64) -> bool {
+    bytes <= MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES
+}
+
+fn array_extent_within_budget(extent: u64) -> bool {
+    extent <= MAX_DEVICE_LINK_ARRAY_EXTENT as u64
+}
+
+fn is_bounded_inline_body(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    let body = tcx.optimized_mir(def_id);
+    let statement_count = body
+        .basic_blocks
+        .iter()
+        .map(|block| block.statements.len())
+        .sum();
+    inline_body_within_budget(body.basic_blocks.len(), statement_count)
+}
+
+fn inline_body_within_budget(basic_blocks: usize, statements: usize) -> bool {
+    basic_blocks <= MAX_DEVICE_LINK_INLINE_BLOCKS && statements <= MAX_DEVICE_LINK_INLINE_STATEMENTS
+}
+
+fn is_concrete_array_builder_path(path: &str) -> bool {
+    matches!(
+        path,
+        "core::array::from_fn"
+            | "std::array::from_fn"
+            | "core::array::try_from_fn"
+            | "std::array::try_from_fn"
+    )
+}
+
+#[cfg(test)]
+mod inline_plan_tests {
+    use super::{
+        array_callable_type, array_extent_within_budget, array_output_size_within_budget,
+        inline_body_within_budget, is_concrete_array_builder_path, retain_uncontested_closures,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn recognizes_only_concrete_core_array_builders() {
+        for path in [
+            "core::array::from_fn",
+            "std::array::from_fn",
+            "core::array::try_from_fn",
+            "std::array::try_from_fn",
+        ] {
+            assert!(
+                is_concrete_array_builder_path(path),
+                "expected concrete array builder: {path}"
+            );
+        }
+
+        for path in [
+            "core::array::try_from_fn_erased",
+            "core::array::from_ref",
+            "core::array::iter",
+            "user_crate::array::from_fn",
+            "user_crate::std::array::try_from_fn",
+            "<F as core::ops::FnMut<(A,)>>::call_mut",
+            "<core::ops::try_trait::Wrapped<T, A, F> as core::ops::FnMut<(A,)>>::call_mut",
+        ] {
+            assert!(
+                !is_concrete_array_builder_path(path),
+                "non-root helper must not seed callback promotion: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_both_inline_body_limits() {
+        assert!(inline_body_within_budget(24, 128));
+        assert!(!inline_body_within_budget(25, 128));
+        assert!(!inline_body_within_budget(24, 129));
+    }
+
+    #[test]
+    fn bounds_concrete_array_extents() {
+        assert!(array_extent_within_budget(0));
+        assert!(array_extent_within_budget(128));
+        assert!(!array_extent_within_budget(129));
+        assert!(!array_extent_within_budget(u64::MAX));
+        assert!(array_output_size_within_budget(32 * 1024));
+        assert!(!array_output_size_within_budget(32 * 1024 + 1));
+        assert!(!array_output_size_within_budget(64 * 1024));
+    }
+
+    #[test]
+    fn selects_only_the_concrete_builder_callable_type() {
+        let generic_types = ["result_closure", "callable"];
+        assert_eq!(
+            array_callable_type("core::array::try_from_fn", &generic_types),
+            Some(&"callable"),
+            "a closure-valued result type must not be selected"
+        );
+
+        assert_eq!(
+            array_callable_type("core::array::try_from_fn_erased", &generic_types),
+            None,
+            "implementation scaffolds must not seed promotion"
+        );
+    }
+
+    #[test]
+    fn a_rejected_use_wins_for_a_shared_callback() {
+        let mut accepted = HashSet::from(["accepted_only", "shared"]);
+        let rejected = HashSet::from(["rejected_only", "shared"]);
+
+        assert_eq!(
+            retain_uncontested_closures(&mut accepted, &rejected),
+            1,
+            "the shared callback is the single conflict"
+        );
+        assert_eq!(accepted, HashSet::from(["accepted_only"]));
     }
 }
 
@@ -726,9 +1068,50 @@ pub fn generate_device_code<'tcx>(
     // context, since the query lives on `rustc_middle::TyCtxt` and is not
     // exposed through stable_mir. Preserving this hint avoids making helper
     // boundaries depend entirely on later optimizer heuristics.
+    let emit_nvvm_ir = std::env::var_os("CUDA_OXIDE_EMIT_NVVM_IR").is_some();
+    let inline_stats = std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some();
+    let inline_plan_started = inline_stats.then(std::time::Instant::now);
+    // The shared lowering pipeline can discover libdevice calls and select
+    // NVVM IR after this rustc-facing phase. Build the plan independently of
+    // an explicit NVVM request so that auto-selected device linking receives
+    // the same intent. Direct PTX export deliberately ignores the orthogonal
+    // `device_link_alwaysinline` attribute.
+    let inline_plan = build_device_inline_plan(tcx, functions);
+    if let Some(inline_plan_started) = inline_plan_started {
+        let inline_plan_elapsed = inline_plan_started.elapsed();
+        let existing_device_always = functions
+            .iter()
+            .filter(|function| {
+                matches!(
+                    inline_attr_for_device_function(tcx, function.instance),
+                    mir_importer::InlineAttr::DeviceAlways
+                )
+            })
+            .count();
+        let matched_array_closures = functions
+            .iter()
+            .filter(|function| inline_plan.array_closures.contains(&function.instance))
+            .count();
+        eprintln!(
+            "[rustc_codegen_cuda] inline plan: elapsed={inline_plan_elapsed:?} \
+             existing_device_always={existing_device_always} \
+             considered_array_builders={} rejected_array_builders={} \
+             conflicting_array_closures={} array_closures={} \
+             matched_array_closures={matched_array_closures} \
+             strategy=callback_only",
+            inline_plan.considered_array_builders,
+            inline_plan.rejected_array_builders,
+            inline_plan.conflicting_array_closures,
+            inline_plan.array_closures.len()
+        );
+    }
     let inline_attrs: Vec<mir_importer::InlineAttr> = functions
         .iter()
-        .map(|func| inline_attr_for_device_function(tcx, func.instance.def_id()))
+        .map(|func| inline_attr_for_device_function(tcx, func.instance))
+        .collect();
+    let device_link_always: Vec<bool> = functions
+        .iter()
+        .map(|func| inline_plan.array_closures.contains(&func.instance))
         .collect();
     let device_mono_reachability: Vec<crate::collector::DeviceMonoReachability> = functions
         .iter()
@@ -751,10 +1134,14 @@ pub fn generate_device_code<'tcx>(
             .zip(export_names.iter())
             .zip(debug_scope_maps.iter())
             .zip(inline_attrs.iter())
+            .zip(device_link_always.iter())
             .zip(device_mono_reachability.iter())
             .filter_map(
                 |(
-                    (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
+                    (
+                        (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
+                        device_link_always,
+                    ),
                     reachability,
                 )| {
                     // Use rustc_internal::stable() to convert the Instance.
@@ -780,13 +1167,11 @@ pub fn generate_device_code<'tcx>(
                         export_name: export_name.clone(),
                         debug_source_scopes: Some(debug_source_scopes.clone()),
                         inline_attr: *inline_attr,
+                        device_link_always: *device_link_always,
                     })
                 },
             )
             .collect();
-
-        // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
-        let emit_nvvm_ir = std::env::var("CUDA_OXIDE_EMIT_NVVM_IR").is_ok();
 
         if verbose {
             eprintln!(

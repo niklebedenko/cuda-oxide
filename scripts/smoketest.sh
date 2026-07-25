@@ -50,11 +50,11 @@ set -uo pipefail
 
 TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
-LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test legacy_atomic_fadd legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
+LTOIR_EXAMPLES=(addressof_sharedarray array_inline_boundary_probe cpp_consumes_rust_device device_ffi_test legacy_atomic_fadd legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 LTOIR_MODERN_EXAMPLES=(small_type_ffi_test)
-AUTO_NVVM_EXAMPLES=(libdevice_math)
+AUTO_NVVM_EXAMPLES=(hdiv_array_inline_probe libdevice_math)
 BLACKWELL_COMPILE_EXAMPLES=(generated_intrinsics_blackwell)
-NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress scoped_atomic_load_store shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
+NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix hdiv_array_inline_probe legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress scoped_atomic_load_store shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
 ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
 
 # Examples that pin RUSTFLAGS=-Zinline-mir=no (verdict rules are unaffected)
@@ -129,6 +129,117 @@ nvvm_verify_arch() {
         fi
     fi
     printf '%s\n' "${arch}"
+}
+
+verify_array_inline_boundary_nvvm_ir() {
+    local ll="crates/rustc-codegen-cuda/examples/array_inline_boundary_probe/array_inline_boundary_probe.ll"
+    [[ -s "${ll}" ]] || return 1
+
+    local outer_callback returned_callback oversized_callback function_item shared_callback
+    local core_defs user_defs
+    outer_callback="$(grep -E \
+        '^define .*@_RNCNv[[:alnum:]_]+_closure_result_boundary0B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${outer_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${outer_callback}")" -eq 1 ]] || return 1
+
+    returned_callback="$(grep -E \
+        '^define .*@_RNCNCNv[[:alnum:]_]+_closure_result_boundary00B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${returned_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${returned_callback}")" -eq 0 ]] || return 1
+
+    core_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).*closure_result_boundary' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${core_defs}")" -eq 2 ]] || return 1
+    [[ "$(grep -c 'inlinehint' <<<"${core_defs}")" -eq 2 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${core_defs}")" -eq 0 ]] || return 1
+
+    oversized_callback="$(grep -E \
+        '^define .*@_RNCNv[[:alnum:]_]+_probe53cuda_oxide_kernel_[[:alnum:]]+_oversized_capture_boundary0B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${oversized_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${oversized_callback}")" -eq 0 ]] || return 1
+
+    function_item="$(grep -E \
+        '^define .*@array_inline_boundary_probe__item_callback\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${function_item}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${function_item}")" -eq 0 ]] || return 1
+
+    shared_callback="$(grep -E \
+        '^define .*@_RNCNv[[:alnum:]_]+_probe[0-9]+cuda_oxide_kernel_[[:alnum:]_]+_shared_callback_boundary0B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${shared_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${shared_callback}")" -eq 0 ]] || return 1
+
+    # Anchor the crate hash directly before this fixture's crate/name path so
+    # core::array definitions that mention the user callback in later generic
+    # arguments cannot satisfy the check.
+    user_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_27array_inline_boundary_probe5array7from_fn' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${user_defs}")" -eq 1 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${user_defs}")" -eq 0 ]] || return 1
+}
+
+verify_hdiv_array_inline_nvvm_ir() {
+    local ll="crates/rustc-codegen-cuda/examples/hdiv_array_inline_probe/hdiv_array_inline_probe.ll"
+    [[ -s "${ll}" ]] || return 1
+
+    local callback_count core_scaffold_count core_always_count
+    callback_count="$(grep -Ec '^define .*@_RNC.*element_lib.*alwaysinline' "${ll}")"
+    core_scaffold_count="$(grep -Ec \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).* inlinehint' \
+        "${ll}")"
+    core_always_count="$(grep -Ec \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).* alwaysinline' \
+        "${ll}" || true)"
+
+    [[ "${callback_count}" -eq 14 ]] || return 1
+    [[ "${core_scaffold_count}" -eq 28 ]] || return 1
+    [[ "${core_always_count}" -eq 0 ]] || return 1
+}
+
+verify_array_inline_boundary_direct_ir() {
+    local log="$1"
+    if ! cargo oxide build array_inline_boundary_probe "--arch=${LTOIR_ARCH}" >"${log}" 2>&1; then
+        return 1
+    fi
+
+    local ll="crates/rustc-codegen-cuda/examples/array_inline_boundary_probe/array_inline_boundary_probe.ll"
+    local outer_callback returned_callback shared_callback core_defs user_defs
+    outer_callback="$(grep -E \
+        '^define .*@_RNCNv[[:alnum:]_]+_closure_result_boundary0B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${outer_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${outer_callback}")" -eq 0 ]] || return 1
+
+    returned_callback="$(grep -E \
+        '^define .*@_RNCNCNv[[:alnum:]_]+_closure_result_boundary00B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${returned_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${returned_callback}")" -eq 0 ]] || return 1
+
+    shared_callback="$(grep -E \
+        '^define .*@_RNCNv[[:alnum:]_]+_probe[0-9]+cuda_oxide_kernel_[[:alnum:]_]+_shared_callback_boundary0B[[:alnum:]_]*\(' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${shared_callback}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${shared_callback}")" -eq 0 ]] || return 1
+
+    core_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).*closure_result_boundary' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${core_defs}")" -eq 2 ]] || return 1
+    [[ "$(grep -c 'inlinehint' <<<"${core_defs}")" -eq 2 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${core_defs}")" -eq 0 ]] || return 1
+
+    user_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_27array_inline_boundary_probe5array7from_fn' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${user_defs}")" -eq 1 ]] || return 1
+    [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${user_defs}")" -eq 0 ]] || return 1
 }
 
 # ---- CLI -----------------------------------------------------------------
@@ -553,6 +664,17 @@ verdict_ltoir() {
         echo "FAIL (LTOIR, failure marker in output)"
         return 1
     fi
+    if [[ "${ex}" == "array_inline_boundary_probe" ]]; then
+        if ! verify_array_inline_boundary_nvvm_ir \
+            || ! verify_array_inline_boundary_direct_ir "${log}.direct"; then
+            echo "FAIL (array inline boundary attributes; direct log: ${log}.direct)"
+            return 1
+        fi
+    elif [[ "${ex}" == "hdiv_array_inline_probe" ]] \
+        && ! verify_hdiv_array_inline_nvvm_ir; then
+        echo "FAIL (H(div) auto-NVVM callback attributes)"
+        return 1
+    fi
     if grep -qE 'SUCCESS|PASS|Complete|NVVM IR is ready' "${log}"; then
         echo "PASS (LTOIR)"
         return 0
@@ -617,6 +739,20 @@ verdict_compile() {
     local artifact="${ex//-/_}"
     if [[ ${ec} -gt 128 ]]; then echo "FAIL (crashed, signal $((ec - 128)))"; return 1; fi
     if [[ ${ec} -ne 0 ]]; then   echo "FAIL (exit=${ec})";                    return 1; fi
+    if [[ "${ex}" == "array_inline_boundary_probe" ]]; then
+        if ! verify_array_inline_boundary_nvvm_ir \
+            || ! verify_array_inline_boundary_direct_ir "${log}.direct"; then
+            echo "FAIL (array inline boundary attributes; direct log: ${log}.direct)"
+            return 1
+        fi
+        echo "PASS (NVVM upgrade and direct fallback verified)"
+        return 0
+    fi
+    if [[ "${ex}" == "hdiv_array_inline_probe" ]] \
+        && ! verify_hdiv_array_inline_nvvm_ir; then
+        echo "FAIL (H(div) NVVM callback attributes)"
+        return 1
+    fi
     if verify_nvvm_in_compile_only "${ex}"; then
         if [[ -s "${ex_dir}/${artifact}.ll" && -s "${ex_dir}/${artifact}.ltoir" ]]; then
             echo "PASS (verified and compiled by libNVVM)"
@@ -1368,8 +1504,12 @@ run_cargo() {
     if [[ ${COMPILE_ONLY} -eq 1 && "${ex}" == "cluster" ]]; then
         args+=("--arch=sm_90")
     fi
-    if [[ "${cat}" == "ltoir" || ( "${cat}" == "auto-nvvm" && ${COMPILE_ONLY} -eq 1 ) ]]; then
+    if [[ "${cat}" == "ltoir" ]]; then
         args+=("--emit-nvvm-ir" "--arch=${LTOIR_ARCH}")
+    elif [[ "${cat}" == "auto-nvvm" && ${COMPILE_ONLY} -eq 1 ]]; then
+        # Supply a target on GPU-less hosts, but leave NVVM selection to the
+        # ordinary auto-libdevice path exercised by this category.
+        args+=("--arch=${LTOIR_ARCH}")
     fi
     if [[ "${cat}" == "ltoir-modern" ]]; then
         args+=("--emit-nvvm-ir" "--arch=${LTOIR_MODERN_ARCH}")
@@ -1580,7 +1720,7 @@ for ex in "${selected[@]}"; do
     if [[ ${status} -eq 0 ]]; then
         pass=$((pass + 1))
         if [[ ${KEEP_LOGS} -eq 0 ]]; then
-            rm -f "${log}"
+            rm -f "${log}" "${log}.direct"
         fi
     else
         failures+=("${ex}|${verdict}|${log}")

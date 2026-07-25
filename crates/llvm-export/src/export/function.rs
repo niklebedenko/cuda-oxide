@@ -671,12 +671,18 @@ impl<'a> ModuleExportState<'a> {
         let alwaysinline_key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
         let device_alwaysinline_key: pliron::identifier::Identifier =
             "device_alwaysinline".try_into().unwrap();
+        let device_link_alwaysinline_key: pliron::identifier::Identifier =
+            "device_link_alwaysinline".try_into().unwrap();
         let is_alwaysinline = attrs
             .get::<pliron::builtin::attributes::StringAttr>(&alwaysinline_key)
             .is_some()
             || attrs
                 .get::<pliron::builtin::attributes::StringAttr>(&device_alwaysinline_key)
-                .is_some();
+                .is_some()
+            || self.nvvm_ir_dialect.is_some()
+                && attrs
+                    .get::<pliron::builtin::attributes::StringAttr>(&device_link_alwaysinline_key)
+                    .is_some();
 
         if let Some(entry_block) = entry_block_opt {
             let func_loc = func.get_operation().deref(self.ctx).loc();
