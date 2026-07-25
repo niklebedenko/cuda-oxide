@@ -801,6 +801,33 @@ pub fn build_host_anchor_object_for_target(
     )
 }
 
+/// Build an anchor-only object with a target-specific symbol and weak legacy alias.
+///
+/// A selected owner can have no device code after monomorphization while its
+/// owner-aware `#[cuda_module]` expansion still references the target-specific
+/// anchor. The strong target symbol satisfies that reference; the weak legacy
+/// alias keeps mixed-version host code link-compatible without embedding an
+/// empty artifact bundle.
+#[cfg(feature = "object-write")]
+pub fn build_host_anchor_object_for_target_with_legacy_anchor(
+    target: &str,
+    anchor_symbol: &str,
+    legacy_anchor_symbol: &str,
+) -> Result<Vec<u8>, ArtifactError> {
+    if anchor_symbol.is_empty() || legacy_anchor_symbol.is_empty() {
+        return Err(ArtifactError::Malformed(
+            "embedded artifact anchor symbol is empty".to_string(),
+        ));
+    }
+
+    build_host_object_with_section(
+        ARTIFACT_ANCHOR_SECTION_NAME,
+        &[0],
+        target,
+        &[(anchor_symbol, false), (legacy_anchor_symbol, true)],
+    )
+}
+
 #[cfg(feature = "object-write")]
 fn build_host_object_with_section(
     section_name: &str,
@@ -1392,6 +1419,38 @@ mod tests {
             build_host_anchor_object_for_target("x86_64-unknown-linux-gnu", ""),
             Err(ArtifactError::Malformed(_))
         ));
+    }
+
+    #[cfg(all(feature = "object-read", feature = "object-write"))]
+    #[test]
+    fn target_anchor_only_object_defines_strong_target_and_weak_legacy_symbols() {
+        use object::{Object, ObjectSymbol};
+
+        let bytes = build_host_anchor_object_for_target_with_legacy_anchor(
+            "x86_64-unknown-linux-gnu",
+            "target_anchor",
+            "legacy_anchor",
+        )
+        .unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let target = file
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("target_anchor"))
+            .expect("target-specific anchor missing");
+        let legacy = file
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("legacy_anchor"))
+            .expect("legacy anchor alias missing");
+
+        assert!(target.is_definition());
+        assert!(!target.is_weak());
+        assert!(legacy.is_definition());
+        assert!(legacy.is_weak());
+        assert!(
+            read_artifact_bundles_from_object_bytes(&bytes)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(all(feature = "object-read", feature = "object-write"))]
