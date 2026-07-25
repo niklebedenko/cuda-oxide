@@ -97,8 +97,8 @@ fn link_libdevice(
 ///
 /// Modules with explicit `@llvm.used` roots internalize every other definition
 /// before the default O2 pipeline so fully inlined helpers are eligible for
-/// global dead-code elimination. A bounded full-unroll pass then handles small
-/// loops exposed by inlining before a final cleanup pipeline.
+/// global dead-code elimination. LLVM's standard O2 profitability model handles
+/// loop unrolling without a module-wide threshold override.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
 /// LoadStoreVectorizer fuses aligned aggregate/element accesses, SROA
@@ -204,13 +204,10 @@ fn optimize_ll(
 /// internalization lets GlobalDCE remove it instead of asking `llc` to emit an
 /// unreachable `.visible .func` body.
 fn optimization_args(public_symbols: &[String]) -> Result<Vec<String>, PipelineError> {
-    const BOUNDED_PIPELINE: &str = "default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>";
+    const OPTIMIZATION_PIPELINE: &str = "default<O2>";
 
     if public_symbols.is_empty() {
-        return Ok(vec![
-            format!("-passes={BOUNDED_PIPELINE}"),
-            "-unroll-threshold=512".to_string(),
-        ]);
+        return Ok(vec![format!("-passes={OPTIMIZATION_PIPELINE}")]);
     }
 
     if let Some(symbol) = public_symbols.iter().find(|symbol| symbol.contains(',')) {
@@ -220,8 +217,7 @@ fn optimization_args(public_symbols: &[String]) -> Result<Vec<String>, PipelineE
     }
 
     Ok(vec![
-        format!("-passes=internalize,{BOUNDED_PIPELINE}"),
-        "-unroll-threshold=512".to_string(),
+        format!("-passes=internalize,{OPTIMIZATION_PIPELINE}"),
         format!("-internalize-public-api-list={}", public_symbols.join(",")),
     ])
 }
@@ -716,22 +712,15 @@ mod tests {
         assert_eq!(
             optimization_args(&symbols).unwrap(),
             [
-                "-passes=internalize,default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>",
-                "-unroll-threshold=512",
+                "-passes=internalize,default<O2>",
                 "-internalize-public-api-list=constant_data,first_kernel",
             ]
         );
     }
 
     #[test]
-    fn modules_without_public_roots_use_the_bounded_optimization_pipeline() {
-        assert_eq!(
-            optimization_args(&[]).unwrap(),
-            [
-                "-passes=default<O2>,function(loop-unroll<O3;full-unroll-max=16;no-partial;no-peeling;no-runtime>),default<O2>",
-                "-unroll-threshold=512",
-            ]
-        );
+    fn modules_without_public_roots_use_the_default_o2_pipeline() {
+        assert_eq!(optimization_args(&[]).unwrap(), ["-passes=default<O2>"]);
     }
 
     #[test]
