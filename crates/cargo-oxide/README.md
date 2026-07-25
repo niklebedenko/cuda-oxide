@@ -99,11 +99,14 @@ explicit flag outranks that variable. Omitting the flags exports nothing rather 
 stages are asked to do, it participates in the codegen fingerprint: switching it
 rebuilds device code instead of reusing artifacts compiled under a different policy.
 
-`--materialize-cubin` moves the remaining libNVVM and nvJitLink work into the
-host build. The executable embeds a native cubin, so deployment does not need
-libNVVM, nvJitLink, or a first-load compilation step. This trades portability
-for startup simplicity: the cubin is pinned to the requested architecture and
-cannot use cuda-oxide's load-time PTX bridge on a newer GPU.
+`--materialize-cubin` moves the remaining PTX/NVVM finalization work into the
+host build. The ordinary route runs cuda-oxide's LLVM middle-end and links its
+optimized PTX directly to a cubin; modules that require deferred NVVM IR or
+LTOIR compilation retain those routes. The executable embeds the resulting
+native cubin, so deployment does not need libNVVM, nvJitLink, or a first-load
+compilation step. This trades portability for startup simplicity: the cubin is
+pinned to the requested architecture and cannot use cuda-oxide's load-time PTX
+bridge on a newer GPU.
 
 ```bash
 cargo oxide build vecadd --materialize-cubin --arch sm_120

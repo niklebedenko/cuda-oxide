@@ -1,0 +1,15 @@
+[package]
+name = "materialized_fixed_vector_loops"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+# Regression for preserving the optimized PTX route during cubin materialization.
+#   cargo oxide run materialized_fixed_vector_loops --materialize-cubin --arch sm_86
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

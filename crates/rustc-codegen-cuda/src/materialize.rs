@@ -9,9 +9,11 @@
 //! libNVVM, nvJitLink, and libdevice inputs before invoking Cargo. Device
 //! macros record the complete codegen identity and exact provenance as Cargo
 //! environment dependencies. We rediscover the tools and compare their bytes
-//! before compiling. Setting the internal opt-in around raw Cargo is
-//! unsupported: Cargo can reuse an existing artifact without invoking this
-//! backend, and when the backend does run it rejects a missing handshake.
+//! before compiling. Optimized PTX is linked directly when the ordinary LLVM
+//! pipeline can produce it; NVVM IR and LTOIR remain supported fallbacks.
+//! Setting the internal opt-in around raw Cargo is unsupported: Cargo can reuse
+//! an existing artifact without invoking this backend, and when the backend
+//! does run it rejects a missing handshake.
 
 use cuda_artifact_finalizer::{
     CudaArch, CudaArchParseError, DebugPolicy, FinalizationOptions, Finalizer, FinalizerError,
@@ -74,11 +76,6 @@ pub(crate) enum MaterializeError {
         "build-time cubin materialization does not yet support #[device] extern declarations because their ordered external link inputs are not available to the backend"
     )]
     HasDeviceExterns,
-
-    #[error(
-        "build-time cubin materialization requires an NVVM IR or LTOIR artifact, but codegen produced PTX; use cargo-oxide so materialization can force NVVM IR emission"
-    )]
-    PtxInput,
 
     #[error(
         "build-time cubin materialization expected compiler IR, but codegen already produced a cubin; refusing to bypass the provenance-checked finalization recipe"
@@ -157,6 +154,19 @@ pub(crate) fn ltoir_to_cubin(
         &options,
         FinalizerOutput::Cubin,
     )?)
+}
+
+pub(crate) fn ptx_to_cubin(
+    request: MaterializationRequest,
+    ptx: &[u8],
+    module_name: &str,
+    target: &str,
+    allow_fma_contraction: bool,
+    debug_policy: DebugPolicy,
+) -> Result<Vec<u8>, MaterializeError> {
+    let options = options(target, allow_fma_contraction, debug_policy)?;
+    let finalizer = checked_finalizer(request)?;
+    Ok(finalizer.link_ptx(&[NamedInput::new(module_name, ptx)], &options)?)
 }
 
 fn options(

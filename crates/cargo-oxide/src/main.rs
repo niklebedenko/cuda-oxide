@@ -48,9 +48,10 @@ mod commands;
     version
 )]
 struct Cli {
-    /// Compile embedded NVVM IR to a target-specific cubin during the build.
-    /// Requires an explicit/configured architecture and exact CUDA-tool
-    /// provenance. The final binary then does not need libNVVM or nvJitLink.
+    /// Finalize optimized PTX or deferred compiler IR to a target-specific
+    /// cubin during the build. Requires an explicit/configured architecture
+    /// and exact CUDA-tool provenance. The final binary then does not need
+    /// libNVVM or nvJitLink.
     #[arg(long, global = true)]
     materialize_cubin: bool,
     #[command(subcommand)]

@@ -40,8 +40,7 @@ impl MaterializationMode {
             // These override inherited/project values: they are a single
             // wrapper-generated handshake tied to this Cargo invocation.
             cmd.env(MATERIALIZE_ENV, "1")
-                .env(EXPECTED_PROVENANCE_ENV, provenance)
-                .env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
+                .env(EXPECTED_PROVENANCE_ENV, provenance);
         }
     }
 }
@@ -5352,7 +5351,7 @@ fn apply_output_mode(
     if let Some(target_arch) = arch {
         cmd.env("CUDA_OXIDE_TARGET", target_arch);
     }
-    if emit_nvvm_ir || materialization.enabled() {
+    if emit_nvvm_ir {
         cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
     }
     materialization.apply(cmd);
@@ -8680,7 +8679,7 @@ device-owner = { path = "../device-owner" }
     }
 
     #[test]
-    fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
+    fn materialization_keeps_optimized_ptx_and_sets_exact_provenance_handshake() {
         let mut cmd = Command::new("cargo");
         let materialization = MaterializationMode {
             provenance: Some("42".repeat(32)),
@@ -8688,10 +8687,7 @@ device-owner = { path = "../device-owner" }
 
         apply_output_mode(&mut cmd, false, Some("sm_90"), &materialization);
 
-        assert_eq!(
-            command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR").as_deref(),
-            Some("1")
-        );
+        assert_eq!(command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR"), None);
         assert_eq!(command_env(&cmd, MATERIALIZE_ENV).as_deref(), Some("1"));
         assert_eq!(
             command_env(&cmd, EXPECTED_PROVENANCE_ENV).as_deref(),

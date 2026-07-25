@@ -1011,16 +1011,16 @@ fn embedded_compile_options(
     }
 }
 
-/// Opt-in (`CUDA_OXIDE_MATERIALIZE_CUBIN`): compile NVVM IR / LTOIR
+/// Opt-in (`CUDA_OXIDE_MATERIALIZE_CUBIN`): compile PTX / NVVM IR / LTOIR
 /// artifacts down to a final cubin before embedding, so the consuming
 /// binary loads device code directly through the CUDA driver — no libNVVM
 /// or nvJitLink on the deployment host and no first-load compile hit. The
 /// cubin is pinned to the emitted architecture; the default (embed the IR,
 /// compile at load) keeps cuda-host's execution routing, including the PTX
-/// bridge to newer GPUs. Once requested, this path fails closed unless codegen
-/// produced NVVM IR or LTOIR; accepting PTX or an already-built cubin would
-/// bypass the wrapper's provenance-checked finalization recipe. See
-/// `materialize` for the trade-offs.
+/// bridge to newer GPUs. The ordinary optimized PTX route is preferred; NVVM
+/// IR and LTOIR cover modules that require deferred compilation. Every route
+/// uses the wrapper's provenance-checked finalizer. See `materialize` for the
+/// trade-offs.
 struct MaterializedEmbeddingArtifact {
     artifact: device_codegen::DeviceCodegenArtifact,
     /// Exact PTX input used to produce `artifact`, when the selected route has
@@ -1075,7 +1075,15 @@ fn materialize_artifact_for_embedding(
             }
         }
         device_codegen::DeviceCodegenArtifactKind::Ptx => {
-            return Err(Box::new(materialize::MaterializeError::PtxInput));
+            let cubin = materialize::ptx_to_cubin(
+                request,
+                &artifact.bytes,
+                &artifact.name,
+                &result.target,
+                result.allow_fma_contraction,
+                debug_policy,
+            )?;
+            materialized_ptx_embedding(bundle_name, artifact.bytes.clone(), cubin)
         }
         device_codegen::DeviceCodegenArtifactKind::Cubin => {
             return Err(Box::new(materialize::MaterializeError::CubinInput));
@@ -1088,13 +1096,21 @@ fn materialized_nvvm_embedding(
     bundle_name: &str,
     materialized: cuda_artifact_finalizer::MaterializedNvvmIr,
 ) -> MaterializedEmbeddingArtifact {
+    materialized_ptx_embedding(bundle_name, materialized.ptx_input, materialized.cubin)
+}
+
+fn materialized_ptx_embedding(
+    bundle_name: &str,
+    ptx_input: Vec<u8>,
+    cubin: Vec<u8>,
+) -> MaterializedEmbeddingArtifact {
     MaterializedEmbeddingArtifact {
         artifact: device_codegen::DeviceCodegenArtifact {
             kind: device_codegen::DeviceCodegenArtifactKind::Cubin,
             name: format!("{bundle_name}.cubin"),
-            bytes: materialized.cubin,
+            bytes: cubin,
         },
-        ptx_sidecar: Some(materialized.ptx_input),
+        ptx_sidecar: Some(ptx_input),
     }
 }
 
@@ -1431,6 +1447,23 @@ mod tests {
             bundle.entry("helper").map(|entry| entry.kind),
             Some(ArtifactEntryKind::DeviceFunction)
         );
+    }
+
+    #[test]
+    fn direct_ptx_materialization_preserves_exact_linker_input_and_cubin() {
+        let linker_input = b".version 8.7\n.visible .entry demo() { ret; }\n\0".to_vec();
+        let cubin = b"final cubin".to_vec();
+
+        let materialized =
+            materialized_ptx_embedding("demo", linker_input.clone(), cubin.clone());
+
+        assert_eq!(materialized.ptx_sidecar, Some(linker_input));
+        assert_eq!(
+            materialized.artifact.kind,
+            device_codegen::DeviceCodegenArtifactKind::Cubin
+        );
+        assert_eq!(materialized.artifact.name, "demo.cubin");
+        assert_eq!(materialized.artifact.bytes, cubin);
     }
 
     #[test]
