@@ -20,6 +20,8 @@
 //!      with edge lanes keeping their own value (the PTX out-of-range rule).
 //!   4. `shuffle_u64_halfwarp` — `idx`: two masked half-warps broadcast their
 //!      own leaders without crossing the member-mask boundary.
+//!   5. `shuffle_value_trait_halfwarp` — the legacy Impulse-compatible trait
+//!      path for `f32`, `f64`, and `u32`, including its width-16 clamp.
 //!
 //! Build and run with:
 //!   cargo oxide run shuffle_64
@@ -115,6 +117,56 @@ mod kernels {
         };
         unsafe {
             *out.get_unchecked_mut(lane as usize) = got;
+        }
+    }
+
+    /// Exercise the Impulse-compatible `WarpShuffleValue` trait rather than
+    /// cuda-oxide's native free functions. Width 16 must keep each half-warp
+    /// independent while XOR-exchanging adjacent lanes.
+    #[kernel]
+    pub fn shuffle_value_trait_halfwarp(
+        mut f32_out: DisjointSlice<f32>,
+        mut f64_out: DisjointSlice<f64>,
+        mut u32_out: DisjointSlice<u32>,
+    ) {
+        let lane = warp::lane_id();
+        let f32_value = (lane as f32) + 0.25;
+        let f64_value = (lane as f64) + 0.5;
+        let u32_value = 0xA500_0000 | lane;
+        let f32_got = unsafe {
+            <f32 as warp::WarpShuffleValue>::shuffle(
+                warp::WarpShuffleMode::Xor,
+                u32::MAX,
+                f32_value,
+                1,
+                16,
+            )
+            .0
+        };
+        let f64_got = unsafe {
+            <f64 as warp::WarpShuffleValue>::shuffle(
+                warp::WarpShuffleMode::Xor,
+                u32::MAX,
+                f64_value,
+                1,
+                16,
+            )
+            .0
+        };
+        let u32_got = unsafe {
+            <u32 as warp::WarpShuffleValue>::shuffle(
+                warp::WarpShuffleMode::Xor,
+                u32::MAX,
+                u32_value,
+                1,
+                16,
+            )
+            .0
+        };
+        unsafe {
+            *f32_out.get_unchecked_mut(lane as usize) = f32_got;
+            *f64_out.get_unchecked_mut(lane as usize) = f64_got;
+            *u32_out.get_unchecked_mut(lane as usize) = u32_got;
         }
     }
 }
@@ -251,6 +303,38 @@ fn main() {
         println!("✓ each half shuffled within its own membermask (no cross-talk)");
     } else {
         println!("✗ masked half-warp broadcast mismatch (membermask mis-wired?)");
+        failed = true;
+    }
+
+    // ===== Test 5: legacy WarpShuffleValue trait path =====
+    println!("\n--- Test 5: WarpShuffleValue trait (width-16 XOR) ---");
+    let mut legacy_f32_dev = DeviceBuffer::<f32>::zeroed(&stream, WARP).unwrap();
+    let mut legacy_f64_dev = DeviceBuffer::<f64>::zeroed(&stream, WARP).unwrap();
+    let mut legacy_u32_dev = DeviceBuffer::<u32>::zeroed(&stream, WARP).unwrap();
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.shuffle_value_trait_halfwarp(
+            (stream).as_ref(),
+            cfg,
+            &mut legacy_f32_dev,
+            &mut legacy_f64_dev,
+            &mut legacy_u32_dev,
+        )
+    }
+    .expect("Kernel launch failed");
+    let legacy_f32 = legacy_f32_dev.to_host_vec(&stream).unwrap();
+    let legacy_f64 = legacy_f64_dev.to_host_vec(&stream).unwrap();
+    let legacy_u32 = legacy_u32_dev.to_host_vec(&stream).unwrap();
+    let legacy_ok = (0..WARP).all(|lane| {
+        let peer = lane ^ 1;
+        legacy_f32[lane] == (peer as f32) + 0.25
+            && legacy_f64[lane] == (peer as f64) + 0.5
+            && legacy_u32[lane] == (0xA500_0000 | peer as u32)
+    });
+    if legacy_ok {
+        println!("✓ trait shuffles preserved values and the width-16 lane groups");
+    } else {
+        println!("✗ WarpShuffleValue trait lowering mismatch");
         failed = true;
     }
 

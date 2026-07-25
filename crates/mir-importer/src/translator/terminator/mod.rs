@@ -2464,6 +2464,21 @@ fn try_dispatch_intrinsic(
         return Ok(Some(operation));
     }
 
+    if name.ends_with("::WarpShuffleValue::shuffle") {
+        return Ok(Some(intrinsics::warp::emit_warp_shuffle_value_trait(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
     if let Some(kind) = intrinsics::asm::InlinePtxCallKind::from_path(name) {
         return Ok(Some(intrinsics::asm::emit_inline_ptx(
             ctx,

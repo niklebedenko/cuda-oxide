@@ -217,6 +217,14 @@ fn device_runtime_checks_target(targets: &rustc_middle::mir::SwitchTargets) -> B
     targets.target_for_value(u128::from(mir_importer::DEVICE_RUNTIME_CHECKS_VALUE))
 }
 
+/// The MIR importer replaces calls through cuda-device's legacy shuffle trait
+/// with a typed PTX shuffle. Its concrete implementation body calls a
+/// `#[gpu_only]` helper that is intentionally absent from device modules, so it
+/// must not also be collected as an ordinary function.
+fn is_legacy_warp_shuffle_value_path(path: &str) -> bool {
+    path.ends_with("::shuffle") && path.contains("WarpShuffleValue")
+}
+
 /// Result of checking if a function should be collected for device compilation.
 #[derive(Debug)]
 enum CollectDecision {
@@ -1540,6 +1548,14 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         let raw_name = self.tcx.def_path_str(resolved.def_id());
+        if is_legacy_warp_shuffle_value_path(&raw_name) {
+            if self.verbose {
+                eprintln!(
+                    "[collector] Skipping WarpShuffleValue implementation lowered at its call site: {raw_name}"
+                );
+            }
+            return;
+        }
         let crate_name = self.tcx.crate_name(resolved.def_id().krate);
         if self.is_generated_intrinsic_placeholder_or_report_mismatch(
             crate_name.as_str(),
@@ -2407,7 +2423,8 @@ pub fn dump_device_mir_info<'tcx>(tcx: TyCtxt<'tcx>, functions: &[CollectedFunct
 #[cfg(test)]
 mod tests {
     use super::{
-        device_runtime_checks_target, is_kernel_entry_def_path, unsupported_codegen_protocol_root,
+        device_runtime_checks_target, is_kernel_entry_def_path, is_legacy_warp_shuffle_value_path,
+        unsupported_codegen_protocol_root,
     };
     use reserved_oxide_symbols::{
         DEVICE_PREFIX, KERNEL_PREFIX, LEGACY_DEVICE_PREFIX, LEGACY_KERNEL_PREFIX,
@@ -2449,6 +2466,22 @@ mod tests {
         let true_target = BasicBlock::from_usize(2);
         let targets = rustc_middle::mir::SwitchTargets::static_if(0, false_target, true_target);
         assert_eq!(device_runtime_checks_target(&targets), false_target);
+    }
+
+    #[test]
+    fn legacy_warp_shuffle_trait_implementations_are_call_site_lowered() {
+        assert!(is_legacy_warp_shuffle_value_path(
+            "cuda_device::warp::<impl cuda_device::warp::WarpShuffleValue for f32>::shuffle"
+        ));
+        assert!(is_legacy_warp_shuffle_value_path(
+            "impulse_detail_nvgpu::<impl impulse_detail_nvgpu::WarpShuffleValue for f64>::shuffle"
+        ));
+        assert!(!is_legacy_warp_shuffle_value_path(
+            "user_crate::WarpShuffleValue::other"
+        ));
+        assert!(!is_legacy_warp_shuffle_value_path(
+            "user_crate::OtherShuffleValue::shuffle"
+        ));
     }
 
     #[test]
