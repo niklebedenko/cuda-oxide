@@ -3698,11 +3698,12 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_array_extract_preserves_recursive_element_alignment() {
+    fn large_dynamic_array_extract_preserves_recursive_element_alignment() {
         let mut ctx = make_ctx();
         let tuple_ty = over_aligned_tuple_ty(&mut ctx);
         let inner: TypeHandle = MirArrayType::get(&mut ctx, tuple_ty, 2).into();
-        let outer: TypeHandle = MirArrayType::get(&mut ctx, inner, 3).into();
+        let outer: TypeHandle =
+            MirArrayType::get(&mut ctx, inner, MAX_SSA_ARRAY_ELEMENTS + 1).into();
         let index_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
         let (module_ptr, block) = build_kernel(&mut ctx, vec![index_ty], vec![]);
         let index = block.deref(&ctx).get_argument(0);
