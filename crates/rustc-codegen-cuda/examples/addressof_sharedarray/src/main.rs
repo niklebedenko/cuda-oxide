@@ -41,7 +41,7 @@
 #![allow(clippy::assign_op_pattern)] // Expanded assignment preserves the addressof repro CFG.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{DisjointSlice, SharedArray, device, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, device, kernel, thread, warp};
 use cuda_host::{cuda_module, ltoir};
 
 struct SharedPointerInner {
@@ -168,6 +168,65 @@ mod kernels {
         }
     }
 
+    /// Minimal A/B for a hot warp scratch range. Converting the shared base
+    /// through `*mut f32` preserves raw-pointer null semantics but necessarily
+    /// uses generic PTX loads and stores.
+    #[kernel]
+    pub fn sharedarray_warp_scratch_raw(mut out: DisjointSlice<f32>) {
+        const WARPS: usize = 4;
+        const STRIDE: usize = 32;
+        static mut RAW_SCRATCH: SharedArray<f32, { WARPS * STRIDE }> = SharedArray::UNINIT;
+
+        let lane = thread::threadIdx_x() as usize % STRIDE;
+        let warp_index = thread::threadIdx_x() as usize / STRIDE;
+        if warp_index < WARPS {
+            let scratch = unsafe {
+                (&raw mut RAW_SCRATCH)
+                    .as_mut()
+                    .unwrap_unchecked()
+                    .as_mut_ptr()
+                    .add(warp_index * STRIDE)
+            };
+            unsafe { scratch.add(lane).write(lane as f32) };
+            warp::sync_mask(u32::MAX);
+
+            let mut sum = 0.0;
+            for column in 0..20 {
+                sum += unsafe { scratch.add(column).read() };
+            }
+            if lane == 0 {
+                unsafe { *out.get_unchecked_mut(warp_index) = sum };
+            }
+        }
+    }
+
+    /// The same computation retains a `SharedArray` reference through the
+    /// indexing operations, allowing CUDA Oxide to emit native shared-memory
+    /// accesses without changing raw-pointer semantics globally.
+    #[kernel]
+    pub fn sharedarray_warp_scratch_indexed(mut out: DisjointSlice<f32>) {
+        const WARPS: usize = 4;
+        const STRIDE: usize = 32;
+        static mut INDEXED_SCRATCH: SharedArray<f32, { WARPS * STRIDE }> = SharedArray::UNINIT;
+
+        let lane = thread::threadIdx_x() as usize % STRIDE;
+        let warp_index = thread::threadIdx_x() as usize / STRIDE;
+        if warp_index < WARPS {
+            let scratch = unsafe { &mut *(&raw mut INDEXED_SCRATCH) };
+            let base = warp_index * STRIDE;
+            scratch[base + lane] = lane as f32;
+            warp::sync_mask(u32::MAX);
+
+            let mut sum = 0.0;
+            for column in 0..20 {
+                sum += scratch[base + column];
+            }
+            if lane == 0 {
+                unsafe { *out.get_unchecked_mut(warp_index) = sum };
+            }
+        }
+    }
+
     #[inline(never)]
     #[device]
     fn repro_weight() -> f32 {
@@ -252,5 +311,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PASS addressof_sharedarray raw receiver: result={}",
         result[4]
     );
-    Ok(())
+
+    let warp_cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut warp_out = DeviceBuffer::<f32>::zeroed(&stream, 4)?;
+    unsafe {
+        module.sharedarray_warp_scratch_raw(stream.as_ref(), warp_cfg, &mut warp_out)?;
+    }
+    let raw_sums = warp_out.to_host_vec(&stream)?;
+    unsafe {
+        module.sharedarray_warp_scratch_indexed(stream.as_ref(), warp_cfg, &mut warp_out)?;
+    }
+    let indexed_sums = warp_out.to_host_vec(&stream)?;
+    let expected_sum = 190.0;
+    if raw_sums.iter().all(|sum| *sum == expected_sum)
+        && indexed_sums.iter().all(|sum| *sum == expected_sum)
+    {
+        println!("PASS shared warp scratch A/B: raw={raw_sums:?}, indexed={indexed_sums:?}");
+        Ok(())
+    } else {
+        eprintln!(
+            "FAIL shared warp scratch A/B: raw={raw_sums:?}, indexed={indexed_sums:?}, expected={expected_sum}"
+        );
+        std::process::exit(1);
+    }
 }
