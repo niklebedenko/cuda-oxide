@@ -15,7 +15,7 @@
 
 use cuda_artifact_finalizer::{
     CudaArch, CudaArchParseError, DebugPolicy, FinalizationOptions, Finalizer, FinalizerError,
-    FinalizerOutput, NamedInput,
+    FinalizerOutput, MaterializedNvvmIr, NamedInput,
 };
 use thiserror::Error;
 
@@ -129,17 +129,17 @@ pub(crate) fn validate_collection(
     Ok(())
 }
 
-pub(crate) fn nvvm_ir_to_cubin(
+pub(crate) fn nvvm_ir_to_artifacts(
     request: MaterializationRequest,
     nvvm_ir: &[u8],
     module_name: &str,
     target: &str,
     allow_fma_contraction: bool,
     debug_policy: DebugPolicy,
-) -> Result<Vec<u8>, MaterializeError> {
+) -> Result<MaterializedNvvmIr, MaterializeError> {
     let options = options(target, allow_fma_contraction, debug_policy)?;
     let finalizer = checked_finalizer(request)?;
-    Ok(finalizer.materialize_nvvm_ir(module_name, nvvm_ir, &options)?)
+    Ok(finalizer.materialize_nvvm_ir_with_ptx(module_name, nvvm_ir, &options)?)
 }
 
 pub(crate) fn ltoir_to_cubin(

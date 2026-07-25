@@ -814,7 +814,8 @@ impl CodegenBackend for CudaCodegenBackend {
             .into_iter()
             .partition(|artifact| artifact.retain_in_host_cgus);
         if !retained.is_empty()
-            && let Err(error) = merge_artifacts_into_host_cgus(sess, &mut compiled_modules, &retained)
+            && let Err(error) =
+                merge_artifacts_into_host_cgus(sess, &mut compiled_modules, &retained)
         {
             sess.dcx().fatal(format!(
                 "[rustc_codegen_cuda] Failed to retain generic device artifact: {error}"
@@ -861,18 +862,26 @@ fn write_device_artifact_object(
 ) -> Result<ArtifactObject, Box<dyn std::error::Error>> {
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
     let materialized_artifact;
+    let materialized_ptx_sidecar;
     let (artifact, was_materialized) = match materialize_artifact_for_embedding(
         materialization_request,
         &bundle_name,
         result,
         artifact,
     )? {
-        Some(cubin) => {
-            materialized_artifact = cubin;
+        Some(materialized) => {
+            materialized_artifact = materialized.artifact;
+            materialized_ptx_sidecar = materialized.ptx_sidecar;
             (&materialized_artifact, true)
         }
-        None => (artifact, false),
+        None => {
+            materialized_ptx_sidecar = None;
+            (artifact, false)
+        }
     };
+    if let Some(ptx) = materialized_ptx_sidecar.as_deref() {
+        write_materialized_ptx_sidecar(&result.ptx_path, ptx)?;
+    }
     let payload_kind = match artifact.kind {
         device_codegen::DeviceCodegenArtifactKind::Ptx => oxide_artifacts::ArtifactPayloadKind::Ptx,
         device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
@@ -1012,12 +1021,19 @@ fn embedded_compile_options(
 /// produced NVVM IR or LTOIR; accepting PTX or an already-built cubin would
 /// bypass the wrapper's provenance-checked finalization recipe. See
 /// `materialize` for the trade-offs.
+struct MaterializedEmbeddingArtifact {
+    artifact: device_codegen::DeviceCodegenArtifact,
+    /// Exact PTX input used to produce `artifact`, when the selected route has
+    /// a PTX link stage. LTOIR-to-cubin has no such byte sequence.
+    ptx_sidecar: Option<Vec<u8>>,
+}
+
 fn materialize_artifact_for_embedding(
     request: Option<materialize::MaterializationRequest>,
     bundle_name: &str,
     result: &device_codegen::DeviceCodegenResult,
     artifact: &device_codegen::DeviceCodegenArtifact,
-) -> Result<Option<device_codegen::DeviceCodegenArtifact>, Box<dyn std::error::Error>> {
+) -> Result<Option<MaterializedEmbeddingArtifact>, Box<dyn std::error::Error>> {
     let Some(request) = request else {
         return Ok(None);
     };
@@ -1028,23 +1044,36 @@ fn materialize_artifact_for_embedding(
         }
         llvm_export::export::DebugKind::Full => cuda_artifact_finalizer::DebugPolicy::Full,
     };
-    let cubin = match artifact.kind {
-        device_codegen::DeviceCodegenArtifactKind::NvvmIr => materialize::nvvm_ir_to_cubin(
-            request,
-            &artifact.bytes,
-            bundle_name,
-            &result.target,
-            result.allow_fma_contraction,
-            debug_policy,
-        )?,
-        device_codegen::DeviceCodegenArtifactKind::Ltoir => materialize::ltoir_to_cubin(
-            request,
-            &artifact.bytes,
-            &artifact.name,
-            &result.target,
-            result.allow_fma_contraction,
-            debug_policy,
-        )?,
+    let materialized = match artifact.kind {
+        device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
+            let artifacts = materialize::nvvm_ir_to_artifacts(
+                request,
+                &artifact.bytes,
+                bundle_name,
+                &result.target,
+                result.allow_fma_contraction,
+                debug_policy,
+            )?;
+            materialized_nvvm_embedding(bundle_name, artifacts)
+        }
+        device_codegen::DeviceCodegenArtifactKind::Ltoir => {
+            let cubin = materialize::ltoir_to_cubin(
+                request,
+                &artifact.bytes,
+                &artifact.name,
+                &result.target,
+                result.allow_fma_contraction,
+                debug_policy,
+            )?;
+            MaterializedEmbeddingArtifact {
+                artifact: device_codegen::DeviceCodegenArtifact {
+                    kind: device_codegen::DeviceCodegenArtifactKind::Cubin,
+                    name: format!("{bundle_name}.cubin"),
+                    bytes: cubin,
+                },
+                ptx_sidecar: None,
+            }
+        }
         device_codegen::DeviceCodegenArtifactKind::Ptx => {
             return Err(Box::new(materialize::MaterializeError::PtxInput));
         }
@@ -1052,11 +1081,25 @@ fn materialize_artifact_for_embedding(
             return Err(Box::new(materialize::MaterializeError::CubinInput));
         }
     };
-    Ok(Some(device_codegen::DeviceCodegenArtifact {
-        kind: device_codegen::DeviceCodegenArtifactKind::Cubin,
-        name: format!("{bundle_name}.cubin"),
-        bytes: cubin,
-    }))
+    Ok(Some(materialized))
+}
+
+fn materialized_nvvm_embedding(
+    bundle_name: &str,
+    materialized: cuda_artifact_finalizer::MaterializedNvvmIr,
+) -> MaterializedEmbeddingArtifact {
+    MaterializedEmbeddingArtifact {
+        artifact: device_codegen::DeviceCodegenArtifact {
+            kind: device_codegen::DeviceCodegenArtifactKind::Cubin,
+            name: format!("{bundle_name}.cubin"),
+            bytes: materialized.cubin,
+        },
+        ptx_sidecar: Some(materialized.ptx_input),
+    }
+}
+
+fn write_materialized_ptx_sidecar(path: &Path, ptx: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, ptx)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1065,9 +1108,7 @@ enum ArtifactAnchorPlaceholderKind {
     UnselectedLegacy,
 }
 
-fn artifact_contains_only_generic_kernels(
-    functions: &[collector::CollectedFunction<'_>],
-) -> bool {
+fn artifact_contains_only_generic_kernels(functions: &[collector::CollectedFunction<'_>]) -> bool {
     generic_kernel_exports_require_cgu_retention(
         functions
             .iter()
@@ -1329,6 +1370,22 @@ mod tests {
             ArtifactPayloadSpec, build_artifact_blob, parse_artifact_blob,
         };
 
+        let materialized = materialized_nvvm_embedding(
+            "demo",
+            cuda_artifact_finalizer::MaterializedNvvmIr {
+                ptx_input: b".version 8.7\n\0".to_vec(),
+                cubin: b"final cubin".to_vec(),
+            },
+        );
+        assert_eq!(
+            materialized.ptx_sidecar.as_deref(),
+            Some(&b".version 8.7\n\0"[..])
+        );
+        assert_eq!(
+            materialized.artifact.kind,
+            device_codegen::DeviceCodegenArtifactKind::Cubin
+        );
+
         let blob = build_artifact_blob(
             &ArtifactBundleSpec::new("demo", "sm_90a")
                 .with_compile_options(embedded_compile_options(
@@ -1338,8 +1395,8 @@ mod tests {
                 ))
                 .with_payload(ArtifactPayloadSpec::new(
                     ArtifactPayloadKind::Cubin,
-                    "demo.cubin",
-                    b"final cubin",
+                    &materialized.artifact.name,
+                    &materialized.artifact.bytes,
                 ))
                 .with_entry(ArtifactEntrySpec::new(
                     "kernel_a",
@@ -1359,6 +1416,7 @@ mod tests {
             bundle.payload(ArtifactPayloadKind::Cubin),
             Some(&b"final cubin"[..])
         );
+        assert_eq!(bundle.payload(ArtifactPayloadKind::Ptx), None);
         assert!(!bundle.compile_options.fma_contraction_enabled());
         assert_eq!(
             bundle.compile_options.debug_policy(),
@@ -1373,6 +1431,26 @@ mod tests {
             bundle.entry("helper").map(|entry| entry.kind),
             Some(ArtifactEntryKind::DeviceFunction)
         );
+    }
+
+    #[test]
+    fn materialized_ptx_sidecar_preserves_exact_linker_input_bytes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cuda-codegen-materialized-ptx-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ptx_path = temp_dir.join("demo.ptx");
+        let linker_input = b".version 8.7\n.visible .entry demo() { ret; }\n\0";
+
+        write_materialized_ptx_sidecar(&ptx_path, linker_input).unwrap();
+
+        assert_eq!(std::fs::read(&ptx_path).unwrap(), linker_input);
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -1418,10 +1496,7 @@ mod tests {
             artifact_anchor_placeholder_kind(true, false, true, 1),
             Some(UnselectedLegacy)
         );
-        assert_eq!(
-            artifact_anchor_placeholder_kind(true, true, true, 1),
-            None
-        );
+        assert_eq!(artifact_anchor_placeholder_kind(true, true, true, 1), None);
         assert_eq!(
             artifact_anchor_placeholder_kind(false, true, false, 0),
             None

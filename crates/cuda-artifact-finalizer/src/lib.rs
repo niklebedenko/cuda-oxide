@@ -100,6 +100,20 @@ pub enum FinalizerError {
     ToolIdentityChanged { tool: &'static str },
 }
 
+/// Outputs from one NVVM IR materialization plan.
+///
+/// `ptx_input` is the exact whole-module byte sequence passed to nvJitLink to
+/// produce `cubin`. Keeping both outputs from the same invocation lets callers
+/// publish an audit sidecar without recompiling the NVVM IR or guessing which
+/// PTX policy produced the embedded image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNvvmIr {
+    /// Exact whole-module PTX input passed to nvJitLink.
+    pub ptx_input: Vec<u8>,
+    /// Validated target-specific cubin produced from `ptx_input`.
+    pub cubin: Vec<u8>,
+}
+
 /// Complete NVVM IR to cubin/PTX finalizer.
 #[derive(Clone)]
 pub struct Finalizer {
@@ -123,12 +137,27 @@ impl Finalizer {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
-        let ptx = self
+        Ok(self
+            .materialize_nvvm_ir_with_ptx(module_name, nvvm_ir, options)?
+            .cubin)
+    }
+
+    /// Compile one NVVM IR module and return both the exact whole-module PTX
+    /// linker input and the validated target-specific cubin it produced.
+    pub fn materialize_nvvm_ir_with_ptx(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+    ) -> Result<MaterializedNvvmIr, FinalizerError> {
+        let ptx_input = self
             .compiler
             .compile_nvvm_ir_to_ptx(module_name, nvvm_ir, options)?;
         let ptx_name = format!("{module_name}.ptx");
-        self.linker
-            .link_ptx(&[NamedInput::new(&ptx_name, &ptx)], options)
+        let cubin = self
+            .linker
+            .link_ptx(&[NamedInput::new(&ptx_name, &ptx_input)], options)?;
+        Ok(MaterializedNvvmIr { ptx_input, cubin })
     }
 
     /// Link ordered LTOIR modules to cubin or PTX.
@@ -356,11 +385,16 @@ entry:
             let ptx_input = [NamedInput::new("kernel.ll.ptx", &linkable_ptx)];
             let whole_ptx_cubin = finalizer.link_ptx(&ptx_input, &options).unwrap();
             assert!(is_valid_cubin(&whole_ptx_cubin));
+            let materialized = finalizer
+                .materialize_nvvm_ir_with_ptx("kernel.ll", LEGACY_NVVM_IR, &options)
+                .unwrap();
+            assert_eq!(materialized.ptx_input, linkable_ptx);
+            assert_eq!(materialized.cubin, whole_ptx_cubin);
             assert_eq!(
                 finalizer
                     .materialize_nvvm_ir("kernel.ll", LEGACY_NVVM_IR, &options)
                     .unwrap(),
-                whole_ptx_cubin
+                materialized.cubin
             );
             let input = [NamedInput::new("kernel.ltoir", &ltoir)];
             let cubin = finalizer
