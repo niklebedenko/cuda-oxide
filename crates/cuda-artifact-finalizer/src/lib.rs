@@ -28,7 +28,7 @@ use provenance::common_provenance_digest;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Failures while compiling NVVM IR or linking LTOIR.
+/// Failures while compiling NVVM IR or linking CUDA device artifacts.
 #[derive(Debug, Error)]
 pub enum FinalizerError {
     /// libNVVM failed to load, validate, or compile.
@@ -81,7 +81,7 @@ pub enum FinalizerError {
     EmptyInput { name: String },
 
     /// nvJitLink was invoked without an input module.
-    #[error("at least one ordered LTOIR input is required")]
+    #[error("at least one ordered linker input is required")]
     NoLinkInputs,
 
     /// nvJitLink returned bytes that are not a complete CUDA ELF image.
@@ -123,15 +123,12 @@ impl Finalizer {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
-        let ltoir = self
+        let ptx = self
             .compiler
-            .compile_nvvm_ir_to_ltoir(module_name, nvvm_ir, options)?;
-        let ltoir_name = format!("{module_name}.ltoir");
-        self.linker.link_ltoir(
-            &[NamedInput::new(&ltoir_name, &ltoir)],
-            options,
-            FinalizerOutput::Cubin,
-        )
+            .compile_nvvm_ir_to_ptx(module_name, nvvm_ir, options)?;
+        let ptx_name = format!("{module_name}.ptx");
+        self.linker
+            .link_ptx(&[NamedInput::new(&ptx_name, &ptx)], options)
     }
 
     /// Link ordered LTOIR modules to cubin or PTX.
@@ -144,12 +141,21 @@ impl Finalizer {
         self.linker.link_ltoir(inputs, options, output)
     }
 
+    /// Link ordered PTX modules to a cubin.
+    pub fn link_ptx(
+        &self,
+        inputs: &[NamedInput<'_>],
+        options: &FinalizationOptions,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        self.linker.link_ptx(inputs, options)
+    }
+
     /// Compiler component, including exact libdevice bytes and provenance.
     pub fn compiler(&self) -> &NvvmCompiler {
         &self.compiler
     }
 
-    /// Ordered LTOIR linker component.
+    /// Ordered LTOIR/PTX linker component.
     pub fn linker(&self) -> &LtoLinker {
         &self.linker
     }
@@ -173,21 +179,19 @@ impl Finalizer {
         ))
     }
 
-    /// Digest the full NVVM IR to output recipe, including ordered options.
+    /// Digest the full NVVM IR to cubin recipe, including ordered options.
     pub fn nvvm_ir_artifact_digest(
         &self,
         module_name: &str,
-        ltoir_module_name: &str,
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
-        output: FinalizerOutput,
     ) -> Option<[u8; 32]> {
+        let ptx_module_name = format!("{module_name}.ptx");
         nvvm_ir_artifact_digest_with_provenance(
             module_name,
-            ltoir_module_name,
+            &ptx_module_name,
             nvvm_ir,
             options,
-            output,
             self.provenance(),
         )
     }
@@ -199,29 +203,27 @@ impl Finalizer {
 /// returns `None` unless both loaded tool identities are exact.
 pub fn nvvm_ir_artifact_digest_with_provenance(
     module_name: &str,
-    ltoir_module_name: &str,
+    ptx_module_name: &str,
     nvvm_ir: &[u8],
     options: &FinalizationOptions,
-    output: FinalizerOutput,
     provenance: ToolProvenance,
 ) -> Option<[u8; 32]> {
-    let compiler_digest = nvvm::nvvm_ir_artifact_digest_parts(
+    let compiler_digest = nvvm::nvvm_ir_ptx_artifact_digest_parts(
         module_name,
         nvvm_ir,
         options,
         &provenance.libdevice_sha256,
         &provenance.libnvvm_sha256?,
     );
-    let linker_digest = link::ltoir_artifact_digest_parts(
-        &[NamedInput::new(ltoir_module_name, &compiler_digest)],
+    let linker_digest = link::ptx_artifact_digest_parts(
+        &[NamedInput::new(ptx_module_name, &compiler_digest)],
         options,
-        output,
         &provenance.nvjitlink_sha256?,
     );
     Some(
         provenance::StableDigest::new()
             .field("recipe", recipe_digest())
-            .field("route", b"nvvm-ir-to-final-output")
+            .field("route", b"nvvm-ir-via-ptx-to-final-output")
             .field("compiler-plan", compiler_digest)
             .field("linker-plan", linker_digest)
             .finish(),
@@ -267,6 +269,61 @@ entry:
 !1 = !{i32 2, i32 0, i32 3, i32 1}
 "#;
 
+    fn exact_provenance() -> ToolProvenance {
+        ToolProvenance {
+            libnvvm_sha256: Some([1; 32]),
+            nvjitlink_sha256: Some([2; 32]),
+            libdevice_sha256: [3; 32],
+        }
+    }
+
+    #[test]
+    fn materialization_digest_tracks_the_whole_ptx_plan() {
+        let options = FinalizationOptions::new("sm_86".parse().unwrap());
+        let baseline = nvvm_ir_artifact_digest_with_provenance(
+            "kernel.ll",
+            "kernel.ll.ptx",
+            b"nvvm ir",
+            &options,
+            exact_provenance(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            baseline,
+            nvvm_ir_artifact_digest_with_provenance(
+                "kernel.ll",
+                "renamed.ptx",
+                b"nvvm ir",
+                &options,
+                exact_provenance(),
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            nvvm_ir_artifact_digest_with_provenance(
+                "kernel.ll",
+                "kernel.ll.ptx",
+                b"nvvm ir",
+                &options.clone().with_fma_contraction(false),
+                exact_provenance(),
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            nvvm_ir_artifact_digest_with_provenance(
+                "kernel.ll",
+                "kernel.ll.ptx",
+                b"nvvm ir",
+                &options.clone().with_debug_policy(DebugPolicy::LineTables),
+                exact_provenance(),
+            )
+            .unwrap()
+        );
+    }
+
     #[test]
     #[ignore = "requires discoverable CUDA Toolkit libNVVM, nvJitLink, and libdevice"]
     fn live_pipeline_accepts_toolkit_cubins_and_emits_ptx_for_both_fma_policies() {
@@ -287,6 +344,24 @@ entry:
                 .compile_nvvm_ir_to_ltoir("kernel.ll", LEGACY_NVVM_IR, &options)
                 .unwrap();
             assert!(!ltoir.is_empty());
+            let linkable_ptx = finalizer
+                .compiler()
+                .compile_nvvm_ir_to_ptx("kernel.ll", LEGACY_NVVM_IR, &options)
+                .unwrap();
+            assert!(
+                linkable_ptx
+                    .windows(b".version".len())
+                    .any(|part| part == b".version")
+            );
+            let ptx_input = [NamedInput::new("kernel.ll.ptx", &linkable_ptx)];
+            let whole_ptx_cubin = finalizer.link_ptx(&ptx_input, &options).unwrap();
+            assert!(is_valid_cubin(&whole_ptx_cubin));
+            assert_eq!(
+                finalizer
+                    .materialize_nvvm_ir("kernel.ll", LEGACY_NVVM_IR, &options)
+                    .unwrap(),
+                whole_ptx_cubin
+            );
             let input = [NamedInput::new("kernel.ltoir", &ltoir)];
             let cubin = finalizer
                 .link_ltoir(&input, &options, FinalizerOutput::Cubin)

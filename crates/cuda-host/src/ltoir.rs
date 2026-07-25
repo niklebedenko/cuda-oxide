@@ -10,11 +10,11 @@
 //! their presence, emits NVVM IR (`<name>.ll`) instead of `.ptx`, and skips
 //! `llc`. The application then has to:
 //!
-//! 1. Compile the NVVM IR to LTOIR via libNVVM, with libdevice added so the
-//!    `__nv_*` symbols are inlined.
-//! 2. Link the resulting LTOIR via nvJitLink to produce either a cubin for
-//!    the same architecture, or PTX when a pre-Blackwell module is loaded on
-//!    a Blackwell GPU.
+//! 1. Compile the NVVM IR to linkable PTX via libNVVM, with libdevice added so
+//!    the `__nv_*` symbols are available to the final link.
+//! 2. Link the complete PTX module via nvJitLink to produce a cubin for the
+//!    same architecture. Explicit LTOIR inputs and the pre-Blackwell to
+//!    Blackwell PTX bridge retain their LTOIR route.
 //! 3. Load that image with the CUDA driver.
 //!
 //! This module wraps that pipeline behind file and in-memory helpers:
@@ -290,7 +290,6 @@ fn build_cubin_from_ll_file(ll_path: &Path, arch: &CudaArch) -> Result<FileCubin
         dir,
         &ll_bytes,
         &ll_path.display().to_string(),
-        &ltoir_path.display().to_string(),
         arch,
         compile_options,
     )?;
@@ -321,8 +320,9 @@ fn build_cubin_from_ll_file(ll_path: &Path, arch: &CudaArch) -> Result<FileCubin
 /// Compile NVVM IR bytes to a loadable cubin image in memory.
 ///
 /// This is the embedded-artifact counterpart of [`build_cubin_from_ll`]. It
-/// adds `libdevice.10.bc`, asks libNVVM for LTOIR, links that LTOIR with
-/// nvJitLink, and returns the final cubin bytes without creating sidecar files.
+/// adds `libdevice.10.bc`, asks libNVVM for linkable PTX, links that complete
+/// module with nvJitLink, and returns the final cubin bytes without creating
+/// sidecar files.
 pub fn build_cubin_from_nvvm_ir(
     nvvm_ir: &[u8],
     module_name: &str,
@@ -566,14 +566,12 @@ fn cached_nvvm_ir_to_cubin(
     source_dir: &Path,
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
-    ltoir_module_name: &str,
     arch: &CudaArch,
 ) -> Result<CacheResult, LtoirError> {
     cached_nvvm_ir_to_cubin_with_compile_options(
         source_dir,
         nvvm_ir,
         nvvm_module_name,
-        ltoir_module_name,
         arch,
         ArtifactCompileOptions::new(),
     )
@@ -583,30 +581,19 @@ fn cached_nvvm_ir_to_cubin_with_compile_options(
     source_dir: &Path,
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
-    ltoir_module_name: &str,
     arch: &CudaArch,
     compile_options: ArtifactCompileOptions,
 ) -> Result<CacheResult, LtoirError> {
     let finalizer = Finalizer::discover()?;
     let options = finalization_options(arch, compile_options);
-    let key = finalizer.nvvm_ir_artifact_digest(
-        nvvm_module_name,
-        ltoir_module_name,
-        nvvm_ir,
-        &options,
-        FinalizerOutput::Cubin,
-    );
+    let key = finalizer.nvvm_ir_artifact_digest(nvvm_module_name, nvvm_ir, &options);
 
     let build = || -> Result<BuiltArtifacts, LtoirError> {
         let ltoir =
             finalizer
                 .compiler()
                 .compile_nvvm_ir_to_ltoir(nvvm_module_name, nvvm_ir, &options)?;
-        let cubin = finalizer.link_ltoir(
-            &[NamedInput::new(ltoir_module_name, &ltoir)],
-            &options,
-            FinalizerOutput::Cubin,
-        )?;
+        let cubin = finalizer.materialize_nvvm_ir(nvvm_module_name, nvvm_ir, &options)?;
         Ok(BuiltArtifacts::new(cubin, Some(ltoir)))
     };
 
@@ -664,7 +651,7 @@ fn cached_ltoir_to_cubin_with_compile_options(
 fn nvvm_ir_cubin_cache_key(
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
-    ltoir_module_name: &str,
+    ptx_module_name: &str,
     arch: &CudaArch,
     libdevice: &[u8],
     libnvvm_digest: &[u8; 32],
@@ -673,7 +660,7 @@ fn nvvm_ir_cubin_cache_key(
     nvvm_ir_cubin_cache_key_with_compile_options(
         nvvm_ir,
         nvvm_module_name,
-        ltoir_module_name,
+        ptx_module_name,
         arch,
         libdevice,
         (libnvvm_digest, nvjitlink_digest),
@@ -685,7 +672,7 @@ fn nvvm_ir_cubin_cache_key(
 fn nvvm_ir_cubin_cache_key_with_options(
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
-    ltoir_module_name: &str,
+    ptx_module_name: &str,
     arch: &CudaArch,
     libdevice: &[u8],
     tool_digests: (&[u8; 32], &[u8; 32]),
@@ -694,7 +681,7 @@ fn nvvm_ir_cubin_cache_key_with_options(
     nvvm_ir_cubin_cache_key_with_compile_options(
         nvvm_ir,
         nvvm_module_name,
-        ltoir_module_name,
+        ptx_module_name,
         arch,
         libdevice,
         tool_digests,
@@ -706,7 +693,7 @@ fn nvvm_ir_cubin_cache_key_with_options(
 fn nvvm_ir_cubin_cache_key_with_compile_options(
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
-    ltoir_module_name: &str,
+    ptx_module_name: &str,
     arch: &CudaArch,
     libdevice: &[u8],
     tool_digests: (&[u8; 32], &[u8; 32]),
@@ -715,10 +702,9 @@ fn nvvm_ir_cubin_cache_key_with_compile_options(
     let (libnvvm_digest, nvjitlink_digest) = tool_digests;
     nvvm_ir_artifact_digest_with_provenance(
         nvvm_module_name,
-        ltoir_module_name,
+        ptx_module_name,
         nvvm_ir,
         &finalization_options(arch, compile_options),
-        FinalizerOutput::Cubin,
         ToolProvenance {
             libnvvm_sha256: Some(*libnvvm_digest),
             nvjitlink_sha256: Some(*nvjitlink_digest),
@@ -1536,7 +1522,7 @@ mod tests {
         let original = nvvm_ir_cubin_cache_key(
             b"nvvm ir",
             "kernel.ll",
-            "kernel.ltoir",
+            "kernel.ll.ptx",
             &arch,
             b"libdevice",
             &nvvm,
@@ -1547,7 +1533,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"different nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"libdevice",
                 &nvvm,
@@ -1556,7 +1542,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "renamed.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"libdevice",
                 &nvvm,
@@ -1565,7 +1551,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "renamed.ltoir",
+                "renamed.ptx",
                 &arch,
                 b"libdevice",
                 &nvvm,
@@ -1574,7 +1560,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &"sm_90".parse().unwrap(),
                 b"libdevice",
                 &nvvm,
@@ -1583,7 +1569,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"different libdevice",
                 &nvvm,
@@ -1592,7 +1578,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"libdevice",
                 &[3_u8; 32],
@@ -1601,7 +1587,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"libdevice",
                 &nvvm,
@@ -1615,7 +1601,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &"compute_86".parse().unwrap(),
                 b"libdevice",
                 &nvvm,
@@ -1628,7 +1614,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &"sm_86a".parse().unwrap(),
                 b"libdevice",
                 &nvvm,
@@ -1641,7 +1627,7 @@ mod tests {
             nvvm_ir_cubin_cache_key_with_options(
                 b"nvvm ir",
                 "kernel.ll",
-                "kernel.ltoir",
+                "kernel.ll.ptx",
                 &arch,
                 b"libdevice",
                 (&nvvm, &nvjitlink),
@@ -1653,7 +1639,7 @@ mod tests {
         let line_tables = nvvm_ir_cubin_cache_key_with_compile_options(
             b"nvvm ir",
             "kernel.ll",
-            "kernel.ltoir",
+            "kernel.ll.ptx",
             &arch,
             b"libdevice",
             (&nvvm, &nvjitlink),
@@ -1662,7 +1648,7 @@ mod tests {
         let full_debug = nvvm_ir_cubin_cache_key_with_compile_options(
             b"nvvm ir",
             "kernel.ll",
-            "kernel.ltoir",
+            "kernel.ll.ptx",
             &arch,
             b"libdevice",
             (&nvvm, &nvjitlink),
@@ -1733,7 +1719,7 @@ mod tests {
             nvvm_ir_cubin_cache_key(
                 b"ltoir",
                 "kernel.ltoir",
-                "kernel.ltoir",
+                "kernel.ltoir.ptx",
                 &arch,
                 b"",
                 &[0_u8; 32],
@@ -1781,28 +1767,16 @@ entry:
         let arch: CudaArch = "sm_86".parse().unwrap();
         let ll_bytes = std::fs::read(&ll).unwrap();
         let ltoir_path = dir.join("kernel.ltoir");
-        let native_hit = cached_nvvm_ir_to_cubin(
-            &dir,
-            &ll_bytes,
-            &ll.display().to_string(),
-            &ltoir_path.display().to_string(),
-            &arch,
-        )
-        .unwrap();
+        let native_hit =
+            cached_nvvm_ir_to_cubin(&dir, &ll_bytes, &ll.display().to_string(), &arch).unwrap();
         assert!(native_hit.cache_hit);
         let native_cache_path = native_hit.immutable_cubin_path.unwrap();
         let cache_modified = std::fs::metadata(&native_cache_path)
             .unwrap()
             .modified()
             .unwrap();
-        let native_hit_again = cached_nvvm_ir_to_cubin(
-            &dir,
-            &ll_bytes,
-            &ll.display().to_string(),
-            &ltoir_path.display().to_string(),
-            &arch,
-        )
-        .unwrap();
+        let native_hit_again =
+            cached_nvvm_ir_to_cubin(&dir, &ll_bytes, &ll.display().to_string(), &arch).unwrap();
         assert!(native_hit_again.cache_hit);
         assert_eq!(
             native_hit_again.immutable_cubin_path.as_ref(),
@@ -1839,14 +1813,8 @@ entry:
         let third = build_cubin_from_ll(&ll, "sm_86").unwrap();
         assert_eq!(third, first, "the public sibling path is stable");
         assert!(std::fs::read(&third).unwrap().starts_with(b"\x7fELF"));
-        let changed_hit = cached_nvvm_ir_to_cubin(
-            &dir,
-            &changed_ir,
-            &ll.display().to_string(),
-            &ltoir_path.display().to_string(),
-            &arch,
-        )
-        .unwrap();
+        let changed_hit =
+            cached_nvvm_ir_to_cubin(&dir, &changed_ir, &ll.display().to_string(), &arch).unwrap();
         assert!(changed_hit.cache_hit);
         assert_ne!(changed_hit.immutable_cubin_path, Some(native_cache_path));
 

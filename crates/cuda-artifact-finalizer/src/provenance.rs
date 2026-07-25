@@ -16,7 +16,7 @@ const DIGEST_DOMAIN: &[u8] = b"cuda-oxide/artifact-finalizer/digest/v1";
 // Bump this recipe version whenever tool invocation, option translation,
 // input ordering, output validation, or other output-affecting semantics
 // change. Cache keys and the cargo-oxide/backend handshake rely on it.
-const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v1";
+const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v2";
 
 /// Exact compiler inputs discovered alongside the loaded CUDA tools.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +231,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn recipe_identifies_the_whole_ptx_finalizer() {
+        let expected: [u8; 32] = Sha256::digest(b"cuda-oxide/artifact-finalizer/recipe/v2").into();
+        assert_eq!(recipe_digest(), expected);
+    }
 
     #[test]
     fn provenance_is_route_specific_and_content_sensitive() {

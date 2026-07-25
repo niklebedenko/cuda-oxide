@@ -22,7 +22,7 @@ struct LoadedLinkerTool {
 static LINKER_TOOL: OnceLock<Arc<LoadedLinkerTool>> = OnceLock::new();
 static LINKER_TOOL_LOAD: OnceLock<Mutex<()>> = OnceLock::new();
 
-/// Driver-independent ordered LTOIR linker.
+/// Driver-independent ordered LTOIR/PTX linker.
 #[derive(Clone)]
 pub struct LtoLinker {
     tool: Arc<LoadedLinkerTool>,
@@ -60,20 +60,42 @@ impl LtoLinker {
         options: &FinalizationOptions,
         output: FinalizerOutput,
     ) -> Result<Vec<u8>, FinalizerError> {
+        self.link_inputs(inputs, LinkInputKind::Ltoir, options, output)
+    }
+
+    /// Link one or more PTX modules to a cubin in the exact supplied order.
+    pub fn link_ptx(
+        &self,
+        inputs: &[NamedInput<'_>],
+        options: &FinalizationOptions,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        self.link_inputs(inputs, LinkInputKind::Ptx, options, FinalizerOutput::Cubin)
+    }
+
+    fn link_inputs(
+        &self,
+        inputs: &[NamedInput<'_>],
+        input_kind: LinkInputKind,
+        options: &FinalizationOptions,
+        output: FinalizerOutput,
+    ) -> Result<Vec<u8>, FinalizerError> {
         validate_inputs(inputs)?;
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
             || current_linker_tool_digest(&self.tool),
             || {
-                let option_storage = options.nvjitlink_options(output);
+                let option_storage = match input_kind {
+                    LinkInputKind::Ltoir => options.nvjitlink_ltoir_options(output),
+                    LinkInputKind::Ptx => options.nvjitlink_ptx_options(),
+                };
                 let option_refs = option_storage
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 let mut linker = Linker::new(&self.tool.library, &option_refs)?;
                 for input in inputs {
-                    linker.add(InputType::Ltoir, input.bytes, input.name)?;
+                    linker.add(input_kind.nvjitlink_type(), input.bytes, input.name)?;
                 }
                 let image = match output {
                     FinalizerOutput::Cubin => linker.finish()?,
@@ -101,6 +123,31 @@ impl LtoLinker {
         Some(ltoir_artifact_digest_parts(
             inputs, options, output, &nvjitlink,
         ))
+    }
+
+    /// Digest every semantic input to an ordered PTX-to-cubin link.
+    pub fn ptx_artifact_digest(
+        &self,
+        inputs: &[NamedInput<'_>],
+        options: &FinalizationOptions,
+    ) -> Option<[u8; 32]> {
+        let nvjitlink = self.nvjitlink_digest()?;
+        Some(ptx_artifact_digest_parts(inputs, options, &nvjitlink))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LinkInputKind {
+    Ltoir,
+    Ptx,
+}
+
+impl LinkInputKind {
+    fn nvjitlink_type(self) -> InputType {
+        match self {
+            Self::Ltoir => InputType::Ltoir,
+            Self::Ptx => InputType::Ptx,
+        }
     }
 }
 
@@ -158,20 +205,58 @@ pub(crate) fn ltoir_artifact_digest_parts(
     output: FinalizerOutput,
     nvjitlink_digest: &[u8; 32],
 ) -> [u8; 32] {
+    artifact_digest_parts(
+        inputs,
+        LinkInputKind::Ltoir,
+        options,
+        output,
+        nvjitlink_digest,
+    )
+}
+
+pub(crate) fn ptx_artifact_digest_parts(
+    inputs: &[NamedInput<'_>],
+    options: &FinalizationOptions,
+    nvjitlink_digest: &[u8; 32],
+) -> [u8; 32] {
+    artifact_digest_parts(
+        inputs,
+        LinkInputKind::Ptx,
+        options,
+        FinalizerOutput::Cubin,
+        nvjitlink_digest,
+    )
+}
+
+fn artifact_digest_parts(
+    inputs: &[NamedInput<'_>],
+    input_kind: LinkInputKind,
+    options: &FinalizationOptions,
+    output: FinalizerOutput,
+    nvjitlink_digest: &[u8; 32],
+) -> [u8; 32] {
     let output_name = match output {
         FinalizerOutput::Cubin => b"elf-cubin".as_slice(),
         FinalizerOutput::Ptx => b"ptx".as_slice(),
     };
+    let (route, input_name_field, input_bytes_field) = match input_kind {
+        LinkInputKind::Ltoir => ("ltoir-to-output", "ltoir-name", "ltoir"),
+        LinkInputKind::Ptx => ("ptx-to-output", "ptx-name", "ptx"),
+    };
     let mut digest = StableDigest::new()
         .field("recipe", recipe_digest())
-        .field("route", b"ltoir-to-output")
+        .field("route", route.as_bytes())
         .field("output", output_name);
     for input in inputs {
         digest = digest
-            .field("ltoir-name", input.name.as_bytes())
-            .field("ltoir", input.bytes);
+            .field(input_name_field, input.name.as_bytes())
+            .field(input_bytes_field, input.bytes);
     }
-    for option in options.nvjitlink_options(output) {
+    let link_options = match input_kind {
+        LinkInputKind::Ltoir => options.nvjitlink_ltoir_options(output),
+        LinkInputKind::Ptx => options.nvjitlink_ptx_options(),
+    };
+    for option in link_options {
         digest = digest.field("nvjitlink-option", option.as_bytes());
     }
     digest
@@ -239,6 +324,11 @@ mod tests {
                 FinalizerOutput::Cubin,
                 &[7; 32]
             )
+        );
+        assert_ne!(
+            baseline,
+            ptx_artifact_digest_parts(&[a, b], &options, &[7; 32]),
+            "LTOIR and PTX inputs must never share a cache identity"
         );
     }
 

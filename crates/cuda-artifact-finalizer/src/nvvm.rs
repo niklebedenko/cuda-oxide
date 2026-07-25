@@ -75,6 +75,29 @@ impl NvvmCompiler {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
+        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ltoir)
+    }
+
+    /// Compile one NVVM IR module plus libdevice into linkable PTX.
+    ///
+    /// libNVVM optimization is disabled deliberately. The final nvJitLink
+    /// invocation owns optimization after seeing every kernel in the module.
+    pub fn compile_nvvm_ir_to_ptx(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ptx)
+    }
+
+    fn compile_nvvm_ir(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+        output: NvvmOutputKind,
+    ) -> Result<Vec<u8>, FinalizerError> {
         validate_name(module_name)?;
         if nvvm_ir.is_empty() {
             return Err(FinalizerError::EmptyInput {
@@ -97,7 +120,10 @@ impl NvvmCompiler {
                 let verify = options.nvvm_verify_options();
                 let verify_refs = verify.iter().map(String::as_str).collect::<Vec<_>>();
                 program.verify(&verify_refs)?;
-                let compile = options.nvvm_compile_options();
+                let compile = match output {
+                    NvvmOutputKind::Ltoir => options.nvvm_ltoir_options(),
+                    NvvmOutputKind::Ptx => options.nvvm_ptx_options(),
+                };
                 let compile_refs = compile.iter().map(String::as_str).collect::<Vec<_>>();
                 Ok(program.compile(&compile_refs)?)
             },
@@ -120,6 +146,29 @@ impl NvvmCompiler {
             &libnvvm,
         ))
     }
+
+    /// Digest every semantic input to the NVVM IR to linkable PTX stage.
+    pub fn ptx_artifact_digest(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+    ) -> Option<[u8; 32]> {
+        let libnvvm = self.libnvvm_digest()?;
+        Some(nvvm_ir_ptx_artifact_digest_parts(
+            module_name,
+            nvvm_ir,
+            options,
+            &self.libdevice_digest,
+            &libnvvm,
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NvvmOutputKind {
+    Ltoir,
+    Ptx,
 }
 
 fn current_nvvm_tool_digest(tool: &LoadedNvvmTool) -> Option<[u8; 32]> {
@@ -225,9 +274,48 @@ pub(crate) fn nvvm_ir_artifact_digest_parts(
     libdevice_digest: &[u8; 32],
     libnvvm_digest: &[u8; 32],
 ) -> [u8; 32] {
+    nvvm_ir_artifact_digest_parts_for_output(
+        module_name,
+        nvvm_ir,
+        options,
+        libdevice_digest,
+        libnvvm_digest,
+        NvvmOutputKind::Ltoir,
+    )
+}
+
+pub(crate) fn nvvm_ir_ptx_artifact_digest_parts(
+    module_name: &str,
+    nvvm_ir: &[u8],
+    options: &FinalizationOptions,
+    libdevice_digest: &[u8; 32],
+    libnvvm_digest: &[u8; 32],
+) -> [u8; 32] {
+    nvvm_ir_artifact_digest_parts_for_output(
+        module_name,
+        nvvm_ir,
+        options,
+        libdevice_digest,
+        libnvvm_digest,
+        NvvmOutputKind::Ptx,
+    )
+}
+
+fn nvvm_ir_artifact_digest_parts_for_output(
+    module_name: &str,
+    nvvm_ir: &[u8],
+    options: &FinalizationOptions,
+    libdevice_digest: &[u8; 32],
+    libnvvm_digest: &[u8; 32],
+    output: NvvmOutputKind,
+) -> [u8; 32] {
+    let route = match output {
+        NvvmOutputKind::Ltoir => b"nvvm-ir-to-ltoir".as_slice(),
+        NvvmOutputKind::Ptx => b"nvvm-ir-to-linkable-ptx".as_slice(),
+    };
     let mut digest = StableDigest::new()
         .field("recipe", recipe_digest())
-        .field("route", b"nvvm-ir-to-ltoir")
+        .field("route", route)
         .field("module-name", module_name.as_bytes())
         .field("module", nvvm_ir)
         .field("module-order", b"libdevice.10.bc,user-nvvm-ir")
@@ -235,7 +323,11 @@ pub(crate) fn nvvm_ir_artifact_digest_parts(
     for option in options.nvvm_verify_options() {
         digest = digest.field("nvvm-verify-option", option.as_bytes());
     }
-    for option in options.nvvm_compile_options() {
+    let compile_options = match output {
+        NvvmOutputKind::Ltoir => options.nvvm_ltoir_options(),
+        NvvmOutputKind::Ptx => options.nvvm_ptx_options(),
+    };
+    for option in compile_options {
         digest = digest.field("nvvm-compile-option", option.as_bytes());
     }
     digest.field("libnvvm-sha256", libnvvm_digest).finish()
@@ -291,10 +383,15 @@ mod tests {
             nvvm_ir_artifact_digest_parts(
                 "kernel.ll",
                 b"ir",
-                &options.with_debug_policy(crate::DebugPolicy::Full),
+                &options.clone().with_debug_policy(crate::DebugPolicy::Full),
                 &[1; 32],
                 &[2; 32]
             )
+        );
+        assert_ne!(
+            baseline,
+            nvvm_ir_ptx_artifact_digest_parts("kernel.ll", b"ir", &options, &[1; 32], &[2; 32]),
+            "LTOIR and PTX compiler routes must never share a cache identity"
         );
     }
 }

@@ -68,7 +68,7 @@ impl FinalizationOptions {
         vec![format!("-arch={}", self.target.compute())]
     }
 
-    pub(crate) fn nvvm_compile_options(&self) -> Vec<String> {
+    pub(crate) fn nvvm_ltoir_options(&self) -> Vec<String> {
         let mut options = vec![
             format!("-arch={}", self.target.compute()),
             "-gen-lto".to_string(),
@@ -81,11 +81,42 @@ impl FinalizationOptions {
         options
     }
 
-    pub(crate) fn nvjitlink_options(&self, output: FinalizerOutput) -> Vec<String> {
+    pub(crate) fn nvvm_ptx_options(&self) -> Vec<String> {
+        let mut options = vec![
+            format!("-arch={}", self.target.compute()),
+            "-opt=0".to_string(),
+            self.fma_option().to_string(),
+        ];
+        if self.debug == DebugPolicy::Full {
+            options.push("-g".to_string());
+        }
+        options
+    }
+
+    pub(crate) fn nvjitlink_ltoir_options(&self, output: FinalizerOutput) -> Vec<String> {
         let mut options = vec![format!("-arch={}", self.target.sm()), "-lto".to_string()];
         if output == FinalizerOutput::Ptx {
             options.push("-ptx".to_string());
         }
+        options.push(self.fma_option().to_string());
+        match self.debug {
+            DebugPolicy::None => {}
+            DebugPolicy::LineTables => options.push("-lineinfo".to_string()),
+            DebugPolicy::Full => options.push("-g".to_string()),
+        }
+        options
+    }
+
+    pub(crate) fn nvjitlink_ptx_options(&self) -> Vec<String> {
+        let optimization = if self.debug == DebugPolicy::Full {
+            "-O0"
+        } else {
+            "-O3"
+        };
+        let mut options = vec![
+            format!("-arch={}", self.target.sm()),
+            optimization.to_string(),
+        ];
         options.push(self.fma_option().to_string());
         match self.debug {
             DebugPolicy::None => {}
@@ -118,7 +149,7 @@ pub enum FinalizerOutput {
 pub struct NamedInput<'a> {
     /// Name shown by CUDA-tool diagnostics and included in provenance.
     pub name: &'a str,
-    /// Complete LTOIR input bytes.
+    /// Complete LTOIR or PTX input bytes.
     pub bytes: &'a [u8],
 }
 
@@ -134,40 +165,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn option_order_preserves_target_lto_output_fma_and_debug_policy() {
+    fn option_order_preserves_route_output_fma_and_debug_policy() {
         let target: CudaArch = "sm_90a".parse().unwrap();
         let base = FinalizationOptions::new(target).with_fma_contraction(false);
 
         assert_eq!(
-            base.nvvm_compile_options(),
+            base.nvvm_ltoir_options(),
             ["-arch=compute_90a", "-gen-lto", "-fma=0"]
         );
         assert_eq!(
-            base.nvjitlink_options(FinalizerOutput::Cubin),
+            base.nvvm_ptx_options(),
+            ["-arch=compute_90a", "-opt=0", "-fma=0"]
+        );
+        assert_eq!(
+            base.nvjitlink_ltoir_options(FinalizerOutput::Cubin),
             ["-arch=sm_90a", "-lto", "-fma=0"]
         );
         assert_eq!(
             base.clone()
                 .with_debug_policy(DebugPolicy::LineTables)
-                .nvjitlink_options(FinalizerOutput::Ptx),
+                .nvjitlink_ltoir_options(FinalizerOutput::Ptx),
             ["-arch=sm_90a", "-lto", "-ptx", "-fma=0", "-lineinfo"]
         );
         assert_eq!(
             base.clone()
                 .with_debug_policy(DebugPolicy::LineTables)
-                .nvvm_compile_options(),
+                .nvvm_ltoir_options(),
             ["-arch=compute_90a", "-gen-lto", "-fma=0"]
         );
         assert_eq!(
             base.clone()
                 .with_debug_policy(DebugPolicy::Full)
-                .nvvm_compile_options(),
+                .nvvm_ltoir_options(),
             ["-arch=compute_90a", "-gen-lto", "-fma=0", "-g", "-opt=0"]
         );
         assert_eq!(
-            base.with_debug_policy(DebugPolicy::Full)
-                .nvjitlink_options(FinalizerOutput::Cubin),
+            base.clone()
+                .with_debug_policy(DebugPolicy::LineTables)
+                .nvjitlink_ptx_options(),
+            ["-arch=sm_90a", "-O3", "-fma=0", "-lineinfo"]
+        );
+        assert_eq!(
+            base.clone()
+                .with_debug_policy(DebugPolicy::Full)
+                .nvvm_ptx_options(),
+            ["-arch=compute_90a", "-opt=0", "-fma=0", "-g"]
+        );
+        assert_eq!(
+            base.clone()
+                .with_debug_policy(DebugPolicy::Full)
+                .nvjitlink_ltoir_options(FinalizerOutput::Cubin),
             ["-arch=sm_90a", "-lto", "-fma=0", "-g"]
+        );
+        assert_eq!(
+            base.with_debug_policy(DebugPolicy::Full)
+                .nvjitlink_ptx_options(),
+            ["-arch=sm_90a", "-O0", "-fma=0", "-g"]
         );
     }
 
@@ -179,7 +232,7 @@ mod tests {
             let expected = if allow { "-fma=1" } else { "-fma=0" };
             assert_eq!(
                 options
-                    .nvvm_compile_options()
+                    .nvvm_ltoir_options()
                     .iter()
                     .filter(|option| option.starts_with("-fma="))
                     .map(String::as_str)
@@ -188,7 +241,25 @@ mod tests {
             );
             assert_eq!(
                 options
-                    .nvjitlink_options(FinalizerOutput::Cubin)
+                    .nvvm_ptx_options()
+                    .iter()
+                    .filter(|option| option.starts_with("-fma="))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            assert_eq!(
+                options
+                    .nvjitlink_ltoir_options(FinalizerOutput::Cubin)
+                    .iter()
+                    .filter(|option| option.starts_with("-fma="))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            assert_eq!(
+                options
+                    .nvjitlink_ptx_options()
                     .iter()
                     .filter(|option| option.starts_with("-fma="))
                     .map(String::as_str)
