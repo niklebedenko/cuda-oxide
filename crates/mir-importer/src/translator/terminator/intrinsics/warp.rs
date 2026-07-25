@@ -5,14 +5,17 @@
 
 //! Manual translation helper for warp reduction.
 
-use super::super::helpers::emit_store_result_and_goto;
+use super::super::helpers::{emit_store_result_and_goto, set_generated_intrinsic_marker};
 use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
 use crate::translator::types;
 use crate::translator::values::ValueMap;
 use dialect_mir::attributes::MirCastKindAttr;
 use dialect_mir::ops::MirCastOp;
-use dialect_nvvm::ops::InlinePtxOp;
+use dialect_nvvm::ops::{
+    InlinePtxOp, ShflSyncBflyF32Op, ShflSyncBflyI32Op, ShflSyncDownF32Op, ShflSyncDownI32Op,
+    ShflSyncIdxF32Op, ShflSyncIdxI32Op, ShflSyncUpF32Op, ShflSyncUpI32Op,
+};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
@@ -22,6 +25,7 @@ use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::printable::Printable;
+use pliron::r#type::Typed;
 use pliron::utils::apint::APInt;
 use rustc_public::mir;
 use rustc_public::ty::{ConstantKind, TyConstKind};
@@ -170,6 +174,52 @@ fn emit_transmute(
     (cast_op.deref(ctx).get_result(0), cast_op)
 }
 
+fn build_structured_legacy_shuffle(
+    ctx: &mut Context,
+    mode: LegacyShuffleMode,
+    mask: pliron::value::Value,
+    value: pliron::value::Value,
+    lane_or_delta: pliron::value::Value,
+    is_f32: bool,
+) -> Ptr<Operation> {
+    let (op, marker) = match (mode, is_f32) {
+        (LegacyShuffleMode::Up, true) => (
+            ShflSyncUpF32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0057",
+        ),
+        (LegacyShuffleMode::Down, true) => (
+            ShflSyncDownF32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0056",
+        ),
+        (LegacyShuffleMode::Xor, true) => (
+            ShflSyncBflyF32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0055",
+        ),
+        (LegacyShuffleMode::Idx, true) => (
+            ShflSyncIdxF32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0054",
+        ),
+        (LegacyShuffleMode::Up, false) => (
+            ShflSyncUpI32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0053",
+        ),
+        (LegacyShuffleMode::Down, false) => (
+            ShflSyncDownI32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0052",
+        ),
+        (LegacyShuffleMode::Xor, false) => (
+            ShflSyncBflyI32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0051",
+        ),
+        (LegacyShuffleMode::Idx, false) => (
+            ShflSyncIdxI32Op::build(ctx, mask, value, lane_or_delta),
+            "v1:i0050",
+        ),
+    };
+    set_generated_intrinsic_marker(ctx, op, marker);
+    op
+}
+
 /// Lowers the legacy `WarpShuffleValue::shuffle(mode, mask, value, b, width)`
 /// trait method directly. Its concrete implementations call a host-only
 /// `warp_shuffle_32` stub, so retaining the implementation body would leave an
@@ -250,7 +300,7 @@ pub fn emit_warp_shuffle_value_trait(
         prev_op,
         loc.clone(),
     )?;
-    let (mut value, next_op) = rvalue::translate_operand(
+    let (value, next_op) = rvalue::translate_operand(
         ctx,
         body,
         &args[2],
@@ -271,51 +321,63 @@ pub fn emit_warp_shuffle_value_trait(
     )?;
     last_op = next_op;
 
-    let physical_ty = if is_f64 {
-        IntegerType::get(ctx, 64, Signedness::Unsigned).to_handle()
-    } else if is_f32 {
-        IntegerType::get(ctx, 32, Signedness::Unsigned).to_handle()
+    let (mut shuffled, mut result_op) = if width == 32 && !is_f64 {
+        let shuffle_op =
+            build_structured_legacy_shuffle(ctx, mode, mask, value, lane_or_delta, is_f32);
+        shuffle_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev_op) = last_op {
+            shuffle_op.insert_after(ctx, prev_op);
+        } else {
+            shuffle_op.insert_at_front(block_ptr, ctx);
+        }
+        (shuffle_op.deref(ctx).get_result(0), shuffle_op)
     } else {
-        value_ty
-    };
-    if is_f32 || is_f64 {
-        let (bits, cast_op) = emit_transmute(ctx, value, physical_ty, block_ptr, last_op, &loc);
-        value = bits;
-        last_op = Some(cast_op);
-    }
+        let physical_ty = if is_f64 {
+            IntegerType::get(ctx, 64, Signedness::Unsigned).to_handle()
+        } else if is_f32 {
+            IntegerType::get(ctx, 32, Signedness::Unsigned).to_handle()
+        } else {
+            value_ty
+        };
+        let (physical_value, inline_prev) = if is_f32 || is_f64 {
+            let (bits, cast_op) = emit_transmute(ctx, value, physical_ty, block_ptr, last_op, &loc);
+            (bits, Some(cast_op))
+        } else {
+            (value, last_op)
+        };
 
-    let template = if is_f64 {
-        format!(
-            "{{ .reg .b32 lo; .reg .b32 hi; mov.b64 {{lo, hi}}, $1; \
-             shfl.sync.{}.b32 lo, lo, $2, {clamp}, $3; \
-             shfl.sync.{}.b32 hi, hi, $2, {clamp}, $3; \
-             mov.b64 $0, {{lo, hi}}; }}",
-            mode.ptx_name(),
-            mode.ptx_name(),
-        )
-    } else {
-        format!("shfl.sync.{}.b32 $0, $1, $2, {clamp}, $3;", mode.ptx_name())
+        let template = if is_f64 {
+            format!(
+                "{{ .reg .b32 lo; .reg .b32 hi; mov.b64 {{lo, hi}}, $1; \
+                 shfl.sync.{}.b32 lo, lo, $2, {clamp}, $3; \
+                 shfl.sync.{}.b32 hi, hi, $2, {clamp}, $3; \
+                 mov.b64 $0, {{lo, hi}}; }}",
+                mode.ptx_name(),
+                mode.ptx_name(),
+            )
+        } else {
+            format!("shfl.sync.{}.b32 $0, $1, $2, {clamp}, $3;", mode.ptx_name())
+        };
+        let constraints = if is_f64 { "=l,l,r,r" } else { "=r,r,r,r" };
+        let shuffle_op = InlinePtxOp::build(
+            ctx,
+            vec![physical_ty],
+            vec![physical_value, lane_or_delta, mask],
+            &template,
+            constraints,
+            false,
+            true,
+        );
+        shuffle_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev_op) = inline_prev {
+            shuffle_op.insert_after(ctx, prev_op);
+        } else {
+            shuffle_op.insert_at_front(block_ptr, ctx);
+        }
+        (shuffle_op.deref(ctx).get_result(0), shuffle_op)
     };
-    let constraints = if is_f64 { "=l,l,r,r" } else { "=r,r,r,r" };
-    let shuffle_op = InlinePtxOp::build(
-        ctx,
-        vec![physical_ty],
-        vec![value, lane_or_delta, mask],
-        &template,
-        constraints,
-        false,
-        true,
-    );
-    shuffle_op.deref_mut(ctx).set_loc(loc.clone());
-    if let Some(prev_op) = last_op {
-        shuffle_op.insert_after(ctx, prev_op);
-    } else {
-        shuffle_op.insert_at_front(block_ptr, ctx);
-    }
-    let mut shuffled = shuffle_op.deref(ctx).get_result(0);
-    let mut result_op = shuffle_op;
 
-    if is_f32 || is_f64 {
+    if shuffled.get_type(ctx) != value_ty {
         let (typed, cast_op) =
             emit_transmute(ctx, shuffled, value_ty, block_ptr, Some(result_op), &loc);
         shuffled = typed;

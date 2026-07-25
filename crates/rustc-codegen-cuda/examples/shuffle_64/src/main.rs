@@ -22,6 +22,8 @@
 //!      own leaders without crossing the member-mask boundary.
 //!   5. `shuffle_value_trait_halfwarp` — the legacy Impulse-compatible trait
 //!      path for `f32`, `f64`, and `u32`, including its width-16 clamp.
+//!   6. `shuffle_value_trait_fullwarp` — the full-width legacy `f32`/`u32`
+//!      path used to verify structured convergent lowering.
 //!
 //! Build and run with:
 //!   cargo oxide run shuffle_64
@@ -166,6 +168,42 @@ mod kernels {
         unsafe {
             *f32_out.get_unchecked_mut(lane as usize) = f32_got;
             *f64_out.get_unchecked_mut(lane as usize) = f64_got;
+            *u32_out.get_unchecked_mut(lane as usize) = u32_got;
+        }
+    }
+
+    /// Full-width legacy trait calls lower through structured shuffle
+    /// intrinsics, preserving convergence information through libNVVM.
+    #[kernel]
+    pub fn shuffle_value_trait_fullwarp(
+        mut f32_out: DisjointSlice<f32>,
+        mut u32_out: DisjointSlice<u32>,
+    ) {
+        let lane = warp::lane_id();
+        let f32_value = (lane as f32) + 0.25;
+        let u32_value = 0xA500_0000 | lane;
+        let f32_got = unsafe {
+            <f32 as warp::WarpShuffleValue>::shuffle(
+                warp::WarpShuffleMode::Xor,
+                u32::MAX,
+                f32_value,
+                1,
+                32,
+            )
+            .0
+        };
+        let u32_got = unsafe {
+            <u32 as warp::WarpShuffleValue>::shuffle(
+                warp::WarpShuffleMode::Xor,
+                u32::MAX,
+                u32_value,
+                1,
+                32,
+            )
+            .0
+        };
+        unsafe {
+            *f32_out.get_unchecked_mut(lane as usize) = f32_got;
             *u32_out.get_unchecked_mut(lane as usize) = u32_got;
         }
     }
