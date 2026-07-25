@@ -142,6 +142,7 @@ fn inline_attr_for_device_function(
 #[derive(Default)]
 struct DeviceInlinePlan<'tcx> {
     array_closures: HashSet<Instance<'tcx>>,
+    borrowed_kernel_closures: HashSet<Instance<'tcx>>,
     considered_array_builders: usize,
     rejected_array_builders: usize,
     conflicting_array_closures: usize,
@@ -203,7 +204,51 @@ fn build_device_inline_plan<'tcx>(
     plan.conflicting_array_closures =
         retain_uncontested_closures(&mut accepted_closures, &rejected_closures);
     plan.array_closures = accepted_closures;
+    plan.borrowed_kernel_closures = functions
+        .iter()
+        .map(|function| function.instance)
+        .filter(|instance| {
+            is_direct_kernel_closure(tcx, *instance)
+                && closure_has_borrowed_capture(*instance)
+        })
+        .collect();
     plan
+}
+
+/// Return whether this is a closure written directly inside a kernel.
+///
+/// A directly nested closure is private to that entry and cannot gain code
+/// reuse across kernels by remaining out of line. Its MIR can be tiny even
+/// when a transitively inlined callee makes the LLVM body exceed heuristic
+/// inline budgets, so source-body size is not a reliable guard here. An
+/// explicit `#[inline(never)]` remains authoritative.
+fn is_direct_kernel_closure(tcx: TyCtxt<'_>, instance: Instance<'_>) -> bool {
+    let def_id = instance.def_id();
+    tcx.def_kind(def_id) == rustc_hir::def::DefKind::Closure
+        && !tcx.is_coroutine(def_id)
+        && tcx
+            .opt_parent(def_id)
+            .is_some_and(|parent| crate::collector::is_kernel_function(tcx, parent))
+        && !matches!(
+            tcx.codegen_fn_attrs(def_id).inline,
+            rustc_hir::attrs::InlineAttr::Never
+        )
+}
+
+/// Return whether a closure carries any capture by Rust reference.
+///
+/// Calling such a closure out of line makes its caller materialize borrowed
+/// SSA values in an addressable frame. This is especially costly at a kernel
+/// boundary, where a large by-value launch aggregate otherwise stays in
+/// parameter space and registers.
+fn closure_has_borrowed_capture(closure: Instance<'_>) -> bool {
+    let captures = closure.args.as_closure().tupled_upvars_ty();
+    let TyKind::Tuple(captures) = captures.kind() else {
+        return false;
+    };
+    captures
+        .iter()
+        .any(|capture| matches!(capture.kind(), TyKind::Ref(..)))
 }
 
 fn retain_uncontested_closures<T: Eq + Hash>(
@@ -1092,22 +1137,42 @@ pub fn generate_device_code<'tcx>(
             .iter()
             .filter(|function| inline_plan.array_closures.contains(&function.instance))
             .count();
+        let matched_borrowed_kernel_closures = functions
+            .iter()
+            .filter(|function| {
+                inline_plan
+                    .borrowed_kernel_closures
+                    .contains(&function.instance)
+            })
+            .count();
         eprintln!(
             "[rustc_codegen_cuda] inline plan: elapsed={inline_plan_elapsed:?} \
              existing_device_always={existing_device_always} \
              considered_array_builders={} rejected_array_builders={} \
              conflicting_array_closures={} array_closures={} \
              matched_array_closures={matched_array_closures} \
-             strategy=callback_only",
+             borrowed_kernel_closures={} \
+             matched_borrowed_kernel_closures={matched_borrowed_kernel_closures} \
+             strategy=bounded_callbacks_and_borrowed_kernel_frames",
             inline_plan.considered_array_builders,
             inline_plan.rejected_array_builders,
             inline_plan.conflicting_array_closures,
-            inline_plan.array_closures.len()
+            inline_plan.array_closures.len(),
+            inline_plan.borrowed_kernel_closures.len()
         );
     }
     let inline_attrs: Vec<mir_importer::InlineAttr> = functions
         .iter()
-        .map(|func| inline_attr_for_device_function(tcx, func.instance))
+        .map(|func| {
+            if inline_plan
+                .borrowed_kernel_closures
+                .contains(&func.instance)
+            {
+                mir_importer::InlineAttr::DeviceAlways
+            } else {
+                inline_attr_for_device_function(tcx, func.instance)
+            }
+        })
         .collect();
     let device_link_always: Vec<bool> = functions
         .iter()
