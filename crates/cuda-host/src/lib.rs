@@ -126,7 +126,7 @@ pub use cuda_async::launch::{AsyncKernelLaunch, AsyncKernelLaunchBuilder, OwnedA
 
 pub use embedded::{
     EmbeddedModuleError, load_all_ptx_bundles_merged, load_embedded_module,
-    load_first_embedded_module,
+    load_embedded_modules_from_current_exe, load_first_embedded_module,
 };
 /// Loads a compiled kernel module by name. It prefers PTX, then
 /// handles NVVM IR (`<name>.ll`) or an existing `<name>.ltoir`, and finally a

@@ -133,6 +133,31 @@ pub fn load_first_embedded_module(
     Err(EmbeddedModuleError::NoModules)
 }
 
+/// Load every embedded artifact bundle with a supported payload from the
+/// current executable.
+///
+/// Each bundle becomes one CUDA module. Cubin and PTX payloads load directly;
+/// NVVM IR and LTOIR payloads are finalized once for the complete bundle
+/// before loading. Unsupported bundles are skipped.
+pub fn load_embedded_modules_from_current_exe(
+    ctx: &Arc<CudaContext>,
+) -> Result<Vec<Arc<CudaModule>>, EmbeddedModuleError> {
+    let mut modules = Vec::new();
+    for bundle in artifact_bundles_from_current_exe()? {
+        match load_bundle(ctx, &bundle) {
+            Ok(module) => modules.push(module),
+            Err(EmbeddedModuleError::UnsupportedPayload { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    if modules.is_empty() {
+        return Err(EmbeddedModuleError::NoModules);
+    }
+
+    Ok(modules)
+}
+
 fn load_bundle(
     ctx: &Arc<CudaContext>,
     bundle: &OwnedArtifactBundle,
