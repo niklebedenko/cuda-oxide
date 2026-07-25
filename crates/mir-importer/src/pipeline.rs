@@ -96,6 +96,9 @@ pub struct CollectedFunction {
     /// the original Rust hint, while NVVM IR additionally receives the
     /// device-link requirement.
     pub device_link_always: bool,
+    /// Request LLVM full-unroll metadata after helper inlining exposes a
+    /// constant array extent.
+    pub deferred_full_unroll: bool,
 }
 
 /// Device artifact format produced by a successful pipeline run.
@@ -302,6 +305,7 @@ pub fn run_pipeline(
             func.is_kernel,
             func.inline_attr,
             func.device_link_always,
+            func.deferred_full_unroll,
             Some(&func.export_name),
             &mut legaliser,
             config.debug_kind,

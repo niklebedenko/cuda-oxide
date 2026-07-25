@@ -114,10 +114,14 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) global_sources: FxHashMap<String, GlobalSourceInfo>,
     /// Next `!N` metadata ID in this module.
     ///
-    /// LLVM has one flat numbered metadata namespace per module. Today this is
-    /// used for NVVM annotations/version nodes; debug-info nodes will use the
-    /// same counter so the exporter never has to guess which IDs are free.
+    /// LLVM has one flat numbered metadata namespace per module. Loop,
+    /// NVVM, and debug nodes share this counter so the exporter never has to
+    /// guess which IDs are free.
     next_metadata_id: usize,
+    /// Self-referential loop nodes and their full-unroll hint nodes.
+    pub(super) full_unroll_loop_nodes: Vec<(usize, usize)>,
+    /// Stable MIR loop marker to the one LLVM loop identity shared by all latches.
+    full_unroll_loop_ids: FxHashMap<String, usize>,
     /// Which debug metadata tier this export should emit.
     pub(super) debug_kind: DebugKind,
     /// NVVM textual dialect, or `None` for the ordinary PTX/llc path.
@@ -186,6 +190,8 @@ impl<'a> ModuleExportState<'a> {
             global_symbols: FxHashMap::default(),
             global_sources: FxHashMap::default(),
             next_metadata_id: 0,
+            full_unroll_loop_nodes: Vec::new(),
+            full_unroll_loop_ids: FxHashMap::default(),
             debug_kind,
             nvvm_ir_dialect,
             debug_compile_unit: None,
@@ -227,6 +233,18 @@ impl<'a> ModuleExportState<'a> {
         let id = self.next_metadata_id;
         self.next_metadata_id += 1;
         id
+    }
+
+    pub(super) fn full_unroll_loop_metadata(&mut self, marker: &str) -> usize {
+        if let Some(&loop_id) = self.full_unroll_loop_ids.get(marker) {
+            return loop_id;
+        }
+        let loop_id = self.alloc_metadata_id();
+        let hint_id = self.alloc_metadata_id();
+        self.full_unroll_loop_nodes.push((loop_id, hint_id));
+        self.full_unroll_loop_ids
+            .insert(marker.to_string(), loop_id);
+        loop_id
     }
 
     #[cfg(test)]

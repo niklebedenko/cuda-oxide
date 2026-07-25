@@ -31,7 +31,10 @@ use super::{
     ExportedModule,
     config::{DebugKind, ExportBackendConfig, NvvmIrDialect},
     externs::{DeviceExternDecl, DeviceExternType},
-    metadata::{emit_nvvm_annotations, emit_nvvmir_version, needs_nvvm_annotations},
+    metadata::{
+        emit_full_unroll_loop_metadata, emit_nvvm_annotations, emit_nvvmir_version,
+        needs_nvvm_annotations,
+    },
     state::{GlobalSourceInfo, GlobalSymbolInfo, ModuleExportState},
 };
 
@@ -555,6 +558,11 @@ pub(super) fn export_module_with_externs_impl(
         writeln!(&mut output, "attributes #0 = {{ convergent }}").unwrap();
     }
 
+    if !state.full_unroll_loop_nodes.is_empty() {
+        writeln!(&mut output).unwrap();
+        emit_full_unroll_loop_metadata(&mut output, &state);
+    }
+
     // 7. nvvm.annotations metadata
     if needs_nvvm_annotations(&state, emit_all_annotations) {
         writeln!(&mut output).unwrap();
@@ -696,6 +704,11 @@ pub(super) fn export_module_to_string_with_config(
     if state.convergent_used {
         writeln!(&mut output).unwrap();
         writeln!(&mut output, "attributes #0 = {{ convergent }}").unwrap();
+    }
+
+    if !state.full_unroll_loop_nodes.is_empty() {
+        writeln!(&mut output).unwrap();
+        emit_full_unroll_loop_metadata(&mut output, &state);
     }
 
     // Emit nvvm.annotations metadata

@@ -149,6 +149,7 @@ pub fn translate_function(
         is_kernel,
         crate::pipeline::InlineAttr::None,
         false,
+        false,
         None,
         legaliser,
         DebugKind::Off,

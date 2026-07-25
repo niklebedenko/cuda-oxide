@@ -10,6 +10,13 @@ use std::fmt::Write;
 
 use super::state::{KernelBlockGeometry, ModuleExportState};
 
+pub(super) fn emit_full_unroll_loop_metadata(output: &mut String, state: &ModuleExportState<'_>) {
+    for &(loop_id, hint_id) in &state.full_unroll_loop_nodes {
+        writeln!(output, "!{loop_id} = distinct !{{!{loop_id}, !{hint_id}}}").unwrap();
+        writeln!(output, "!{hint_id} = !{{!\"llvm.loop.unroll.full\"}}").unwrap();
+    }
+}
+
 pub(super) fn needs_nvvm_annotations(
     state: &ModuleExportState,
     emit_all_annotations: bool,

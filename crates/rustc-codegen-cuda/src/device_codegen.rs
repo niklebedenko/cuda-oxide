@@ -143,9 +143,11 @@ fn inline_attr_for_device_function(
 struct DeviceInlinePlan<'tcx> {
     array_closures: HashSet<Instance<'tcx>>,
     borrowed_kernel_closures: HashSet<Instance<'tcx>>,
+    deferred_full_unroll_helpers: HashSet<Instance<'tcx>>,
     considered_array_builders: usize,
     rejected_array_builders: usize,
     conflicting_array_closures: usize,
+    conflicting_deferred_unroll_closures: usize,
 }
 
 // These are compile-resource guards rather than semantic limits. Mandatory
@@ -156,6 +158,10 @@ const MAX_DEVICE_LINK_INLINE_STATEMENTS: usize = 128;
 const MAX_DEVICE_LINK_CLOSURE_CAPTURE_BYTES: u64 = 256;
 const MAX_DEVICE_LINK_ARRAY_EXTENT: usize = 128;
 const MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES: u64 = 32 * 1024;
+// Full unrolling may duplicate the transitive always-inline callback body.
+// Eight copies is the accepted bounded code-growth policy for this targeted
+// array-builder optimization.
+const MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT: usize = 8;
 
 fn build_device_inline_plan<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -165,6 +171,8 @@ fn build_device_inline_plan<'tcx>(
     let mut plan = DeviceInlinePlan::default();
     let mut accepted_closures = HashSet::new();
     let mut rejected_closures = HashSet::new();
+    let mut accepted_deferred_unroll_closures = HashSet::new();
+    let mut rejected_deferred_unroll_closures = HashSet::new();
     for function in functions {
         let instance = function.instance;
         let def_id = instance.def_id();
@@ -178,6 +186,8 @@ fn build_device_inline_plan<'tcx>(
         plan.considered_array_builders += 1;
         let closures = closure_instances_in_args(tcx, instance);
         if closures.len() != 1 {
+            rejected_closures.extend(closures.iter().copied());
+            rejected_deferred_unroll_closures.extend(closures.iter().copied());
             plan.rejected_array_builders += 1;
             if trace_plan {
                 trace_array_inline_seed(tcx, instance, &path, &closures, false);
@@ -200,16 +210,43 @@ fn build_device_inline_plan<'tcx>(
             rejected_closures.insert(closure);
             plan.rejected_array_builders += 1;
         }
+        if accepted
+            && array_extents_within_limit(tcx, instance, MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT)
+        {
+            accepted_deferred_unroll_closures.insert(closure);
+        } else {
+            rejected_deferred_unroll_closures.insert(closure);
+        }
     }
     plan.conflicting_array_closures =
         retain_uncontested_closures(&mut accepted_closures, &rejected_closures);
+    plan.conflicting_deferred_unroll_closures = retain_uncontested_closures(
+        &mut accepted_deferred_unroll_closures,
+        &rejected_deferred_unroll_closures,
+    );
     plan.array_closures = accepted_closures;
+    plan.deferred_full_unroll_helpers = functions
+        .iter()
+        .map(|function| function.instance)
+        .filter(|instance| {
+            let def_id = instance.def_id();
+            if !is_core_def(tcx, def_id)
+                || !is_erased_array_builder_helper_path(&tcx.def_path_str(def_id))
+            {
+                return false;
+            }
+            let closures = closure_instances_anywhere_in_args(tcx, *instance);
+            closures.len() == 1
+                && closures
+                    .iter()
+                    .all(|closure| accepted_deferred_unroll_closures.contains(closure))
+        })
+        .collect();
     plan.borrowed_kernel_closures = functions
         .iter()
         .map(|function| function.instance)
         .filter(|instance| {
-            is_direct_kernel_closure(tcx, *instance)
-                && closure_has_borrowed_capture(*instance)
+            is_direct_kernel_closure(tcx, *instance) && closure_has_borrowed_capture(*instance)
         })
         .collect();
     plan
@@ -316,8 +353,8 @@ fn closure_instances_in_args<'tcx>(
 
 fn array_callable_type<'a, T>(path: &str, generic_types: &'a [T]) -> Option<&'a T> {
     // Both concrete builders carry their callable F as the final type
-    // parameter. `try_from_fn` may wrap F in core's `Wrapped` adapter;
-    // `closure_instance_in_callable_type` unwraps that adapter.
+    // parameter. The recursive type walk below finds callbacks nested in
+    // core's `Wrapped` and array-drain adapters.
     is_concrete_array_builder_path(path)
         .then(|| generic_types.last())
         .flatten()
@@ -325,46 +362,63 @@ fn array_callable_type<'a, T>(path: &str, generic_types: &'a [T]) -> Option<&'a 
 
 fn closure_instances_in_type<'tcx>(tcx: TyCtxt<'tcx>, root: Ty<'tcx>) -> HashSet<Instance<'tcx>> {
     let mut closures = HashSet::new();
-    if let Some(closure) = closure_instance_in_callable_type(tcx, root) {
-        closures.insert(closure);
-    }
+    collect_closure_instances_in_type(tcx, root, &mut closures);
     closures
 }
 
-fn closure_instance_in_callable_type<'tcx>(
+fn collect_closure_instances_in_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     callable: Ty<'tcx>,
-) -> Option<Instance<'tcx>> {
-    let closure = match callable.kind() {
-        TyKind::Closure(closure_def_id, closure_args) => Instance::try_resolve(
-            tcx,
-            TypingEnv::fully_monomorphized(),
-            *closure_def_id,
-            closure_args,
-        )
-        .ok()
-        .flatten()?,
+    closures: &mut HashSet<Instance<'tcx>>,
+) {
+    match callable.kind() {
+        TyKind::Closure(closure_def_id, closure_args) => {
+            if let Some(closure) = Instance::try_resolve(
+                tcx,
+                TypingEnv::fully_monomorphized(),
+                *closure_def_id,
+                closure_args,
+            )
+            .ok()
+            .flatten()
+            .filter(|closure| tcx.is_mir_available(closure.def_id()))
+            {
+                closures.insert(closure);
+            }
+        }
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
-            return closure_instance_in_callable_type(tcx, *pointee);
+            collect_closure_instances_in_type(tcx, *pointee, closures);
         }
-        TyKind::Adt(definition, arguments) if is_core_wrapped_type(tcx, definition.did()) => {
-            let callable = arguments
-                .iter()
-                .filter_map(|argument| argument.as_type())
-                .next_back()?;
-            return closure_instance_in_callable_type(tcx, callable);
+        TyKind::Array(element, _) | TyKind::Slice(element) => {
+            collect_closure_instances_in_type(tcx, *element, closures);
         }
-        _ => return None,
-    };
-
-    tcx.is_mir_available(closure.def_id()).then_some(closure)
+        TyKind::Tuple(elements) => {
+            for element in elements.iter() {
+                collect_closure_instances_in_type(tcx, element, closures);
+            }
+        }
+        TyKind::Adt(_, arguments) => {
+            for nested in arguments.iter().filter_map(|argument| argument.as_type()) {
+                collect_closure_instances_in_type(tcx, nested, closures);
+            }
+        }
+        _ => {}
+    }
 }
 
-fn is_core_wrapped_type(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
-    is_core_def(tcx, def_id)
-        && tcx
-            .def_path_str(def_id)
-            .ends_with("::ops::try_trait::Wrapped")
+fn closure_instances_anywhere_in_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> HashSet<Instance<'tcx>> {
+    let mut closures = HashSet::new();
+    for ty in instance
+        .args
+        .iter()
+        .filter_map(|argument| argument.as_type())
+    {
+        collect_closure_instances_in_type(tcx, ty, &mut closures);
+    }
+    closures
 }
 
 fn is_core_def(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
@@ -374,6 +428,14 @@ fn is_core_def(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
 }
 
 fn array_extents_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    array_extents_within_limit(tcx, instance, MAX_DEVICE_LINK_ARRAY_EXTENT)
+}
+
+fn array_extents_within_limit<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    max_extent: usize,
+) -> bool {
     let mut saw_concrete_extent = false;
     for arg in instance.args.iter() {
         let Some(value) = arg.as_const() else {
@@ -383,7 +445,7 @@ fn array_extents_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>
             return false;
         };
         saw_concrete_extent = true;
-        if !array_extent_within_budget(extent) {
+        if !array_extent_within_limit(extent, max_extent) {
             return false;
         }
     }
@@ -413,6 +475,10 @@ fn array_extent_within_budget(extent: u64) -> bool {
     extent <= MAX_DEVICE_LINK_ARRAY_EXTENT as u64
 }
 
+fn array_extent_within_limit(extent: u64, max_extent: usize) -> bool {
+    extent <= max_extent as u64
+}
+
 fn is_bounded_inline_body(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
     let body = tcx.optimized_mir(def_id);
     let statement_count = body
@@ -437,11 +503,19 @@ fn is_concrete_array_builder_path(path: &str) -> bool {
     )
 }
 
+fn is_erased_array_builder_helper_path(path: &str) -> bool {
+    matches!(
+        path,
+        "core::array::try_from_fn_erased" | "std::array::try_from_fn_erased"
+    )
+}
+
 #[cfg(test)]
 mod inline_plan_tests {
     use super::{
-        array_callable_type, array_extent_within_budget, array_output_size_within_budget,
-        inline_body_within_budget, is_concrete_array_builder_path, retain_uncontested_closures,
+        array_callable_type, array_extent_within_budget, array_extent_within_limit,
+        array_output_size_within_budget, inline_body_within_budget, is_concrete_array_builder_path,
+        is_erased_array_builder_helper_path, retain_uncontested_closures,
     };
     use std::collections::HashSet;
 
@@ -476,6 +550,23 @@ mod inline_plan_tests {
     }
 
     #[test]
+    fn recognizes_only_the_erased_core_array_builder_helper() {
+        for path in [
+            "core::array::try_from_fn_erased",
+            "std::array::try_from_fn_erased",
+        ] {
+            assert!(is_erased_array_builder_helper_path(path));
+        }
+        for path in [
+            "core::array::try_from_fn",
+            "core::array::from_fn",
+            "user_crate::array::try_from_fn_erased",
+        ] {
+            assert!(!is_erased_array_builder_helper_path(path));
+        }
+    }
+
+    #[test]
     fn enforces_both_inline_body_limits() {
         assert!(inline_body_within_budget(24, 128));
         assert!(!inline_body_within_budget(25, 128));
@@ -488,6 +579,8 @@ mod inline_plan_tests {
         assert!(array_extent_within_budget(128));
         assert!(!array_extent_within_budget(129));
         assert!(!array_extent_within_budget(u64::MAX));
+        assert!(array_extent_within_limit(8, 8));
+        assert!(!array_extent_within_limit(9, 8));
         assert!(array_output_size_within_budget(32 * 1024));
         assert!(!array_output_size_within_budget(32 * 1024 + 1));
         assert!(!array_output_size_within_budget(64 * 1024));
@@ -1145,19 +1238,32 @@ pub fn generate_device_code<'tcx>(
                     .contains(&function.instance)
             })
             .count();
+        let matched_deferred_full_unroll_helpers = functions
+            .iter()
+            .filter(|function| {
+                inline_plan
+                    .deferred_full_unroll_helpers
+                    .contains(&function.instance)
+            })
+            .count();
         eprintln!(
             "[rustc_codegen_cuda] inline plan: elapsed={inline_plan_elapsed:?} \
              existing_device_always={existing_device_always} \
              considered_array_builders={} rejected_array_builders={} \
              conflicting_array_closures={} array_closures={} \
              matched_array_closures={matched_array_closures} \
+             conflicting_deferred_unroll_closures={} \
+             deferred_full_unroll_helpers={} \
+             matched_deferred_full_unroll_helpers={matched_deferred_full_unroll_helpers} \
              borrowed_kernel_closures={} \
              matched_borrowed_kernel_closures={matched_borrowed_kernel_closures} \
-             strategy=bounded_callbacks_and_borrowed_kernel_frames",
+             strategy=bounded_callbacks_deferred_array_unroll_and_borrowed_kernel_frames",
             inline_plan.considered_array_builders,
             inline_plan.rejected_array_builders,
             inline_plan.conflicting_array_closures,
             inline_plan.array_closures.len(),
+            inline_plan.conflicting_deferred_unroll_closures,
+            inline_plan.deferred_full_unroll_helpers.len(),
             inline_plan.borrowed_kernel_closures.len()
         );
     }
@@ -1177,6 +1283,14 @@ pub fn generate_device_code<'tcx>(
     let device_link_always: Vec<bool> = functions
         .iter()
         .map(|func| inline_plan.array_closures.contains(&func.instance))
+        .collect();
+    let deferred_full_unroll: Vec<bool> = functions
+        .iter()
+        .map(|func| {
+            inline_plan
+                .deferred_full_unroll_helpers
+                .contains(&func.instance)
+        })
         .collect();
     let device_mono_reachability: Vec<crate::collector::DeviceMonoReachability> = functions
         .iter()
@@ -1200,12 +1314,16 @@ pub fn generate_device_code<'tcx>(
             .zip(debug_scope_maps.iter())
             .zip(inline_attrs.iter())
             .zip(device_link_always.iter())
+            .zip(deferred_full_unroll.iter())
             .zip(device_mono_reachability.iter())
             .filter_map(
                 |(
                     (
-                        (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
-                        device_link_always,
+                        (
+                            (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
+                            device_link_always,
+                        ),
+                        deferred_full_unroll,
                     ),
                     reachability,
                 )| {
@@ -1233,6 +1351,7 @@ pub fn generate_device_code<'tcx>(
                         debug_source_scopes: Some(debug_source_scopes.clone()),
                         inline_attr: *inline_attr,
                         device_link_always: *device_link_always,
+                        deferred_full_unroll: *deferred_full_unroll,
                     })
                 },
             )

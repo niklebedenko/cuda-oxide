@@ -993,6 +993,7 @@ fn emit_entry_allocas(
 /// * `is_kernel` - Add `gpu_kernel` attribute for kernel entry points
 /// * `inline_attr` - Preserve Rust inline intent on non-kernel functions
 /// * `device_link_always` - Add orthogonal NVVM-link mandatory-inline intent
+/// * `deferred_full_unroll` - Preserve bounded deferred loop-unroll intent
 /// * `override_name` - Custom export name (defaults to instance name)
 pub fn translate_body(
     ctx: &mut Context,
@@ -1003,6 +1004,7 @@ pub fn translate_body(
     is_kernel: bool,
     inline_attr: crate::pipeline::InlineAttr,
     device_link_always: bool,
+    deferred_full_unroll: bool,
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
     debug_kind: DebugKind,
@@ -1348,6 +1350,15 @@ pub fn translate_body(
         inline_attr,
         device_link_always,
     );
+    if deferred_full_unroll {
+        let key: Identifier = dialect_mir::DEFERRED_FULL_UNROLL_FUNC_ATTR
+            .try_into()
+            .unwrap();
+        mir_func_op.get_operation().deref_mut(ctx).attributes.set(
+            key,
+            pliron::builtin::attributes::StringAttr::new("true".to_string()),
+        );
+    }
 
     // Get the function body region (region 0)
     let region_ptr = op_ptr.deref(ctx).get_region(0);

@@ -25,6 +25,7 @@
 
 use llvm_export::ops as llvm;
 use pliron::basic_block::BasicBlock;
+use pliron::builtin::attributes::StringAttr;
 use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -34,6 +35,19 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
 use pliron::r#type::Typed;
+
+fn propagate_loop_unroll_attr(ctx: &mut Context, source: Ptr<Operation>, target: Ptr<Operation>) {
+    let key: pliron::identifier::Identifier =
+        dialect_mir::LOOP_UNROLL_FULL_ATTR.try_into().unwrap();
+    let attribute = source
+        .deref(ctx)
+        .attributes
+        .get::<StringAttr>(&key)
+        .cloned();
+    if let Some(attribute) = attribute {
+        target.deref_mut(ctx).attributes.set(key, attribute);
+    }
+}
 
 /// Convert `mir.return` to `llvm.return`.
 ///
@@ -130,6 +144,7 @@ pub(crate) fn convert_cond_branch(
     let false_args = operands[1 + num_true_args..].to_vec();
 
     let llvm_br = llvm::CondBrOp::new(ctx, cond, true_block, true_args, false_block, false_args);
+    propagate_loop_unroll_attr(ctx, op, llvm_br.get_operation());
     rewriter.insert_operation(ctx, llvm_br.get_operation());
     rewriter.erase_operation(ctx, op);
 
@@ -188,6 +203,7 @@ pub(crate) fn convert_assert(
         .insert_at_back(abort_block, ctx);
 
     let llvm_br = llvm::CondBrOp::new(ctx, cond, success_block, args.to_vec(), abort_block, vec![]);
+    propagate_loop_unroll_attr(ctx, op, llvm_br.get_operation());
     rewriter.insert_operation(ctx, llvm_br.get_operation());
     rewriter.erase_operation(ctx, op);
 
@@ -251,6 +267,7 @@ pub(crate) fn convert_goto(
     }
 
     let llvm_br = llvm::BrOp::new(ctx, dest, final_args);
+    propagate_loop_unroll_attr(ctx, op, llvm_br.get_operation());
     rewriter.insert_operation(ctx, llvm_br.get_operation());
     rewriter.erase_operation(ctx, op);
 

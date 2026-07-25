@@ -427,6 +427,52 @@ fn exporter_rejects_extra_predecessor_values_before_emitting_phis() {
 }
 
 #[test]
+fn loop_latches_reuse_self_referential_full_unroll_metadata() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "loop_unroll_metadata".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "loop_forever".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let region = func.get_operation().deref(&ctx).get_region(0);
+    let first_loop_block = BasicBlock::new(&mut ctx, None, vec![]);
+    first_loop_block.insert_at_back(region, &ctx);
+    let second_loop_block = BasicBlock::new(&mut ctx, None, vec![]);
+    second_loop_block.insert_at_back(region, &ctx);
+
+    BrOp::new(&mut ctx, first_loop_block, vec![])
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    let key: Identifier = "loop_unroll_full".try_into().unwrap();
+    let first_latch = BrOp::new(&mut ctx, second_loop_block, vec![]);
+    first_latch
+        .get_operation()
+        .deref_mut(&mut ctx)
+        .attributes
+        .set(key.clone(), StringAttr::new("loop_0".into()));
+    first_latch
+        .get_operation()
+        .insert_at_back(first_loop_block, &ctx);
+    let second_latch = BrOp::new(&mut ctx, first_loop_block, vec![]);
+    second_latch
+        .get_operation()
+        .deref_mut(&mut ctx)
+        .attributes
+        .set(key, StringAttr::new("loop_0".into()));
+    second_latch
+        .get_operation()
+        .insert_at_back(second_loop_block, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("loop metadata export succeeds");
+    assert_eq!(ir.matches("!llvm.loop !0").count(), 2, "{ir}");
+    assert!(ir.contains("!0 = distinct !{!0, !1}"), "{ir}");
+    assert_eq!(ir.matches("distinct !{!0, !1}").count(), 1, "{ir}");
+    assert!(ir.contains("!1 = !{!\"llvm.loop.unroll.full\"}"), "{ir}");
+}
+
+#[test]
 fn exporter_rejects_distinct_values_on_duplicate_conditional_edges() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "duplicate_conditional_edge".try_into().unwrap());

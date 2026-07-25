@@ -581,7 +581,7 @@ impl<'a> ModuleExportState<'a> {
     }
 
     fn emit_br(
-        &self,
+        &mut self,
         op: &ops::BrOp,
         block_labels: &FxHashMap<Ptr<BasicBlock>, String>,
         output: &mut String,
@@ -589,7 +589,9 @@ impl<'a> ModuleExportState<'a> {
         let op_ref = op.get_operation().deref(self.ctx);
         let dest = op_ref.successors().next().unwrap();
         let label = block_labels.get(&dest).ok_or("Missing block label")?;
-        writeln!(output, "  br label %{label}").unwrap();
+        write!(output, "  br label %{label}").unwrap();
+        self.emit_loop_unroll_metadata_attachment(op.get_operation(), output);
+        writeln!(output).unwrap();
         Ok(())
     }
 
@@ -610,8 +612,28 @@ impl<'a> ModuleExportState<'a> {
 
         write!(output, "  br i1 ").unwrap();
         self.export_value(cond, value_names, output)?;
-        writeln!(output, ", label %{true_label}, label %{false_label}").unwrap();
+        write!(output, ", label %{true_label}, label %{false_label}").unwrap();
+        self.emit_loop_unroll_metadata_attachment(op.get_operation(), output);
+        writeln!(output).unwrap();
         Ok(())
+    }
+
+    fn emit_loop_unroll_metadata_attachment(
+        &mut self,
+        operation: Ptr<Operation>,
+        output: &mut String,
+    ) {
+        let key: pliron::identifier::Identifier =
+            "loop_unroll_full".try_into().expect("valid attribute key");
+        let marker = operation
+            .deref(self.ctx)
+            .attributes
+            .get::<StringAttr>(&key)
+            .map(|attribute| String::from((*attribute).clone()));
+        if let Some(marker) = marker {
+            let metadata_id = self.full_unroll_loop_metadata(&marker);
+            write!(output, ", !llvm.loop !{metadata_id}").unwrap();
+        }
     }
 
     fn emit_load(
