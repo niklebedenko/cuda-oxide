@@ -24,6 +24,8 @@ const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
 const LEGACY_CODEGEN_FINGERPRINT_CFG: &str = "cuda_oxide_internal_codegen_env";
 const LEGACY_MATERIALIZER_PROVENANCE_CFG: &str = "cuda_oxide_internal_materializer_provenance";
 const CODEGEN_ACTIVE_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_ACTIVE";
+const BACKEND_ENV: &str = "CUDA_OXIDE_BACKEND";
+const LOADED_KERNEL_MANIFEST_ENV: &str = "CUDA_OXIDE_LOADED_KERNEL_MANIFEST";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MaterializationMode {
@@ -2773,6 +2775,17 @@ fn passthrough_codegen_fingerprint(
     )
 }
 
+fn affects_scoped_codegen_fingerprint(key: &str) -> bool {
+    // The resolved backend path and binary digest are already part of the
+    // global rustflags identity. The loaded-kernel manifest is a runtime trace
+    // destination and cannot affect generated device code.
+    key.starts_with("CUDA_OXIDE_")
+        && !matches!(
+            key,
+            CODEGEN_FINGERPRINT_ENV | BACKEND_ENV | LOADED_KERNEL_MANIFEST_ENV
+        )
+}
+
 fn passthrough_codegen_fingerprint_with_env(
     ctx: &Context,
     opts: &CargoPassthroughOptions<'_>,
@@ -2787,7 +2800,7 @@ fn passthrough_codegen_fingerprint_with_env(
     // parent override rule as `apply_config_env` so changes that can affect
     // codegen also change Cargo's rustflags fingerprint.
     for (key, configured_value) in &ctx.config.env {
-        if !key.starts_with("CUDA_OXIDE_") {
+        if !affects_scoped_codegen_fingerprint(key) {
             continue;
         }
         if let Some(value) = inherited_env.get(key) {
@@ -2799,11 +2812,12 @@ fn passthrough_codegen_fingerprint_with_env(
             effective_env.insert(key.clone(), configured_value.as_bytes().to_vec());
         }
     }
-    // Capture backend settings inherited outside project config, including
+    // Capture codegen settings inherited outside project config, including
     // current and future CUDA_OXIDE_* switches.
-    for (key, value) in inherited_env.iter().filter(|(key, _)| {
-        key.starts_with("CUDA_OXIDE_") && key.as_str() != CODEGEN_FINGERPRINT_ENV
-    }) {
+    for (key, value) in inherited_env
+        .iter()
+        .filter(|(key, _)| affects_scoped_codegen_fingerprint(key))
+    {
         effective_env.insert(key.clone(), value.clone());
     }
 
@@ -8503,6 +8517,59 @@ device-owner = { path = "../device-owner" }
 
         assert_ne!(fingerprint(&absent), fingerprint(&first));
         assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[test]
+    fn passthrough_fingerprint_ignores_backend_selector_and_runtime_manifest() {
+        let ctx = test_context(OxideConfig::default());
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            materialize_cubin: false,
+        };
+        let fingerprint = |ctx: &Context, inherited_env: &BTreeMap<String, Vec<u8>>| {
+            passthrough_codegen_fingerprint_with_env(
+                ctx,
+                &opts,
+                None,
+                Some("sm_80"),
+                &MaterializationMode::default(),
+                inherited_env,
+            )
+        };
+        let base = BTreeMap::new();
+        let inherited = BTreeMap::from([
+            (
+                BACKEND_ENV.to_string(),
+                b"/resolved/by-the-same-context/backend.so".to_vec(),
+            ),
+            (
+                LOADED_KERNEL_MANIFEST_ENV.to_string(),
+                b"/tmp/runtime-only-kernels.jsonl".to_vec(),
+            ),
+        ]);
+        let configured = test_context(OxideConfig {
+            env: vec![
+                (
+                    BACKEND_ENV.to_string(),
+                    "/resolved/by-the-same-context/backend.so".to_string(),
+                ),
+                (
+                    LOADED_KERNEL_MANIFEST_ENV.to_string(),
+                    "/tmp/runtime-only-kernels.jsonl".to_string(),
+                ),
+            ],
+            ..OxideConfig::default()
+        });
+
+        assert_eq!(fingerprint(&ctx, &base), fingerprint(&ctx, &inherited));
+        assert_eq!(fingerprint(&ctx, &base), fingerprint(&configured, &base));
     }
 
     #[test]
