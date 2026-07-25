@@ -115,11 +115,13 @@ rechecks them inside the backend; use the wrapper flag instead of setting
 `CUDA_OXIDE_MATERIALIZE_CUBIN` around raw Cargo. That variable is an internal
 wrapper/backend signal, not a supported user interface: raw Cargo may reuse a
 previous artifact without running the backend, and a backend invocation without
-the wrapper's fingerprint is rejected. Generic `#[cuda_module]`
-kernels, `#[device] extern` declarations, and metadata-interop examples are
-rejected because their run-time multi-artifact linking is not yet represented
-by this single-cubin path. Materialization is also a final-output mode, so it
-cannot be combined with `--emit-nvvm-ir` or `emit-ltoir`.
+the wrapper's fingerprint is rejected. Generic `#[cuda_module]` kernels are
+materialized independently in each owning crate and resolved across the
+executable's embedded module set. `#[device] extern` declarations and
+metadata-interop examples are rejected because their ordered external link
+inputs are not yet represented by this path. Materialization is also a
+final-output mode, so it cannot be combined with `--emit-nvvm-ir` or
+`emit-ltoir`.
 
 ## Commands
 

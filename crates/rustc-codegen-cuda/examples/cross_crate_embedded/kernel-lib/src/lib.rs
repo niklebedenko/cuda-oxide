@@ -5,12 +5,10 @@
 
 //! Library crate for the cross_crate_embedded regression test (issue #222).
 //!
-//! The generic kernel here is the key: because `scale<T>` is generic,
-//! `#[cuda_module]` generates `load_all_ptx_bundles_merged` instead of
-//! `load_embedded_module`. Without that, the monomorphized PTX (e.g.
-//! `scale::<f32>`) would only be present in the binary crate's artifact
-//! bundle, not in this library's bundle, causing a "named symbol not found"
-//! panic at runtime.
+//! The generic kernel here is the key: `#[cuda_module]` loads every embedded
+//! CUDA artifact and resolves each concrete specialization across the resulting
+//! module set. A specialization may be owned by the binary crate rather than
+//! this library's artifact.
 
 use core::ops::Mul;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};

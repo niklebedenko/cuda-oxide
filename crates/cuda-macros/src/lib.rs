@@ -203,7 +203,7 @@ use reserved_oxide_symbols::{
     CODEGEN_FINGERPRINT_ENV, DEVICE_CODEGEN_CRATE_ENV, DEVICE_EXTERN_PREFIX, DEVICE_PREFIX,
     INSTANTIATE_PREFIX, KERNEL_PREFIX, KERNEL_SCOPE_LOCAL, MATERIALIZE_CUBIN_ENV,
     MATERIALIZER_PROVENANCE_ENV, RESERVED_ROOT, artifact_anchor_symbol, artifact_anchor_symbol_v2,
-    constant_symbol, ptx_merge_required_marker,
+    constant_symbol,
 };
 use syn::{
     Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, ForeignItem, GenericArgument, GenericParam,
@@ -972,23 +972,6 @@ fn expand_cuda_module_inner_with_artifact_anchor(
         Ok,
     )?;
     let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
-    let ptx_merge_required_markers = transformed.kernels.iter().filter_map(|kernel| {
-        if !kernel.is_generic {
-            return None;
-        }
-        let marker = internal_ident(&ptx_merge_required_marker(&kernel.fn_name.to_string()));
-        let cfg_attrs = &kernel.effective_cfg_attrs;
-        Some(quote! {
-            #(#cfg_attrs)*
-            // Consumed by the codegen collector. This enabled generic kernel
-            // requires run-time PTX bundle merging, which ahead-of-time cubin
-            // materialization cannot represent yet.
-            #[doc(hidden)]
-            #[used]
-            #[allow(dead_code, non_upper_case_globals)]
-            static #marker: u8 = 0;
-        })
-    });
     let enable_generic_loader_statements = transformed.kernels.iter().filter_map(|kernel| {
         if !kernel.is_generic {
             return None;
@@ -1007,22 +990,21 @@ fn expand_cuda_module_inner_with_artifact_anchor(
         .any(|kernel| kernel.launch_contract.is_some());
     let module_loader = if has_generic {
         // A syntactically present generic kernel may be removed by cfg. Make
-        // the loader decision under the exact same effective cfg chain as its
-        // marker, so eligibility and run-time behavior cannot disagree.
+        // the loader decision under the exact same effective cfg chain.
         quote! {
             #[allow(unused_mut)]
             let mut __cuda_oxide_has_enabled_generic_kernel = false;
             #(#enable_generic_loader_statements)*
-            let module = if __cuda_oxide_has_enabled_generic_kernel {
-                let _ = name; // merged load ignores the crate-name hint
-                ::cuda_host::load_all_ptx_bundles_merged(ctx)?
+            let modules = if __cuda_oxide_has_enabled_generic_kernel {
+                let _ = name; // multi-artifact load ignores the crate-name hint
+                ::cuda_host::load_embedded_modules_from_current_exe(ctx)?
             } else {
-                ::cuda_host::load_embedded_module(ctx, name)?
+                ::std::vec![::cuda_host::load_embedded_module(ctx, name)?]
             };
         }
     } else {
         quote! {
-            let module = ::cuda_host::load_embedded_module(ctx, name)?;
+            let modules = ::std::vec![::cuda_host::load_embedded_module(ctx, name)?];
         }
     };
     let constant_fields = constants.iter().map(generate_cuda_module_constant_field);
@@ -1053,7 +1035,7 @@ fn expand_cuda_module_inner_with_artifact_anchor(
             /// For a non-generic module, the selected package bundle must be
             /// the artifact compiled from this `cuda_module`; package names are
             /// not yet unique across all library and binary targets. For a
-            /// generic module, the merged PTX set must contain each matching
+            /// generic module, the embedded artifact set must contain each matching
             /// specialization and no conflicting entry definition.
             pub unsafe fn load_async(
                 device_id: usize,
@@ -1106,7 +1088,7 @@ fn expand_cuda_module_inner_with_artifact_anchor(
             /// For a non-generic module, the selected package bundle must be
             /// the artifact compiled from this `cuda_module`; package names are
             /// not yet unique across all library and binary targets. For a
-            /// generic module, the merged PTX set must contain each matching
+            /// generic module, the embedded artifact set must contain each matching
             /// specialization and no conflicting entry definition.
             pub unsafe fn load(
                 ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
@@ -1139,7 +1121,7 @@ fn expand_cuda_module_inner_with_artifact_anchor(
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
                 #module_loader
                 // SAFETY: upheld by this function's caller.
-                unsafe { from_module(module) }.map_err(::cuda_host::EmbeddedModuleError::Driver)
+                unsafe { from_modules(modules) }.map_err(::cuda_host::EmbeddedModuleError::Driver)
             }
         }
     } else {
@@ -1149,7 +1131,7 @@ fn expand_cuda_module_inner_with_artifact_anchor(
                 name: &str,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
                 #module_loader
-                from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
+                from_modules(modules).map_err(::cuda_host::EmbeddedModuleError::Driver)
             }
         }
     };
@@ -1228,9 +1210,9 @@ fn expand_cuda_module_inner_with_artifact_anchor(
     };
 
     // Everything below names `::cuda_host` or `::cuda_core`. The kernels
-    // themselves, and the PTX-merge markers the codegen collector consumes, do
-    // not -- so a crate that only compiles kernels can take cuda-macros with
-    // `default-features = false` and stop depending on the host stack.
+    // themselves do not -- so a crate that only compiles kernels can take
+    // cuda-macros with `default-features = false` and stop depending on the
+    // host stack.
     let host_items = if emit_host {
         quote! {
             #(#launch_contract_impls)*
@@ -1289,7 +1271,6 @@ fn expand_cuda_module_inner_with_artifact_anchor(
         #(#module_attrs)*
         #vis mod #ident {
             #(#module_items)*
-            #(#ptx_merge_required_markers)*
             #host_items
         }
     })
@@ -8071,7 +8052,6 @@ fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStream2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reserved_oxide_symbols::PTX_MERGE_REQUIRED_PREFIX;
 
     /// Expands a `#[cuda_module]` body and returns the generated tokens as a
     /// whitespace-free string, so tests can assert on call paths without
@@ -8341,13 +8321,13 @@ mod tests {
             "typed launch must forward type and const arguments to the name helper:\n{expanded}"
         );
         assert!(
-            expanded.contains(PTX_MERGE_REQUIRED_PREFIX),
-            "generic cuda_module must emit the compiler-visible PTX-merge marker:\n{expanded}"
+            expanded.contains("load_embedded_modules_from_current_exe(ctx)?"),
+            "generic cuda_module must load every independently finalized artifact:\n{expanded}"
         );
     }
 
     #[test]
-    fn non_generic_cuda_module_does_not_emit_ptx_merge_marker() {
+    fn non_generic_cuda_module_loads_only_its_named_artifact() {
         let module: ItemMod = parse_quote! {
             mod kernels {
                 #[kernel]
@@ -8357,13 +8337,17 @@ mod tests {
         let expanded = expand_to_compact_string(module);
 
         assert!(
-            !expanded.contains(PTX_MERGE_REQUIRED_PREFIX),
-            "non-generic cuda_module must remain eligible for cubin materialization:\n{expanded}"
+            !expanded.contains("load_embedded_modules_from_current_exe(ctx)?"),
+            "non-generic cuda_module must not load unrelated artifacts:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("load_embedded_module(ctx,name)?"),
+            "non-generic cuda_module must load its named artifact:\n{expanded}"
         );
     }
 
     #[test]
-    fn cfg_gated_generic_uses_the_same_gate_for_marker_and_loader() {
+    fn cfg_gated_generic_uses_its_effective_gate_for_loader_selection() {
         let module: ItemMod = parse_quote! {
             mod kernels {
                 #[kernel]
@@ -8375,14 +8359,6 @@ mod tests {
             }
         };
         let expanded = expand_to_compact_string(module);
-        let marker = ptx_merge_required_marker("optional");
-
-        assert!(
-            expanded.contains(&format!(
-                "#[cfg(feature=\"generic\")]#[doc(hidden)]#[used]#[allow(dead_code,non_upper_case_globals)]static{marker}:u8=0"
-            )),
-            "marker must inherit the generic kernel's cfg:\n{expanded}"
-        );
         assert!(
             expanded.contains(
                 "#[cfg(feature=\"generic\")]let_={__cuda_oxide_has_enabled_generic_kernel=true;};"
@@ -8390,13 +8366,13 @@ mod tests {
             "loader selection must inherit the generic kernel's cfg:\n{expanded}"
         );
         assert!(
-            expanded.contains("if__cuda_oxide_has_enabled_generic_kernel{let_=name;::cuda_host::load_all_ptx_bundles_merged(ctx)?}else{::cuda_host::load_embedded_module(ctx,name)?}"),
+            expanded.contains("if__cuda_oxide_has_enabled_generic_kernel{let_=name;::cuda_host::load_embedded_modules_from_current_exe(ctx)?}else{::std::vec![::cuda_host::load_embedded_module(ctx,name)?]}"),
             "loader must fall back to the embedded artifact when no generic kernel is enabled:\n{expanded}"
         );
     }
 
     #[test]
-    fn nested_generic_marker_inherits_every_ancestor_cfg() {
+    fn nested_generic_loader_inherits_every_ancestor_cfg() {
         let module: ItemMod = parse_quote! {
             mod kernels {
                 #[cfg(feature = "outer")]
@@ -8408,12 +8384,9 @@ mod tests {
             }
         };
         let expanded = expand_to_compact_string(module);
-        let marker = ptx_merge_required_marker("map");
         assert!(
-            expanded.contains(&format!(
-                "#[cfg(feature=\"outer\")]#[cfg(target_os=\"linux\")]#[doc(hidden)]#[used]#[allow(dead_code,non_upper_case_globals)]static{marker}:u8=0"
-            )),
-            "root marker must use the nested kernel's effective cfg chain:\n{expanded}"
+            expanded.contains("#[cfg(feature=\"outer\")]#[cfg(target_os=\"linux\")]let_={__cuda_oxide_has_enabled_generic_kernel=true;};"),
+            "loader selection must use the nested kernel's effective cfg chain:\n{expanded}"
         );
     }
 

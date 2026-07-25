@@ -71,11 +71,6 @@ pub(crate) enum MaterializeError {
     ProvenanceMismatch { expected: String, actual: String },
 
     #[error(
-        "build-time cubin materialization does not yet support generic #[cuda_module] loading because it merges PTX bundles across crates at run time"
-    )]
-    RequiresPtxBundleMerge,
-
-    #[error(
         "build-time cubin materialization does not yet support #[device] extern declarations because their ordered external link inputs are not available to the backend"
     )]
     HasDeviceExterns,
@@ -124,13 +119,9 @@ pub(crate) fn request_from_env() -> Result<Option<MaterializationRequest>, Mater
 pub(crate) fn validate_collection(
     request: Option<MaterializationRequest>,
     has_device_externs: bool,
-    requires_ptx_bundle_merge: bool,
 ) -> Result<(), MaterializeError> {
     if request.is_none() {
         return Ok(());
-    }
-    if requires_ptx_bundle_merge {
-        return Err(MaterializeError::RequiresPtxBundleMerge);
     }
     if has_device_externs {
         return Err(MaterializeError::HasDeviceExterns);
@@ -280,19 +271,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_collection_models_fail_without_tools() {
+    fn device_extern_materialization_fails_without_tools() {
         let request = Some(MaterializationRequest {
             expected_provenance: [0; 32],
         });
         assert!(matches!(
-            validate_collection(request, false, true),
-            Err(MaterializeError::RequiresPtxBundleMerge)
-        ));
-        assert!(matches!(
-            validate_collection(request, true, false),
+            validate_collection(request, true),
             Err(MaterializeError::HasDeviceExterns)
         ));
-        assert!(validate_collection(None, true, true).is_ok());
+        assert!(validate_collection(None, true).is_ok());
     }
 
     #[test]

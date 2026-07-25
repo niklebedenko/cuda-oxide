@@ -10,12 +10,12 @@
 //! rather than from a PTX file on disk.
 //!
 //! When `kernel_lib::kernels::load(&ctx)` is called, the macro-generated
-//! `load` function uses `load_all_ptx_bundles_merged` (because the module
-//! contains generic kernels). This merges all PTX bundles in the process, so
-//! specializations remain visible regardless of which crate owns their
-//! monomorphized entry points. The example deliberately owns `scale::<f32>` in
-//! the library as an archive-retention regression and instantiates its other
-//! launch types downstream.
+//! `load` function loads every embedded CUDA artifact because the module
+//! contains generic kernels. Its launch handle resolves specializations across
+//! those modules regardless of which crate owns their monomorphized entry
+//! points. The example deliberately owns `scale::<f32>` in the library as an
+//! archive-retention regression and instantiates its other launch types
+//! downstream.
 //!
 //! Run: cargo oxide run cross_crate_embedded
 //! No-CUDA linkage check: run the built binary with `--verify-bundles`.
