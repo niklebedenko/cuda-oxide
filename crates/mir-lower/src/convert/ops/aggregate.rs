@@ -416,7 +416,12 @@ fn try_pack_float_array_union(
         } else {
             let amount =
                 integer_constant(ctx, rewriter, carrier_bits, index * u64::from(element_bits));
-            let shift = llvm::ShlOp::new(ctx, wide, amount);
+            let shift = llvm::ShlOp::new_with_overflow_flag(
+                ctx,
+                wide,
+                amount,
+                IntegerOverflowFlagsAttr::default(),
+            );
             rewriter.insert_operation(ctx, shift.get_operation());
             shift.get_operation().deref(ctx).get_result(0)
         };
@@ -2657,6 +2662,21 @@ mod tests {
         assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
         assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 0);
         assert_eq!(count_ops::<llvm::BitcastOp>(&ctx, &body), 4);
+        let shifts = find_all::<llvm::ShlOp>(&ctx, &body);
+        assert_eq!(shifts.len(), 1);
+        let overflow_flags_key =
+            llvm_export::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone();
+        assert!(
+            shifts.iter().all(|shift| {
+                shift
+                    .get_operation()
+                    .deref(&ctx)
+                    .attributes
+                    .get::<IntegerOverflowFlagsAttr>(&overflow_flags_key)
+                    .is_some()
+            }),
+            "packing a float array into its integer union carrier must produce exportable shifts"
+        );
     }
 
     fn append_empty_struct_value(
