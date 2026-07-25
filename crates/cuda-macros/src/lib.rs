@@ -344,7 +344,8 @@ fn impl_trait_parameter_error(input: &ItemFn, item_kind: &str) -> Option<syn::Er
 /// Attribute arguments for `#[kernel(...)]`.
 ///
 /// Legacy explicit-instantiation types, the optional launch-context binding,
-/// and the bare `unchecked_indexing` flag may appear in any order:
+/// optional named arguments, and the bare `unchecked_indexing` flag may appear
+/// in any order:
 ///
 /// ```ignore
 /// #[kernel(launch_context = launch_context)]
@@ -352,7 +353,9 @@ fn impl_trait_parameter_error(input: &ItemFn, item_kind: &str) -> Option<syn::Er
 /// #[kernel(unchecked_indexing)]
 /// #[kernel(f32, unchecked_indexing)]
 /// #[kernel(launch_context = launch_context, unchecked_indexing)]
+/// #[kernel(device_feature = "optional-kernels")]
 /// ```
+#[derive(Default)]
 struct KernelArgs {
     /// Types to instantiate generic kernels for
     instantiate_types: Vec<Type>,
@@ -360,6 +363,8 @@ struct KernelArgs {
     launch_context: Option<Ident>,
     /// Elide slice/array bounds checks in this kernel's body (UB contract).
     unchecked_indexing: bool,
+    /// Cargo feature that controls only emission of a fixed device entry.
+    device_feature: Option<LitStr>,
 }
 
 /// Returns true when the next attribute argument is exactly the bare flag
@@ -384,30 +389,55 @@ impl Parse for KernelArgs {
         let mut instantiate_types = Vec::new();
         let mut launch_context = None;
         let mut unchecked_indexing = false;
+        let mut device_feature = None;
 
         while !input.is_empty() {
             if input.peek(Ident) && input.peek2(Token![=]) {
                 let name: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
-                if name != "launch_context" {
-                    return Err(syn::Error::new(
-                        name.span(),
-                        format!(
-                            "unknown #[kernel] named argument `{name}`; expected `launch_context = IDENT`"
-                        ),
-                    ));
-                }
-                let value: Ident = input.parse().map_err(|_| {
-                    syn::Error::new(
-                        input.span(),
-                        "`launch_context` must be a single Rust identifier",
-                    )
-                })?;
-                if launch_context.replace(value).is_some() {
-                    return Err(syn::Error::new(
-                        name.span(),
-                        "duplicate `launch_context` argument in #[kernel]",
-                    ));
+                match name.to_string().as_str() {
+                    "launch_context" => {
+                        let value: Ident = input.parse().map_err(|_| {
+                            syn::Error::new(
+                                input.span(),
+                                "`launch_context` must be a single Rust identifier",
+                            )
+                        })?;
+                        if launch_context.replace(value).is_some() {
+                            return Err(syn::Error::new(
+                                name.span(),
+                                "duplicate `launch_context` argument in #[kernel]",
+                            ));
+                        }
+                    }
+                    "device_feature" => {
+                        let value: LitStr = input.parse().map_err(|_| {
+                            syn::Error::new(
+                                input.span(),
+                                "`device_feature` must be a Cargo feature string literal",
+                            )
+                        })?;
+                        if value.value().is_empty() {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                "`device_feature` cannot be empty",
+                            ));
+                        }
+                        if device_feature.replace(value).is_some() {
+                            return Err(syn::Error::new(
+                                name.span(),
+                                "duplicate `device_feature` argument in #[kernel]",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!(
+                                "unknown #[kernel] named argument `{name}`; expected `launch_context = IDENT` or `device_feature = \"FEATURE\"`"
+                            ),
+                        ));
+                    }
                 }
             } else if peek_bare_kernel_flag(input, "unchecked_indexing") {
                 let flag: Ident = input.parse()?;
@@ -432,6 +462,7 @@ impl Parse for KernelArgs {
             instantiate_types,
             launch_context,
             unchecked_indexing,
+            device_feature,
         })
     }
 }
@@ -576,6 +607,10 @@ struct CudaModuleKernel {
     /// the kernel's own attributes. Root-level artifact references need the
     /// complete chain because they live outside those child modules.
     effective_cfg_attrs: Vec<syn::Attribute>,
+    /// Availability attributes for the concrete device entry. This extends
+    /// ordinary item availability with an optional device-only Cargo feature
+    /// gate while leaving generated host launch methods callable.
+    effective_device_cfg_attrs: Vec<syn::Attribute>,
     method_attrs: Vec<syn::Attribute>,
     unsafety: Option<Token![unsafe]>,
     fn_name: Ident,
@@ -1446,6 +1481,21 @@ fn cuda_module_loaded_module_use_binding(tree: &syn::UseTree) -> Option<&Ident> 
     }
 }
 
+fn cuda_module_kernel_args(attrs: &[syn::Attribute]) -> syn::Result<KernelArgs> {
+    let attr = attrs
+        .iter()
+        .find(|attr| attr_path_ends_with(attr, "kernel"))
+        .expect("cuda_module_kernel_args called without a kernel attribute");
+    match &attr.meta {
+        syn::Meta::Path(_) => Ok(KernelArgs::default()),
+        syn::Meta::List(_) => attr.parse_args(),
+        syn::Meta::NameValue(_) => Err(syn::Error::new_spanned(
+            attr,
+            "kernel arguments must be written in parentheses",
+        )),
+    }
+}
+
 fn cuda_module_kernel(
     item_fn: &ItemFn,
     module_path: &[Ident],
@@ -1481,14 +1531,26 @@ fn cuda_module_kernel(
     // is unconditional too.
     add_cuda_module_disjoint_abi_bounds(&mut generics, &params);
     let is_generic = has_codegen_generics(&item_fn.sig.generics);
+    let kernel_args = cuda_module_kernel_args(&item_fn.attrs)?;
+    if is_generic && kernel_args.device_feature.is_some() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "`device_feature` currently supports only non-generic kernels",
+        ));
+    }
     let cfg_attrs = cuda_module_cfg_attrs(&item_fn.attrs)?;
     let mut effective_cfg_attrs = ancestor_cfg_attrs.to_vec();
     effective_cfg_attrs.extend(cfg_attrs.clone());
+    let mut effective_device_cfg_attrs = effective_cfg_attrs.clone();
+    if let Some(feature) = kernel_args.device_feature {
+        effective_device_cfg_attrs.push(parse_quote!(#[cfg(feature = #feature)]));
+    }
     Ok(Some(CudaModuleKernel {
         module_path: module_path.to_vec(),
         vis: item_fn.vis.clone(),
         cfg_attrs,
         effective_cfg_attrs,
+        effective_device_cfg_attrs,
         method_attrs: cuda_module_method_attrs(&item_fn.attrs),
         unsafety: item_fn.sig.unsafety,
         fn_name: item_fn.sig.ident.clone(),
@@ -1717,7 +1779,7 @@ fn cuda_module_artifact_anchor_statements(
         .iter()
         .filter(|kernel| !kernel.is_generic)
         .map(|kernel| {
-            let cfg_attrs = &kernel.effective_cfg_attrs;
+            let cfg_attrs = &kernel.effective_device_cfg_attrs;
             quote! {
                 #(#cfg_attrs)*
                 let _artifact_anchor: *const ::core::primitive::u8 = {
@@ -4340,6 +4402,24 @@ fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
 /// `generic_const_exprs` feature. Partial factors must be in `2..=1024`; an
 /// invalid specialization fails compilation instead of becoming a no-op.
 ///
+/// # Optional fixed entries
+///
+/// A non-generic kernel can keep its generated host launch method available
+/// while emitting the concrete device entry only when a Cargo feature is
+/// enabled:
+///
+/// ```ignore
+/// #[kernel(device_feature = "optional-kernels")]
+/// pub fn optional_kernel(args: Args) {
+///     // ...
+/// }
+/// ```
+///
+/// Calling the host launch method without an artifact containing that entry
+/// returns the normal function-lookup error. This differs intentionally from
+/// `#[cfg(feature = "optional-kernels")]`, which removes both the device entry
+/// and the typed host launch surface.
+///
 /// The pass currently recognizes explicit counted `while` loops. Range-based
 /// `for` loops are not yet recognized.
 ///
@@ -4367,6 +4447,7 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
         instantiate_types,
         launch_context,
         unchecked_indexing,
+        device_feature,
     } = args;
 
     if let Some(err) = reject_reserved_name(&input.sig.ident) {
@@ -4423,6 +4504,14 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Only type and const parameters create distinct codegen instances.
     // Lifetimes are erased before monomorphization.
     let has_generics = has_codegen_generics(&input.sig.generics);
+    if has_generics && device_feature.is_some() {
+        return syn::Error::new_spanned(
+            &input.sig.generics,
+            "`device_feature` currently supports only non-generic kernels",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     if has_generics && !instantiate_types.is_empty() {
         let type_param_count = input
@@ -4475,7 +4564,7 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
         generate_generic_kernel(input, instantiate_types, launch_context)
     } else {
         // Simple non-generic kernel
-        generate_simple_kernel(input, launch_context)
+        generate_simple_kernel(input, launch_context, device_feature).into()
     }
 }
 
@@ -5530,7 +5619,11 @@ fn _generate_dummy_binding(name: &Ident, ty: &Type) -> TokenStream2 {
 }
 
 /// Generate a simple non-generic kernel
-fn generate_simple_kernel(mut input: ItemFn, explicit_scope: Option<Ident>) -> TokenStream {
+fn generate_simple_kernel(
+    mut input: ItemFn,
+    explicit_scope: Option<Ident>,
+    device_feature: Option<LitStr>,
+) -> TokenStream2 {
     if let Some(ident) = explicit_scope {
         let scope = explicit_kernel_scope(&mut input, ident);
         let bindings = explicit_kernel_scope_bindings(&scope);
@@ -5552,6 +5645,7 @@ fn generate_simple_kernel(mut input: ItemFn, explicit_scope: Option<Ident>) -> T
 
     // Generate the CudaKernel trait implementation (host-side only)
     // This provides the PTX name for cuda_launch! to look up
+    let device_cfg = device_feature.map(|feature| quote!(#[cfg(feature = #feature)]));
     let cuda_kernel_impl = generate_cuda_kernel_impl(
         &fn_name,
         &ptx_entry_name,
@@ -5560,13 +5654,14 @@ fn generate_simple_kernel(mut input: ItemFn, explicit_scope: Option<Ident>) -> T
     );
 
     let expanded = quote! {
+        #device_cfg
         #[unsafe(no_mangle)]
         #input
 
         #cuda_kernel_impl
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
 /// Generate the GenericCudaKernel trait implementation for a generic kernel.
@@ -8667,6 +8762,77 @@ mod tests {
     }
 
     #[test]
+    fn device_feature_gates_only_the_fixed_entry_not_its_host_launch_method() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel(device_feature = "optional-kernels")]
+                pub fn optional(value: u32) {}
+            }
+        };
+        let items = &module.content.as_ref().expect("inline module").1;
+        let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false).unwrap();
+        let kernel = transformed
+            .kernels
+            .iter()
+            .find(|kernel| kernel.fn_name == "optional")
+            .expect("optional kernel was not collected");
+        assert!(kernel.cfg_attrs.is_empty());
+        assert!(kernel.effective_cfg_attrs.is_empty());
+        let device_attrs = &kernel.effective_device_cfg_attrs;
+        assert_eq!(
+            quote!(#(#device_attrs)*).to_string().replace(' ', ""),
+            "#[cfg(feature=\"optional-kernels\")]"
+        );
+
+        let module_expansion = expand_to_compact_string(module);
+        assert!(
+            module_expansion.contains("pubunsafefnoptional("),
+            "device feature must retain the typed host launch method:\n{module_expansion}"
+        );
+
+        let entry: ItemFn = parse_quote! {
+            pub fn optional(value: u32) {}
+        };
+        let feature = LitStr::new("optional-kernels", proc_macro2::Span::call_site());
+        let entry_expansion = generate_simple_kernel(entry, None, Some(feature))
+            .to_string()
+            .replace(' ', "");
+        assert!(
+            entry_expansion.contains(
+                "#[cfg(feature=\"optional-kernels\")]#[unsafe(no_mangle)]pubfncuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_optional"
+            ),
+            "device feature must gate the generated collector entry:\n{entry_expansion}"
+        );
+        assert!(
+            entry_expansion.contains("pubstruct__optional_CudaKernel;"),
+            "device feature must retain the host PTX-name marker:\n{entry_expansion}"
+        );
+        assert_eq!(
+            entry_expansion
+                .matches("#[cfg(feature=\"optional-kernels\")]")
+                .count(),
+            1,
+            "only the concrete device entry should carry the feature gate"
+        );
+    }
+
+    #[test]
+    fn device_feature_rejects_generic_kernels_until_entry_retention_is_explicit() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel(device_feature = "optional-kernels")]
+                pub fn optional<T: Copy>(value: T) {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("generic device feature should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("currently supports only non-generic kernels")
+        );
+    }
+
+    #[test]
     fn conflicting_kernel_names_across_modules_are_rejected() {
         let module: ItemMod = parse_quote! {
             mod kernels {
@@ -8780,15 +8946,28 @@ mod tests {
 
     #[test]
     fn kernel_launch_context_argument_composes_with_legacy_instantiations() {
-        let args: KernelArgs = syn::parse_str("f32, launch_context = launch_context, f64").unwrap();
+        let args: KernelArgs = syn::parse_str(
+            "f32, launch_context = launch_context, device_feature = \"optional-kernels\", f64",
+        )
+        .unwrap();
         assert_eq!(args.instantiate_types.len(), 2);
         assert_eq!(args.launch_context.unwrap(), "launch_context");
+        assert_eq!(
+            args.device_feature.expect("device feature").value(),
+            "optional-kernels"
+        );
 
         let duplicate =
             syn::parse_str::<KernelArgs>("launch_context = first, launch_context = second")
                 .err()
                 .unwrap();
         assert!(duplicate.to_string().contains("duplicate `launch_context`"));
+
+        let duplicate =
+            syn::parse_str::<KernelArgs>("device_feature = \"a\", device_feature = \"b\"")
+                .err()
+                .unwrap();
+        assert!(duplicate.to_string().contains("duplicate `device_feature`"));
 
         let unknown = syn::parse_str::<KernelArgs>("context = launch_context")
             .err()
