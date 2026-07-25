@@ -209,7 +209,10 @@ fn legacy_export_uses_one_canonical_pointer_with_multiple_typed_views() {
     let ir = export_module_to_string_with_config(&ctx, &module, &config)
         .expect("legacy export succeeds");
 
-    assert!(ir.contains("define void @multiple_views(i8* %v0)"), "{ir}");
+    assert!(
+        ir.contains("define internal void @multiple_views(i8* %v0)"),
+        "{ir}"
+    );
     assert!(ir.contains("bitcast i8* %v0 to i32*"), "{ir}");
     assert!(ir.contains("load i32, i32*"), "{ir}");
     assert!(ir.contains("bitcast i8* %v0 to float*"), "{ir}");
@@ -1420,6 +1423,119 @@ fn ptx_export_records_standalone_device_function_roots_for_internalization() {
 }
 
 #[test]
+fn nvvm_export_internalizes_only_module_private_definitions() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "nvvm_linkage".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+
+    for (name, address_space) in [
+        ("__device_global_0", 1),
+        ("__shared_mem_0", 3),
+        ("HOST_GLOBAL", 1),
+    ] {
+        let global = GlobalOp::new(&mut ctx, name.try_into().unwrap(), i32_ty.into());
+        global.set_address_space(&mut ctx, address_space);
+        global.get_operation().insert_at_back(module_block, &ctx);
+    }
+
+    let func_ty = FuncType::get(&ctx, VoidType::get(&ctx).into(), vec![], false);
+    let kernel = FuncOp::new(&mut ctx, "entry_kernel".try_into().unwrap(), func_ty);
+    kernel.get_operation().deref_mut(&ctx).attributes.set(
+        "gpu_kernel".try_into().unwrap(),
+        StringAttr::new("true".into()),
+    );
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(kernel.get_or_create_entry_block(&mut ctx), &ctx);
+    kernel.get_operation().insert_at_back(module_block, &ctx);
+
+    let helper = FuncOp::new(&mut ctx, "rust_mangled_helper".try_into().unwrap(), func_ty);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(helper.get_or_create_entry_block(&mut ctx), &ctx);
+    helper.get_operation().insert_at_back(module_block, &ctx);
+
+    let device_export = FuncOp::new(
+        &mut ctx,
+        "cuda_oxide_device_246e25db_standalone_export"
+            .try_into()
+            .unwrap(),
+        func_ty,
+    );
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(device_export.get_or_create_entry_block(&mut ctx), &ctx);
+    device_export
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    let nvvm = export_module_with_externs_and_roots::<DeviceExternDecl>(
+        &ctx,
+        &module,
+        &[],
+        &NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    )
+    .expect("NVVM export succeeds");
+    assert_eq!(
+        nvvm.public_symbols,
+        ["HOST_GLOBAL", "entry_kernel", "standalone_export"]
+    );
+    assert!(
+        nvvm.llvm_ir
+            .contains("@__device_global_0 = internal addrspace(1) global"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir
+            .contains("@__shared_mem_0 = internal addrspace(3) global"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir.contains("@HOST_GLOBAL = addrspace(1) global"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir
+            .contains("define internal void @rust_mangled_helper()"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir.contains("define void @entry_kernel()"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir.contains("define void @standalone_export()"),
+        "{}",
+        nvvm.llvm_ir
+    );
+
+    let ptx = export_module_with_externs_and_roots::<DeviceExternDecl>(
+        &ctx,
+        &module,
+        &[],
+        &PtxExportConfig,
+    )
+    .expect("PTX export succeeds");
+    assert!(
+        ptx.llvm_ir
+            .contains("@__device_global_0 = addrspace(1) global"),
+        "{}",
+        ptx.llvm_ir
+    );
+    assert!(
+        ptx.llvm_ir.contains("define void @rust_mangled_helper()"),
+        "{}",
+        ptx.llvm_ir
+    );
+}
+
+#[test]
 fn legacy_export_rejects_debug_metadata() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "legacy_debug".try_into().unwrap());
@@ -1573,7 +1689,7 @@ fn export_addressof_uses_symbol_when_definition_block_prints_later() {
     )
     .expect("legacy addressof export succeeds");
     assert!(
-        legacy.contains("@__shared_mem_20 = addrspace(3) global i32 undef"),
+        legacy.contains("@__shared_mem_20 = internal addrspace(3) global i32 undef"),
         "NVVM shared globals must be uninitialized:\n{legacy}"
     );
     assert!(
@@ -2223,7 +2339,7 @@ fn export_alwaysinline_function_attribute_uses_llvm_define_syntax() {
         .expect("NVVM export succeeds");
     let nvvm_define_line = nvvm_ir
         .lines()
-        .find(|line| line.starts_with("define void @inline_helper("))
+        .find(|line| line.starts_with("define internal void @inline_helper("))
         .expect("inline helper definition");
     assert!(
         nvvm_define_line.contains("alwaysinline"),
@@ -2256,10 +2372,10 @@ fn export_device_alwaysinline_reaches_nvvm_ir() {
         .expect("NVVM IR export succeeds");
     let define_line = ir
         .lines()
-        .find(|line| line.starts_with("define void @device_builtin("))
+        .find(|line| line.starts_with("define internal void @device_builtin("))
         .expect("device built-in definition");
     assert_eq!(
-        define_line, "define void @device_builtin() alwaysinline #0 {",
+        define_line, "define internal void @device_builtin() alwaysinline #0 {",
         "device built-ins must retain mandatory inlining through NVVM export:\n{ir}"
     );
 }
@@ -2312,10 +2428,10 @@ fn export_device_link_alwaysinline_only_reaches_nvvm_ir() {
         .expect("NVVM IR export succeeds");
     let nvvm_define = nvvm_ir
         .lines()
-        .find(|line| line.starts_with("define void @device_link_helper("))
+        .find(|line| line.starts_with("define internal void @device_link_helper("))
         .expect("device-link helper definition");
     assert_eq!(
-        nvvm_define, "define void @device_link_helper() alwaysinline #0 {",
+        nvvm_define, "define internal void @device_link_helper() alwaysinline #0 {",
         "the device linker must receive mandatory-inline intent:\n{nvvm_ir}"
     );
 }
@@ -2341,17 +2457,23 @@ fn export_inlinehint_function_attribute_reaches_nvvm_ir() {
         .set(key, StringAttr::new("true".to_string()));
     func.get_operation().insert_at_back(module_block, &ctx);
 
-    for ir in [
-        export_module_to_string(&ctx, &module).expect("PTX IR export succeeds"),
-        export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
-            .expect("NVVM IR export succeeds"),
+    for (ir, expected) in [
+        (
+            export_module_to_string(&ctx, &module).expect("PTX IR export succeeds"),
+            "define void @inline_helper() inlinehint #0 {",
+        ),
+        (
+            export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+                .expect("NVVM IR export succeeds"),
+            "define internal void @inline_helper() inlinehint #0 {",
+        ),
     ] {
         let define_line = ir
             .lines()
-            .find(|line| line.starts_with("define void @inline_helper("))
+            .find(|line| line.contains("void @inline_helper("))
             .expect("inline helper definition");
         assert_eq!(
-            define_line, "define void @inline_helper() inlinehint #0 {",
+            define_line, expected,
             "`inlinehint` must reach each LLVM export path:\n{ir}"
         );
     }

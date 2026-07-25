@@ -135,27 +135,33 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(ty, output)?;
             writeln!(output, ", align {alignment}").unwrap();
         } else {
-            self.public_globals.push(name.to_string());
-            // Defined static storage in the global's address space. The LLVM
-            // definition retains external linkage for host-side symbol lookup.
-            //
+            // Rust allocations and static shared-memory slots are private
+            // implementation details of an NVVM module. Named user globals
+            // retain external linkage for host-side symbol lookup.
+            let is_internal = self.nvvm_ir_dialect.is_some()
+                && (name.starts_with("__device_global_") || name.starts_with("__shared_mem_"));
+            if !is_internal {
+                self.public_globals.push(name.to_string());
+            }
+
             // `constant` rather than `global` when the storage is marked
             // never-written (see `GLOBAL_IMMUTABLE_KEY`). That keyword is what
             // lets `opt` treat a read of this storage as invariant: it both
             // enables `isOnlyCopiedFromConstantMemory` to delete a copy of the
             // data into a stack slot, and makes `llc` select `ld.global.nc`
-            // (the read-only data cache) for the load. External linkage is
-            // retained either way; `constant` constrains writes, not visibility.
+            // (the read-only data cache) for the load. Internal linkage is
+            // retained for compiler-generated storage; `constant` constrains
+            // writes, not visibility.
             let storage_keyword = if global.is_immutable(self.ctx) {
                 "constant"
             } else {
                 "global"
             };
-            write!(
-                output,
-                "@{name} = addrspace({address_space}) {storage_keyword} "
-            )
-            .unwrap();
+            write!(output, "@{name} = ").unwrap();
+            if is_internal {
+                write!(output, "internal ").unwrap();
+            }
+            write!(output, "addrspace({address_space}) {storage_keyword} ").unwrap();
             self.export_type(ty, output)?;
             if let Some(encoded) = global.initializer_relocations(self.ctx) {
                 let hex = global.initializer_hex(self.ctx).ok_or_else(|| {
@@ -692,6 +698,13 @@ impl<'a> ModuleExportState<'a> {
             }
 
             write!(output, "define ").unwrap();
+            // Kernel entries and explicit `#[device]` exports are consumed
+            // outside this module. Ordinary Rust definitions are module-local
+            // helpers and need internal linkage so libNVVM can inline and
+            // eliminate them.
+            if self.nvvm_ir_dialect.is_some() && !is_kernel && !has_device_prefix(&func_name) {
+                write!(output, "internal ").unwrap();
+            }
             if is_kernel && self.emit_ptx_kernel_keyword {
                 write!(output, "ptx_kernel ").unwrap();
             }
