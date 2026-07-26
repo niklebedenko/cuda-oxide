@@ -1149,6 +1149,9 @@ fn materialize_artifact_for_embedding(
             result.allow_fma_contraction,
             debug_policy,
         )?;
+        if let Some(warning) = &materialized.ptx_bundle_durability_warning {
+            eprintln!("[rustc_codegen_cuda] warning: {warning}");
+        }
         if std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some() {
             for (index, partition) in materialized.partitions.iter().enumerate() {
                 eprintln!(

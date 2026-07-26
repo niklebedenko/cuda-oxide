@@ -264,7 +264,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "partitions={} operations_per_partition={} source_bytes={} ptx_bytes={} \
          cubin_bytes={} elapsed_ms={} nvvm_ms={} link_add_ms={} link_complete_ms={} \
-         peak_rss_kib={:?} static_launch_probe={} bundle={}",
+         peak_rss_kib={:?} static_launch_probe={} bundle_durable={} bundle={}",
         materialized.partitions.len(),
         operations_per_partition,
         materialized
@@ -292,6 +292,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         materialized.link_elapsed.as_millis(),
         materialized.peak_rss_kib,
         ran_static_launch_probe,
+        materialized.ptx_bundle_durability_warning.is_none(),
         materialized.ptx_bundle_path.display(),
     );
     Ok(())

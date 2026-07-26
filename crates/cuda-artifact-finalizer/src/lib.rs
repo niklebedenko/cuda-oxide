@@ -38,7 +38,7 @@ use thiserror::Error;
 /// The partition planner targets substantially smaller artifacts. This is a
 /// fail-closed allocation ceiling for corrupt, stale, or unexpectedly large
 /// materialization inputs.
-pub const MAX_PARTITION_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_PARTITION_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Failures while compiling NVVM IR or linking CUDA device artifacts.
 #[derive(Debug, Error)]
@@ -222,6 +222,10 @@ pub struct MaterializedPartition {
 pub struct MaterializedPartitionedOwner {
     pub partitions: Vec<MaterializedPartition>,
     pub ptx_bundle_path: PathBuf,
+    /// Present when the complete bundle was atomically published but syncing
+    /// its parent directory failed. The live file remains safe to consume;
+    /// only its survival across an immediate system crash is uncertain.
+    pub ptx_bundle_durability_warning: Option<String>,
     pub cubin: Vec<u8>,
     /// Time spent completing the already-populated nvJitLink state.
     pub link_elapsed: Duration,
@@ -346,10 +350,11 @@ impl Finalizer {
             Ok(())
         })?;
         let bundle_file = bundle.finish()?;
-        pending_bundle.publish(bundle_file)?;
+        let ptx_bundle_durability_warning = pending_bundle.publish(bundle_file)?;
         Ok(MaterializedPartitionedOwner {
             partitions,
             ptx_bundle_path: ptx_bundle_path.to_path_buf(),
+            ptx_bundle_durability_warning,
             cubin,
             link_elapsed,
             peak_rss_kib: process_peak_rss_kib(),
@@ -638,27 +643,37 @@ impl PendingPtxBundle {
         })
     }
 
-    fn publish(mut self, file: std::fs::File) -> Result<(), FinalizerError> {
+    fn publish(mut self, file: std::fs::File) -> Result<Option<String>, FinalizerError> {
+        self.publish_with_directory_sync(file, |directory| directory.sync_all())
+    }
+
+    fn publish_with_directory_sync(
+        &mut self,
+        file: std::fs::File,
+        sync_directory: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<Option<String>, FinalizerError> {
         file.sync_all().map_err(|source| FinalizerError::Io {
             path: self.temporary.clone(),
             source,
         })?;
         drop(file);
-        std::fs::rename(&self.temporary, &self.target).map_err(|source| FinalizerError::Io {
-            path: self.target.clone(),
-            source,
-        })?;
         let parent = nonempty_parent(&self.target);
         let directory = std::fs::File::open(parent).map_err(|source| FinalizerError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
-        directory.sync_all().map_err(|source| FinalizerError::Io {
-            path: parent.to_path_buf(),
+        std::fs::rename(&self.temporary, &self.target).map_err(|source| FinalizerError::Io {
+            path: self.target.clone(),
             source,
         })?;
         self.published = true;
-        Ok(())
+        Ok(sync_directory(&directory).err().map(|error| {
+            format!(
+                "PTX bundle {} is live, but its parent directory {} could not be synced: {error}",
+                self.target.display(),
+                parent.display(),
+            )
+        }))
     }
 }
 
@@ -776,6 +791,37 @@ entry:
 
         assert_eq!(std::fs::read(&target).unwrap(), b"previous complete bundle");
         assert!(!temporary_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn post_rename_directory_sync_failure_reports_live_nondurable_bundle() {
+        let sequence = PTX_BUNDLE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "cuda-oxide-bundle-durability-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("owner.ptx.bundle");
+        std::fs::write(&target, b"previous complete bundle").unwrap();
+
+        let (mut pending, mut temporary_file) = PendingPtxBundle::create(&target).unwrap();
+        let temporary_path = pending.temporary.clone();
+        temporary_file.write_all(b"new complete bundle").unwrap();
+        let warning = pending
+            .publish_with_directory_sync(temporary_file, |_| {
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+            .unwrap()
+            .expect("post-publication durability failure must remain observable");
+
+        assert!(pending.published);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new complete bundle");
+        assert!(!temporary_path.exists());
+        assert!(warning.contains("is live") && warning.contains("injected directory sync failure"));
+
+        drop(pending);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new complete bundle");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
