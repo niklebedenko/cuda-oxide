@@ -875,9 +875,8 @@ pub struct DeviceCodegenConfig {
     pub dump_llvm_dialect: bool,
     /// Partition large owner closures before LLVM/libNVVM optimization.
     ///
-    /// This is enabled only by build-time cubin materialization. Runtime
-    /// artifacts stay single-module so their loading and fallback behavior is
-    /// unchanged.
+    /// This is normally enabled by build-time cubin materialization. An
+    /// explicitly selected monolithic owner stays on the LLVM O3 path.
     pub partition_large_owner: bool,
 }
 

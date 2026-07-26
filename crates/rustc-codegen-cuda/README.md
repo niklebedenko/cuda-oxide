@@ -89,6 +89,7 @@ These are set automatically by `cargo oxide`. For manual invocations, all four a
 | `CUDA_OXIDE_EMIT_NVVM_IR`            | Emit NVVM IR for libNVVM                    |
 | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`    | Comma-separated device owner crate filter   |
 | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`    | Comma-separated `owner=export` root filter  |
+| `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` | Keep selected owners on LLVM O3           |
 
 `cargo oxide --arch <sm_XX>` sets `CUDA_OXIDE_TARGET`. When it is unset,
 PTX output auto-detects the required target from generated LLVM IR.
@@ -105,6 +106,11 @@ Validation occurs when rustc compiles the selected owner. Build wrappers must
 therefore include `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` in the owner's Cargo
 codegen fingerprint so a changed selection cannot reuse a stale owner
 artifact; `cargo oxide` includes it automatically.
+`CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` opts selected materialized owners out of
+partitioning so their complete closure is optimized as one LLVM module. It is
+restricted to measured, bounded exact-root artifacts and fails closed without
+`CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`; wrappers include it in the same CUDA
+environment fingerprint.
 
 ## Source Layout
 

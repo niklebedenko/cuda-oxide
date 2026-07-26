@@ -287,6 +287,7 @@
 //! | `CUDA_OXIDE_TARGET`               | Override GPU target (e.g., `sm_90a`) |
 //! | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE` | Filter device owner crate names      |
 //! | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` | Select exact roots within owners     |
+//! | `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` | Disable owner partitioning     |
 //!
 //! ## Module Structure
 //!
@@ -396,6 +397,8 @@ pub struct CudaCodegenConfig {
     pub device_codegen_roots: Option<BTreeMap<String, BTreeSet<String>>>,
     /// Fail-closed parse error retained until rustc's diagnostic context exists.
     pub device_codegen_roots_error: Option<String>,
+    /// Keep a materialized device owner in the LLVM O3 single-module path.
+    pub monolithic_device_codegen: bool,
 }
 
 impl CudaCodegenConfig {
@@ -408,8 +411,9 @@ impl CudaCodegenConfig {
     /// | `CUDA_OXIDE_DUMP_MIR`                | `dump_mir_dialect`       |
     /// | `CUDA_OXIDE_DUMP_LLVM`               | `dump_llvm_dialect`      |
     /// | `CUDA_OXIDE_PTX_DIR`                 | `ptx_output_dir`         |
-    /// | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`  | `device_codegen_crates`  |
-    /// | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`  | `device_codegen_roots`   |
+    /// | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`       | `device_codegen_crates`     |
+    /// | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`       | `device_codegen_roots`      |
+    /// | `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN`  | `monolithic_device_codegen` |
     pub fn from_env() -> Self {
         let device_codegen_crates = parse_device_codegen_crates(
             std::env::var(reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV)
@@ -433,10 +437,19 @@ impl CudaCodegenConfig {
         let parsed_roots = parsed_roots.and_then(|filters| {
             validate_device_codegen_root_owners(filters, device_codegen_crates.as_ref())
         });
-        let (device_codegen_roots, device_codegen_roots_error) = match parsed_roots {
+        let (device_codegen_roots, mut device_codegen_roots_error) = match parsed_roots {
             Ok(filters) => (filters, None),
             Err(error) => (None, Some(error)),
         };
+        let monolithic_device_codegen =
+            std::env::var_os("CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN").is_some();
+        if device_codegen_roots_error.is_none() {
+            device_codegen_roots_error = validate_monolithic_device_codegen(
+                monolithic_device_codegen,
+                device_codegen_roots.is_some(),
+            )
+            .err();
+        }
         Self {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
             dump_rustc_mir: std::env::var("CUDA_OXIDE_SHOW_RUSTC_MIR").is_ok(),
@@ -448,6 +461,7 @@ impl CudaCodegenConfig {
             device_codegen_crates,
             device_codegen_roots,
             device_codegen_roots_error,
+            monolithic_device_codegen,
         }
     }
 
@@ -461,6 +475,28 @@ impl CudaCodegenConfig {
         self.device_codegen_roots
             .as_ref()?
             .get(&normalize_device_crate_name(crate_name))
+    }
+}
+
+fn should_partition_materialized_owner(
+    materialization_requested: bool,
+    monolithic_device_codegen: bool,
+) -> bool {
+    materialization_requested && !monolithic_device_codegen
+}
+
+fn validate_monolithic_device_codegen(
+    monolithic_device_codegen: bool,
+    has_exact_roots: bool,
+) -> Result<(), String> {
+    if monolithic_device_codegen && !has_exact_roots {
+        Err(
+            "CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS"
+                .to_string(),
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -817,7 +853,10 @@ impl CodegenBackend for CudaCodegenBackend {
                         dump_rustc_mir: self.config.dump_rustc_mir,
                         dump_mir_dialect: self.config.dump_mir_dialect,
                         dump_llvm_dialect: self.config.dump_llvm_dialect,
-                        partition_large_owner: materialization_request.is_some(),
+                        partition_large_owner: should_partition_materialized_owner(
+                            materialization_request.is_some(),
+                            self.config.monolithic_device_codegen,
+                        ),
                     };
 
                 // Run the cuda-oxide pipeline, catching backend panics and
@@ -1639,6 +1678,21 @@ pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monolithic_device_codegen_disables_only_materialized_owner_partitioning() {
+        assert!(should_partition_materialized_owner(true, false));
+        assert!(!should_partition_materialized_owner(true, true));
+        assert!(!should_partition_materialized_owner(false, false));
+        assert!(!should_partition_materialized_owner(false, true));
+        assert!(validate_monolithic_device_codegen(true, true).is_ok());
+        assert!(validate_monolithic_device_codegen(false, false).is_ok());
+        assert_eq!(
+            validate_monolithic_device_codegen(true, false).unwrap_err(),
+            "CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS"
+        );
+    }
 
     #[test]
     fn device_codegen_owner_filter_normalizes_and_matches_crate_names() {
