@@ -28,8 +28,11 @@
 //!
 //! # What the pass does
 //!
-//! For every LLVM struct- or array-typed argument of a non-entry block with
-//! two or more incoming edges (a single-incoming PHI folds on its own):
+//! For an LLVM struct- or array-typed argument of a non-entry block with two
+//! or more incoming edges (a single-incoming PHI folds on its own), the pass
+//! first requires either immediate `extractvalue` consumers or a tag-shaped
+//! aggregate returned whole for later inlining. For each selected
+//! argument:
 //!
 //! 1. append one new block argument per scalar leaf of the aggregate,
 //! 2. rebuild the aggregate at the block head with `llvm.undef` +
@@ -46,6 +49,7 @@ use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::BranchOpInterface;
+use pliron::builtin::types::IntegerType;
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
 use pliron::op::{Op, op_cast};
@@ -149,8 +153,14 @@ fn scalarize_block(
     // Plan which arguments to split.
     let mut plans: Vec<SplitPlan> = Vec::new();
     for arg_idx in 0..num_args {
-        let ty = block.deref(ctx).get_argument(arg_idx).get_type(ctx);
-        if let Some(leaves) = aggregate_leaves(ctx, ty) {
+        let arg = block.deref(ctx).get_argument(arg_idx);
+        let ty = arg.get_type(ctx);
+        let directly_extracted = aggregate_is_only_extracted(ctx, arg);
+        let returned_tag_shaped =
+            aggregate_is_only_returned(ctx, arg) && aggregate_has_leading_integer_tag(ctx, ty);
+        if (directly_extracted || returned_tag_shaped)
+            && let Some(leaves) = aggregate_leaves(ctx, ty)
+        {
             plans.push(SplitPlan {
                 arg_idx,
                 aggregate_ty: ty,
@@ -271,6 +281,47 @@ fn scalarize_block(
     Ok(())
 }
 
+/// Whether every use reads a field from the aggregate.
+///
+/// Scalarization only helps LLVM when consumers immediately extract fields
+/// from a merge PHI. Rebuilding an aggregate for a whole-value consumer
+/// lengthens every scalar leaf's live range and can turn an otherwise
+/// register-resident numerical aggregate into local-memory traffic.
+fn aggregate_is_only_extracted(ctx: &Context, value: Value) -> bool {
+    let uses = value.uses(ctx);
+    !uses.is_empty()
+        && uses
+            .iter()
+            .all(|r#use| Operation::get_op::<llvm::ExtractValueOp>(r#use.user_op(), ctx).is_some())
+}
+
+/// Whether every immediate use returns the aggregate whole.
+fn aggregate_is_only_returned(ctx: &Context, value: Value) -> bool {
+    let uses = value.uses(ctx);
+    !uses.is_empty()
+        && uses
+            .iter()
+            .all(|r#use| Operation::get_op::<llvm::ReturnOp>(r#use.user_op(), ctx).is_some())
+}
+
+/// Whether an aggregate has the structural shape of a tagged value.
+///
+/// Return-merge blocks for tagged values may return the aggregate whole and
+/// only expose their tag after inlining into a caller. Keep scalarizing this
+/// conservative shape even though the immediate consumer is not an
+/// `extractvalue`. This is a structural heuristic, not semantic enum metadata.
+fn aggregate_has_leading_integer_tag(ctx: &Context, ty: TypeHandle) -> bool {
+    let ty_ref = ty.deref(ctx);
+    let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() else {
+        return false;
+    };
+    if struct_ty.is_opaque() {
+        return false;
+    }
+    let fields: Vec<_> = struct_ty.fields().collect();
+    fields.len() >= 2 && fields[0].deref(ctx).is::<IntegerType>()
+}
+
 /// Expand an LLVM struct or array type into its scalar leaves.
 ///
 /// Returns `None` when `ty` is not an aggregate, is an opaque struct, or
@@ -368,14 +419,17 @@ mod tests {
     use pliron::builtin::types::{IntegerType, Signedness};
     use pliron::op::Op;
 
-    /// entry(%a: i32, %b: i64):
-    ///   %agg = insertvalue (insertvalue (undef {i32, {i64, i32}}), %a, 0), %b, 1, 0
+    /// entry(%a: i64, %b: i32):
+    ///   %agg = insertvalue (insertvalue (undef {{i64, i32}, i32}), %a, 0, 0), %b, 1
     ///   br ^merge(%agg)
     /// ^other:
     ///   br ^merge(undef)
-    /// ^merge(%agg: {i32, {i64, i32}}):   // two incoming edges
-    ///   extractvalue %agg, 0
+    /// ^merge(%agg: {{i64, i32}, i32}):   // two incoming edges
+    ///   extractvalue %agg, 0, 0
     ///   return
+    ///
+    /// The first field is not an integer tag, so this exercises the immediate
+    /// `extractvalue` selection rule independently of enum recognition.
     #[test]
     fn splits_aggregate_block_argument_into_scalar_leaves() {
         let mut ctx = make_ctx();
@@ -384,19 +438,19 @@ mod tests {
         let inner_ty: TypeHandle =
             llvm_types::StructType::get_unnamed(&ctx, vec![i64_ty, i32_ty]).into();
         let agg_ty: TypeHandle =
-            llvm_types::StructType::get_unnamed(&ctx, vec![i32_ty, inner_ty]).into();
+            llvm_types::StructType::get_unnamed(&ctx, vec![inner_ty, i32_ty]).into();
 
-        let (module_ptr, entry) = build_kernel(&mut ctx, vec![i32_ty, i64_ty], vec![]);
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![i64_ty, i32_ty], vec![]);
         let scalar_a = entry.deref(&ctx).get_argument(0);
         let scalar_b = entry.deref(&ctx).get_argument(1);
 
         let undef_op = llvm::UndefOp::new(&mut ctx, agg_ty);
         undef_op.get_operation().insert_at_back(entry, &ctx);
         let empty = undef_op.get_operation().deref(&ctx).get_result(0);
-        let insert_a = llvm::InsertValueOp::new(&mut ctx, empty, scalar_a, vec![0]);
+        let insert_a = llvm::InsertValueOp::new(&mut ctx, empty, scalar_a, vec![0, 0]);
         insert_a.get_operation().insert_at_back(entry, &ctx);
         let with_a = insert_a.get_operation().deref(&ctx).get_result(0);
-        let insert_b = llvm::InsertValueOp::new(&mut ctx, with_a, scalar_b, vec![1, 0]);
+        let insert_b = llvm::InsertValueOp::new(&mut ctx, with_a, scalar_b, vec![1]);
         insert_b.get_operation().insert_at_back(entry, &ctx);
         let aggregate = insert_b.get_operation().deref(&ctx).get_result(0);
 
@@ -412,7 +466,7 @@ mod tests {
         other_br.get_operation().insert_at_back(other, &ctx);
 
         let merge_arg = merge.deref(&ctx).get_argument(0);
-        let extract_op = llvm::ExtractValueOp::new(&mut ctx, merge_arg, vec![0]).unwrap();
+        let extract_op = llvm::ExtractValueOp::new(&mut ctx, merge_arg, vec![0, 0]).unwrap();
         extract_op.get_operation().insert_at_back(merge, &ctx);
         let return_op = llvm::ReturnOp::new(&mut ctx, None);
         return_op.get_operation().insert_at_back(merge, &ctx);
@@ -424,15 +478,15 @@ mod tests {
         let leaf_tys: Vec<TypeHandle> = (0..3)
             .map(|idx| merge.deref(&ctx).get_argument(idx).get_type(&ctx))
             .collect();
-        assert_eq!(leaf_tys, vec![i32_ty, i64_ty, i32_ty]);
+        assert_eq!(leaf_tys, vec![i64_ty, i32_ty, i32_ty]);
 
         // The branch forwards three scalar leaves split from the aggregate.
         let term_obj = Operation::get_op_dyn(br_op.get_operation(), &ctx);
         let branch = op_cast::<dyn BranchOpInterface>(term_obj.as_ref()).unwrap();
         let forwarded = branch.successor_operands(&ctx, 0);
         assert_eq!(forwarded.len(), 3);
-        assert_eq!(forwarded[0].get_type(&ctx), i32_ty);
-        assert_eq!(forwarded[1].get_type(&ctx), i64_ty);
+        assert_eq!(forwarded[0].get_type(&ctx), i64_ty);
+        assert_eq!(forwarded[1].get_type(&ctx), i32_ty);
         assert_eq!(forwarded[2].get_type(&ctx), i32_ty);
 
         // The old aggregate use is fed by a rebuild at the block head.
@@ -495,6 +549,9 @@ mod tests {
         );
         cond_br.get_operation().insert_at_back(entry, &ctx);
 
+        let merge_arg = merge.deref(&ctx).get_argument(0);
+        let extract_op = llvm::ExtractValueOp::new(&mut ctx, merge_arg, vec![0]).unwrap();
+        extract_op.get_operation().insert_at_back(merge, &ctx);
         let return_op = llvm::ReturnOp::new(&mut ctx, None);
         return_op.get_operation().insert_at_back(merge, &ctx);
 
@@ -537,6 +594,7 @@ mod tests {
     #[test]
     fn duplicate_edges_survive_full_lowering() {
         use crate::convert::ops::test_util::{append_mir_return, find_first, kernel_blocks};
+        use dialect_mir::attributes::FieldIndexAttr;
         use dialect_mir::ops as mir;
         use dialect_mir::types::MirTupleType;
         use pliron::builtin::op_interfaces::OperandSegmentInterface;
@@ -564,6 +622,17 @@ mod tests {
         let tuple_value = tuple.deref(&ctx).get_result(0);
 
         let merge = append_block(&mut ctx, entry, vec![tuple_ty]);
+        let merge_arg = merge.deref(&ctx).get_argument(0);
+        let extract = Operation::new(
+            &mut ctx,
+            mir::MirExtractFieldOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![merge_arg],
+            vec![],
+            0,
+        );
+        mir::MirExtractFieldOp::new(extract).set_attr_index(&ctx, FieldIndexAttr(0));
+        extract.insert_at_back(merge, &ctx);
         append_mir_return(&mut ctx, merge, vec![]);
 
         let (operands, segment_sizes) = mir::MirCondBranchOp::compute_segment_sizes(vec![
@@ -603,9 +672,101 @@ mod tests {
             .filter(|op| Operation::get_op::<llvm::ExtractValueOp>(*op, &ctx).is_some())
             .count();
         assert_eq!(
-            extract_count, 2,
-            "exactly one extract chain, one op per leaf"
+            extract_count, 3,
+            "exactly one predecessor chain plus the original field consumer"
         );
+    }
+
+    /// A tag-shaped return merge is consumed as a whole value until the helper
+    /// is inlined into its caller. Its leading integer tag keeps it eligible.
+    #[test]
+    fn scalarizes_tag_shaped_aggregate_returned_whole() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let payload_ty: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![i64_ty, i32_ty]).into();
+        let enum_ty: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![i32_ty, payload_ty]).into();
+
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![], vec![enum_ty]);
+        let entry_value = llvm::UndefOp::new(&mut ctx, enum_ty);
+        entry_value.get_operation().insert_at_back(entry, &ctx);
+        let entry_value = entry_value.get_operation().deref(&ctx).get_result(0);
+
+        let other = append_block(&mut ctx, entry, vec![]);
+        let merge = append_block(&mut ctx, entry, vec![enum_ty]);
+        let entry_br = llvm::BrOp::new(&mut ctx, merge, vec![entry_value]);
+        entry_br.get_operation().insert_at_back(entry, &ctx);
+
+        let other_value = llvm::UndefOp::new(&mut ctx, enum_ty);
+        other_value.get_operation().insert_at_back(other, &ctx);
+        let other_value = other_value.get_operation().deref(&ctx).get_result(0);
+        let other_br = llvm::BrOp::new(&mut ctx, merge, vec![other_value]);
+        other_br.get_operation().insert_at_back(other, &ctx);
+
+        let returned = merge.deref(&ctx).get_argument(0);
+        let return_op = llvm::ReturnOp::new(&mut ctx, Some(returned));
+        return_op.get_operation().insert_at_back(merge, &ctx);
+
+        scalarize_aggregate_block_args(&mut ctx, module_ptr).unwrap();
+
+        assert_eq!(merge.deref(&ctx).get_num_arguments(), 3);
+        let returned = return_op.get_operation().deref(&ctx).get_operand(0);
+        assert_eq!(returned.get_type(&ctx), enum_ty);
+        assert_ne!(
+            returned,
+            merge.deref(&ctx).get_argument(0),
+            "the whole return must consume the aggregate rebuilt from scalar PHIs"
+        );
+    }
+
+    /// A numerical aggregate consumed as a whole value must remain one block
+    /// argument. Splitting it lengthens every leaf's live range and can force
+    /// register-resident kernel state into local memory.
+    #[test]
+    fn leaves_whole_value_numerical_aggregate_intact() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let lanes_ty: TypeHandle = llvm_types::ArrayType::get(&ctx, i32_ty, 4).into();
+        let aggregate_ty: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![lanes_ty, i32_ty]).into();
+
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![], vec![]);
+        let entry_value = llvm::UndefOp::new(&mut ctx, aggregate_ty);
+        entry_value.get_operation().insert_at_back(entry, &ctx);
+        let entry_value = entry_value.get_operation().deref(&ctx).get_result(0);
+
+        let other = append_block(&mut ctx, entry, vec![]);
+        let merge = append_block(&mut ctx, entry, vec![aggregate_ty]);
+        let entry_br = llvm::BrOp::new(&mut ctx, merge, vec![entry_value]);
+        entry_br.get_operation().insert_at_back(entry, &ctx);
+
+        let other_value = llvm::UndefOp::new(&mut ctx, aggregate_ty);
+        other_value.get_operation().insert_at_back(other, &ctx);
+        let other_value = other_value.get_operation().deref(&ctx).get_result(0);
+        let other_br = llvm::BrOp::new(&mut ctx, merge, vec![other_value]);
+        other_br.get_operation().insert_at_back(other, &ctx);
+
+        let merge_arg = merge.deref(&ctx).get_argument(0);
+        let replacement = llvm::UndefOp::new(&mut ctx, i32_ty);
+        replacement.get_operation().insert_at_back(merge, &ctx);
+        let replacement = replacement.get_operation().deref(&ctx).get_result(0);
+        let consume_whole = llvm::InsertValueOp::new(&mut ctx, merge_arg, replacement, vec![1]);
+        consume_whole.get_operation().insert_at_back(merge, &ctx);
+        let return_op = llvm::ReturnOp::new(&mut ctx, None);
+        return_op.get_operation().insert_at_back(merge, &ctx);
+
+        scalarize_aggregate_block_args(&mut ctx, module_ptr).unwrap();
+
+        assert_eq!(merge.deref(&ctx).get_num_arguments(), 1);
+        assert_eq!(
+            consume_whole.get_operation().deref(&ctx).get_operand(0),
+            merge_arg
+        );
+        let term_obj = Operation::get_op_dyn(entry_br.get_operation(), &ctx);
+        let branch = op_cast::<dyn BranchOpInterface>(term_obj.as_ref()).unwrap();
+        assert_eq!(branch.successor_operands(&ctx, 0), vec![entry_value]);
     }
 
     /// A block argument whose aggregate expands past the leaf budget must be

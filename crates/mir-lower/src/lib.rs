@@ -402,8 +402,10 @@ pub fn lower_mir_to_llvm_with_options(
     // which export as PHIs of first-class aggregates. LLVM's -O2 pipeline
     // cannot split those (SROA only handles allocas), so e.g. an iterator
     // loop merging `Option<(f32, f32)>` keeps a materialized discriminant and
-    // an extra branch per iteration. Split such arguments into scalar leaves
-    // so the exported IR carries scalar PHIs, as SROA would produce.
+    // an extra branch per iteration. Select immediate field consumers and
+    // tag-shaped aggregate returns, then split those arguments into scalar leaves so
+    // the exported IR carries scalar PHIs without extending the live ranges
+    // of numerical aggregates consumed as whole values.
     scalarize_block_args::scalarize_aggregate_block_args(ctx, module_op)?;
     Ok(())
 }
