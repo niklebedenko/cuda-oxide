@@ -165,6 +165,8 @@ pub struct MaterializedPartition {
     pub ptx_sha256: [u8; 32],
     /// Time spent in libNVVM. Direct PTX inputs report zero.
     pub nvvm_compile_elapsed: Duration,
+    /// Time spent adding this PTX module to the shared nvJitLink state.
+    pub jit_link_add_elapsed: Duration,
     /// Process high-water resident set after adding this input.
     pub peak_rss_kib: Option<u64>,
 }
@@ -283,13 +285,16 @@ impl Finalizer {
                     .unwrap_or(input.name)
                     .to_string();
                 let ptx_sha256 = bundle.add_record(&ptx_name, &ptx)?;
+                let link_add_started = std::time::Instant::now();
                 linker.add(&ptx_name, &ptx)?;
+                let jit_link_add_elapsed = link_add_started.elapsed();
                 partitions.push(MaterializedPartition {
                     name: input.name.to_string(),
                     source_bytes,
                     ptx_bytes: ptx.len(),
                     ptx_sha256,
                     nvvm_compile_elapsed,
+                    jit_link_add_elapsed,
                     peak_rss_kib: process_peak_rss_kib(),
                 });
             }

@@ -1154,11 +1154,12 @@ fn materialize_artifact_for_embedding(
                 eprintln!(
                     "[rustc_codegen_cuda] owner partition finalization: index={index} \
                      name={} source_bytes={} ptx_bytes={} nvvm_compile_elapsed={:?} \
-                     peak_rss_kib={:?}",
+                     jit_link_add_elapsed={:?} peak_rss_kib={:?}",
                     partition.name,
                     partition.source_bytes,
                     partition.ptx_bytes,
                     partition.nvvm_compile_elapsed,
+                    partition.jit_link_add_elapsed,
                     partition.peak_rss_kib,
                 );
             }
