@@ -1634,7 +1634,7 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
     assert!(
         partition
             .llvm_ir
-            .contains("@__device_global_0 = internal addrspace(1) global"),
+            .contains("@__device_global_0 = linkonce_odr addrspace(1) global"),
         "{}",
         partition.llvm_ir
     );

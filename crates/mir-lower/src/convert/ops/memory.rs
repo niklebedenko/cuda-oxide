@@ -1066,15 +1066,14 @@ struct DeviceGlobalSpec<'a> {
     immutable: bool,
 }
 
-/// `next_device_global_index` is scoped to one `MirToLlvmConversionDriver`
-/// instance (one module), not a process-global counter: `N` is a function of
-/// this module's own MIR walk order, not of how many other modules have
-/// lowered a device global earlier in the process (#706).
+/// The driver still passes its per-module index state for compatibility with
+/// the shared-memory allocator, but device-global names are derived from the
+/// source key so independent owner partitions coalesce the same Rust static.
 fn create_device_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
     device_globals: &mut DeviceGlobalsMap,
-    next_device_global_index: &mut usize,
+    _next_device_global_index: &mut usize,
     spec: DeviceGlobalSpec<'_>,
 ) -> Result<pliron::identifier::Identifier> {
     // An explicit initializer is already the evaluated Rust allocation image.
@@ -1112,7 +1111,9 @@ fn create_device_global(
 
     // Constant-memory globals reuse the Rust-side mangled name so host code can
     // resolve them by name via `cuModuleGetGlobal`. Ordinary device globals
-    // are private to the kernel and get a counter-based unique name.
+    // keep the same mangled identity behind a private prefix. Independent
+    // owner partitions therefore emit the same linkable symbol for the same
+    // Rust static rather than partition-local counter names.
     let name: pliron::identifier::Identifier =
         if spec.addr_space == llvm_export::types::address_space::CONSTANT {
             spec.key.try_into().map_err(|e| {
@@ -1122,9 +1123,14 @@ fn create_device_global(
                 ))
             })?
         } else {
-            let counter = *next_device_global_index;
-            *next_device_global_index += 1;
-            format!("__device_global_{counter}").try_into().unwrap()
+            format!("__device_global_{}", spec.key)
+                .try_into()
+                .map_err(|e| {
+                    anyhow_to_pliron(anyhow::anyhow!(
+                        "ordinary device global key {:?} is not a valid symbol suffix: {e:?}",
+                        spec.key
+                    ))
+                })?
         };
 
     let global_op = if alignment > 0 {
@@ -2746,20 +2752,35 @@ mod tests {
             .expect("expected one global in addrspace(4)");
 
         // Constant-memory globals reuse the Rust mangled name so host code can
-        // resolve them by name via `cuModuleGetGlobal`; ordinary globals get
-        // a counter-suffixed `__device_global_N`.
+        // resolve them by name via `cuModuleGetGlobal`; ordinary globals keep
+        // that stable key behind the private generated-global prefix.
         assert_eq!(
             global_addr_const.get_symbol_name(&ctx).to_string(),
             "_ZN7my_mod3KEYE",
             "constant globals must keep the mangled global_key as symbol name"
         );
-        assert!(
-            global_addr_global
-                .get_symbol_name(&ctx)
-                .to_string()
-                .starts_with("__device_global_"),
-            "ordinary device globals get the __device_global_ prefix"
+        assert_eq!(
+            global_addr_global.get_symbol_name(&ctx).to_string(),
+            "__device_global_ordinary_static",
+            "ordinary device globals derive their symbol from stable global identity"
         );
+
+        // A separate lowering context models another owner partition. The
+        // same Rust static key must produce the same linkable definition.
+        let mut other_ctx = make_ctx();
+        let (other_module, other_block) = build_kernel(&mut other_ctx, vec![], vec![]);
+        append_global_alloc(&mut other_ctx, other_block, "ordinary_static", false);
+        append_mir_return(&mut other_ctx, other_block, vec![]);
+        crate::lower_mir_to_llvm(&mut other_ctx, other_module).expect("lowering failed");
+        let other_top = module_top_block(&other_ctx, other_module);
+        let other_name = other_top
+            .deref(&other_ctx)
+            .iter(&other_ctx)
+            .find_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &other_ctx))
+            .expect("expected global in independent partition")
+            .get_symbol_name(&other_ctx)
+            .to_string();
+        assert_eq!(other_name, "__device_global_ordinary_static");
     }
 
     #[test]

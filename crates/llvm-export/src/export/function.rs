@@ -138,9 +138,14 @@ impl<'a> ModuleExportState<'a> {
             // Rust allocations and static shared-memory slots are private
             // implementation details of an NVVM module. Named user globals
             // retain external linkage for host-side symbol lookup.
-            let is_internal = (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
-                && (name.starts_with("__device_global_") || name.starts_with("__shared_mem_"));
-            if !is_internal {
+            let is_generated_device_global = name.starts_with("__device_global_");
+            let is_generated_shared_global = name.starts_with("__shared_mem_");
+            let is_partition_coalescible_device_global =
+                self.partitioned_owner && is_generated_device_global;
+            let is_internal = !is_partition_coalescible_device_global
+                && (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
+                && (is_generated_device_global || is_generated_shared_global);
+            if !is_internal && !is_partition_coalescible_device_global {
                 self.public_globals.push(name.to_string());
             }
 

@@ -12,6 +12,8 @@ const MODULE_A: &[u8] = br#"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
+@__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+
 define linkonce_odr i32 @shared_device(i32 %value) #0 {
 entry:
   %result = add i32 %value, 7
@@ -20,7 +22,9 @@ entry:
 
 define void @kernel_a(i32* %output) {
 entry:
-  %value = call i32 @shared_device(i32 11)
+  %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
+  %value = call i32 @shared_device(i32 %global_value)
+  store i32 %value, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
   store i32 %value, i32* %output, align 4
   ret void
 }
@@ -39,6 +43,8 @@ const MODULE_B: &[u8] = br#"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
+@__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+
 define linkonce_odr i32 @shared_device(i32 %value) #0 {
 entry:
   %result = add i32 %value, 7
@@ -47,7 +53,9 @@ entry:
 
 define void @kernel_b(i32* %output) {
 entry:
-  %value = call i32 @shared_device(i32 13)
+  %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
+  %value = call i32 @shared_device(i32 %global_value)
+  store i32 %value, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
   store i32 %value, i32* %output, align 4
   ret void
 }
@@ -86,6 +94,8 @@ fn pressure_module(index: usize, operations: usize) -> Vec<u8> {
         r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16-v32:32-v64:64-v128:128-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
+@__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+
 define linkonce_odr i32 @shared_device(i32 %value) #0 {{
 entry:
   %result = add i32 %value, 7
@@ -94,7 +104,9 @@ entry:
 
 define void @kernel_{index}(i32* %output) {{
 entry:
-  %seed = call i32 @shared_device(i32 {index})"#
+  %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
+  %seed = call i32 @shared_device(i32 %global_value)
+  store i32 %seed, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4"#
     )
     .expect("writing a String cannot fail");
     let mut previous = "%seed".to_string();
