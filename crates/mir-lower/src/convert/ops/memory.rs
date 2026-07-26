@@ -77,6 +77,7 @@ use pliron::result::Result;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
+use sha2::{Digest as _, Sha256};
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::create_error!(
@@ -1066,9 +1067,12 @@ struct DeviceGlobalSpec<'a> {
     immutable: bool,
 }
 
-/// The driver still passes its per-module index state for compatibility with
-/// the shared-memory allocator, but device-global names are derived from the
-/// source key so independent owner partitions coalesce the same Rust static.
+fn ordinary_device_global_name(key: &str) -> pliron::identifier::Identifier {
+    let digest = Sha256::digest(key.as_bytes());
+    format!("__device_global_{digest:x}")
+        .try_into()
+        .expect("SHA-256 device-global symbol is a valid identifier")
+}
 fn create_device_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
@@ -1110,10 +1114,10 @@ fn create_device_global(
     };
 
     // Constant-memory globals reuse the Rust-side mangled name so host code can
-    // resolve them by name via `cuModuleGetGlobal`. Ordinary device globals
-    // keep the same mangled identity behind a private prefix. Independent
-    // owner partitions therefore emit the same linkable symbol for the same
-    // Rust static rather than partition-local counter names.
+    // resolve them by name via `cuModuleGetGlobal`. Ordinary device globals use
+    // a full digest of their semantic key. The bounded symbol accepts structural
+    // keys as well as Rust identifiers, and independent owner partitions emit
+    // the same linkable symbol for the same allocation.
     let name: pliron::identifier::Identifier =
         if spec.addr_space == llvm_export::types::address_space::CONSTANT {
             spec.key.try_into().map_err(|e| {
@@ -1123,14 +1127,7 @@ fn create_device_global(
                 ))
             })?
         } else {
-            format!("__device_global_{}", spec.key)
-                .try_into()
-                .map_err(|e| {
-                    anyhow_to_pliron(anyhow::anyhow!(
-                        "ordinary device global key {:?} is not a valid symbol suffix: {e:?}",
-                        spec.key
-                    ))
-                })?
+            ordinary_device_global_name(spec.key)
         };
 
     let global_op = if alignment > 0 {
@@ -2752,8 +2749,8 @@ mod tests {
             .expect("expected one global in addrspace(4)");
 
         // Constant-memory globals reuse the Rust mangled name so host code can
-        // resolve them by name via `cuModuleGetGlobal`; ordinary globals keep
-        // that stable key behind the private generated-global prefix.
+        // resolve them by name via `cuModuleGetGlobal`; ordinary globals use a
+        // bounded digest of the stable semantic key.
         assert_eq!(
             global_addr_const.get_symbol_name(&ctx).to_string(),
             "_ZN7my_mod3KEYE",
@@ -2761,7 +2758,7 @@ mod tests {
         );
         assert_eq!(
             global_addr_global.get_symbol_name(&ctx).to_string(),
-            "__device_global_ordinary_static",
+            ordinary_device_global_name("ordinary_static").to_string(),
             "ordinary device globals derive their symbol from stable global identity"
         );
 
@@ -2780,7 +2777,54 @@ mod tests {
             .expect("expected global in independent partition")
             .get_symbol_name(&other_ctx)
             .to_string();
-        assert_eq!(other_name, "__device_global_ordinary_static");
+        assert_eq!(
+            other_name,
+            ordinary_device_global_name("ordinary_static").to_string()
+        );
+    }
+
+    #[test]
+    fn convert_global_alloc_hashes_structural_key_to_stable_symbol() {
+        let key =
+            "__cuda_oxide_promoted_type32:<mir.array <builtin.fp32 ,2>,32>:bytes8:0000803f00000040";
+        let expected = ordinary_device_global_name(key).to_string();
+        assert_eq!(expected.len(), "__device_global_".len() + 64);
+        assert!(
+            expected
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        );
+        assert_ne!(
+            expected,
+            ordinary_device_global_name(
+                "__cuda_oxide_promoted_type32:<mir.array <builtin.fp32 ,2>,32>:bytes8:0000803f00000041"
+            )
+            .to_string(),
+            "distinct allocation keys must not share a generated symbol"
+        );
+
+        let lower_name = |ctx: &mut Context| {
+            let (module_ptr, block) = build_kernel(ctx, vec![], vec![]);
+            append_global_alloc(ctx, block, key, false);
+            append_mir_return(ctx, block, vec![]);
+            crate::lower_mir_to_llvm(ctx, module_ptr).expect("lowering failed");
+            module_top_block(ctx, module_ptr)
+                .deref(ctx)
+                .iter(ctx)
+                .find_map(|op| Operation::get_op::<llvm::GlobalOp>(op, ctx))
+                .expect("expected structural-key device global")
+                .get_symbol_name(ctx)
+                .to_string()
+        };
+
+        let mut first_ctx = make_ctx();
+        let mut second_ctx = make_ctx();
+        assert_eq!(lower_name(&mut first_ctx), expected);
+        assert_eq!(
+            lower_name(&mut second_ctx),
+            expected,
+            "independent owner partitions must derive the same symbol"
+        );
     }
 
     #[test]
