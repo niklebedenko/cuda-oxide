@@ -38,6 +38,7 @@ linkme = "0.3"            # must match workspace
 combine = "4.6"           # must match workspace
 once_cell = "1.18"        # must match workspace
 thiserror = "2"           # must match workspace
+sha2 = "0.10"             # must match workspace
 
 # Note: rustc internal crates are NOT listed here.
 # They're accessed via `extern crate` with #![feature(rustc_private)]

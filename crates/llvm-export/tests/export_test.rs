@@ -78,6 +78,46 @@ impl<C: ExportBackendConfig> ExportBackendConfig for DebugConfig<C> {
     }
 }
 
+struct PartitionedConfig<C>(C);
+
+impl<C: ExportBackendConfig> ExportBackendConfig for PartitionedConfig<C> {
+    fn datalayout(&self) -> &str {
+        self.0.datalayout()
+    }
+
+    fn emit_llvm_used(&self) -> bool {
+        self.0.emit_llvm_used()
+    }
+
+    fn emit_nvvmir_version(&self) -> bool {
+        self.0.emit_nvvmir_version()
+    }
+
+    fn nvvmir_version(&self) -> [i32; 4] {
+        self.0.nvvmir_version()
+    }
+
+    fn emit_all_kernel_annotations(&self) -> bool {
+        self.0.emit_all_kernel_annotations()
+    }
+
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        self.0.emit_ptx_kernel_keyword()
+    }
+
+    fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
+        self.0.nvvm_ir_dialect()
+    }
+
+    fn debug_kind(&self) -> DebugKind {
+        self.0.debug_kind()
+    }
+
+    fn partitioned_owner(&self) -> bool {
+        true
+    }
+}
+
 fn src_location(ctx: &mut Context, file: &str, line: i32, column: i32) -> Location {
     Location::SrcPos {
         src: Source::new_from_file(ctx, PathBuf::from(file)),
@@ -1578,6 +1618,53 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
         ptx.llvm_ir.contains("define void @rust_mangled_helper()"),
         "{}",
         ptx.llvm_ir
+    );
+
+    let partition = export_module_with_externs_and_roots::<DeviceExternDecl>(
+        &ctx,
+        &module,
+        &[],
+        &PartitionedConfig(PtxExportConfig),
+    )
+    .expect("partition PTX export succeeds");
+    assert_eq!(
+        partition.public_symbols,
+        ["HOST_GLOBAL", "entry_kernel", "standalone_export"]
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("@__device_global_0 = internal addrspace(1) global"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("@HOST_GLOBAL = linkonce_odr addrspace(1) global"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("define internal void @rust_mangled_helper()"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("define linkonce_odr void @standalone_export()"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("define ptx_kernel void @entry_kernel()"),
+        "{}",
+        partition.llvm_ir
     );
 }
 

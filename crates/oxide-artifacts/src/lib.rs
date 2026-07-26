@@ -9,6 +9,8 @@
 //! backend. A bundle names a producer, records the device target it was built
 //! for, and carries one or more generated device-code payloads.
 
+pub mod ptx_bundle;
+
 use core::fmt;
 
 pub const ARTIFACT_SECTION_NAME: &str = ".oxart";

@@ -126,6 +126,8 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_kind: DebugKind,
     /// NVVM textual dialect, or `None` for the ordinary PTX/llc path.
     pub(super) nvvm_ir_dialect: Option<NvvmIrDialect>,
+    /// This module is one closure-complete partition of a larger owner.
+    pub(super) partitioned_owner: bool,
     /// The single compile unit used for Stage 2 line-table debug info.
     pub(super) debug_compile_unit: Option<usize>,
     /// `DIFile` nodes keyed by the source path they describe.
@@ -173,6 +175,7 @@ impl<'a> ModuleExportState<'a> {
         emit_ptx_kernel_keyword: bool,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
+        partitioned_owner: bool,
     ) -> Self {
         Self {
             ctx,
@@ -194,6 +197,7 @@ impl<'a> ModuleExportState<'a> {
             full_unroll_loop_ids: FxHashMap::default(),
             debug_kind,
             nvvm_ir_dialect,
+            partitioned_owner,
             debug_compile_unit: None,
             debug_files: FxHashMap::default(),
             debug_subroutine_type: None,

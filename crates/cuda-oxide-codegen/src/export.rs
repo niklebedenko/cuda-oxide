@@ -213,6 +213,7 @@ pub fn export_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
+    partitioned_owner: bool,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let exported = render_exported_llvm_ir(
         ctx,
@@ -221,6 +222,7 @@ pub fn export_llvm_ir(
         emit_nvvm_ir,
         nvvm_dialect,
         debug_kind,
+        partitioned_owner,
     )?;
 
     std::fs::write(path, &exported.llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
@@ -242,6 +244,7 @@ pub fn render_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
+    partitioned_owner: bool,
 ) -> Result<String, PipelineError> {
     render_exported_llvm_ir(
         ctx,
@@ -250,6 +253,7 @@ pub fn render_llvm_ir(
         emit_nvvm_ir,
         nvvm_dialect,
         debug_kind,
+        partitioned_owner,
     )
     .map(|exported| exported.llvm_ir)
 }
@@ -261,6 +265,7 @@ fn render_exported_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
+    partitioned_owner: bool,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
@@ -272,6 +277,7 @@ fn render_exported_llvm_ir(
         let config = PipelineExportConfig {
             inner: llvm_export::export::NvvmExportConfig::new(dialect),
             debug_kind,
+            partitioned_owner,
         };
         llvm_export::export::export_module_with_externs_and_roots(
             ctx,
@@ -284,6 +290,7 @@ fn render_exported_llvm_ir(
         let config = PipelineExportConfig {
             inner: llvm_export::export::PtxExportConfig,
             debug_kind,
+            partitioned_owner,
         };
         llvm_export::export::export_module_with_externs_and_roots(
             ctx,
@@ -300,6 +307,7 @@ fn render_exported_llvm_ir(
 struct PipelineExportConfig<C> {
     inner: C,
     debug_kind: DebugKind,
+    partitioned_owner: bool,
 }
 
 impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
@@ -333,6 +341,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
 
     fn debug_kind(&self) -> DebugKind {
         self.debug_kind
+    }
+
+    fn partitioned_owner(&self) -> bool {
+        self.partitioned_owner
     }
 }
 
@@ -763,7 +775,8 @@ mod tests {
         let mut ctx = Context::new();
         let module_ptr = build_module_with_func_decl(&mut ctx, "llvm_nvvm_tcgen05_alloc");
 
-        let preview = render_llvm_ir(&ctx, module_ptr, &[], false, None, DebugKind::Off).unwrap();
+        let preview =
+            render_llvm_ir(&ctx, module_ptr, &[], false, None, DebugKind::Off, false).unwrap();
 
         assert!(preview.contains("@llvm.nvvm.tcgen05.alloc"), "{preview}");
         assert_eq!(

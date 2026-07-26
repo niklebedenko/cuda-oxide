@@ -17,8 +17,10 @@
 
 use cuda_artifact_finalizer::{
     CudaArch, CudaArchParseError, DebugPolicy, FinalizationOptions, Finalizer, FinalizerError,
-    FinalizerOutput, MaterializedNvvmIr, NamedInput,
+    FinalizerOutput, MaterializedNvvmIr, MaterializedPartitionedOwner, NamedInput,
+    PartitionFileInput,
 };
+use std::path::Path;
 use thiserror::Error;
 
 pub(crate) const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
@@ -167,6 +169,19 @@ pub(crate) fn ptx_to_cubin(
     let options = options(target, allow_fma_contraction, debug_policy)?;
     let finalizer = checked_finalizer(request)?;
     Ok(finalizer.link_ptx(&[NamedInput::new(module_name, ptx)], &options)?)
+}
+
+pub(crate) fn partition_files_to_cubin(
+    request: MaterializationRequest,
+    inputs: &[PartitionFileInput<'_>],
+    ptx_bundle_path: &Path,
+    target: &str,
+    allow_fma_contraction: bool,
+    debug_policy: DebugPolicy,
+) -> Result<MaterializedPartitionedOwner, MaterializeError> {
+    let options = options(target, allow_fma_contraction, debug_policy)?;
+    let finalizer = checked_finalizer(request)?;
+    Ok(finalizer.materialize_partition_files(inputs, ptx_bundle_path, &options)?)
 }
 
 fn options(

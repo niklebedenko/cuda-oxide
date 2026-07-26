@@ -353,6 +353,7 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "oxide-artifacts",
  "sha2",
  "thiserror",
 ]
@@ -960,6 +961,7 @@ name = "oxide-artifacts"
 version = "0.2.1"
 dependencies = [
  "object",
+ "sha2",
 ]
 
 [[package]]

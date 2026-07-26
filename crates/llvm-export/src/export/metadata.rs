@@ -169,7 +169,7 @@ mod tests {
     use pliron::context::Context;
 
     fn test_state<'a>(ctx: &'a Context) -> ModuleExportState<'a> {
-        ModuleExportState::new(ctx, false, DebugKind::Off, None)
+        ModuleExportState::new(ctx, false, DebugKind::Off, None, false)
     }
 
     #[test]

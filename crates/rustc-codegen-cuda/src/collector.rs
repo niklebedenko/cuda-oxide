@@ -134,7 +134,7 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Blocks reachable under the values CUDA Oxide emits for device-only runtime
 /// checks.
@@ -392,6 +392,27 @@ pub struct CollectionResult<'tcx> {
 
     /// External device function declarations (no MIR, emit as `declare`).
     pub device_externs: Vec<DeviceExternDecl>,
+
+    /// Deterministic transitive function closures rooted at each kernel or
+    /// standalone `#[device]` export.
+    ///
+    /// Large AOT owners use these closures as indivisible partition families,
+    /// keeping every ordinary helper with each root that calls it. Symbols are
+    /// rustc's mangled monomorphization identities rather than collection
+    /// indices, so changing CGU or traversal order cannot change the family.
+    pub function_families: Vec<DeviceFunctionFamily>,
+}
+
+/// One exported device root and its complete transitive definition closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceFunctionFamily {
+    /// Mangled monomorphization identity of the root.
+    pub root_symbol: String,
+    /// User-visible export name of the root.
+    pub root_export_name: String,
+    /// Sorted mangled identities of every definition reachable from the root,
+    /// including the root itself.
+    pub function_symbols: Vec<String>,
 }
 
 /// Counts kernel functions across all codegen units.
@@ -821,6 +842,7 @@ pub fn collect_device_functions<'tcx>(
     verbose: bool,
 ) -> CollectionResult<'tcx> {
     let mut collector = DeviceCollector::new(tcx, verbose);
+    let mut roots = Vec::new();
 
     // Find all kernel entry points
     for cgu in cgus {
@@ -865,9 +887,14 @@ pub fn collect_device_functions<'tcx>(
                     eprintln!("[collector] Found kernel: {} -> {}", name, export_name);
                 }
 
-                collector.add_root(*instance, true, export_name);
+                roots.push((*instance, true, export_name));
             }
         }
+    }
+    roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
+    roots.dedup_by(|left, right| left.0 == right.0);
+    for (instance, is_kernel, export_name) in roots.drain(..) {
+        collector.add_root(instance, is_kernel, export_name);
     }
 
     // Find standalone device function roots (Phase 2: device functions without kernels).
@@ -901,9 +928,14 @@ pub fn collect_device_functions<'tcx>(
                     }
 
                     // Add as a non-kernel root — produces .func (not .entry) in PTX
-                    collector.add_root(*instance, false, export_name);
+                    roots.push((*instance, false, export_name));
                 }
             }
+        }
+        roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
+        roots.dedup_by(|left, right| left.0 == right.0);
+        for (instance, is_kernel, export_name) in roots {
+            collector.add_root(instance, is_kernel, export_name);
         }
     }
 
@@ -932,6 +964,10 @@ struct DeviceCollector<'tcx> {
     discovery: HashMap<String, DiscoveryCtx>,
     /// Functions collected so far, in discovery order.
     result: Vec<CollectedFunction<'tcx>>,
+    /// Mangled root identities, in canonical order.
+    roots: Vec<String>,
+    /// Direct call graph between definitions that survive collection.
+    call_edges: HashMap<String, BTreeSet<String>>,
     /// External device function declarations collected (for FFI with external LTOIR).
     device_externs: Vec<DeviceExternDecl>,
     /// DefIds of device externs already seen (prevents duplicates).
@@ -954,6 +990,8 @@ impl<'tcx> DeviceCollector<'tcx> {
             worklist: VecDeque::new(),
             discovery: HashMap::new(),
             result: Vec::new(),
+            roots: Vec::new(),
+            call_edges: HashMap::new(),
             device_externs: Vec::new(),
             seen_device_externs: HashSet::new(),
             warned_dynamic_shared_array: false,
@@ -990,6 +1028,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // vs map<f32, Closure2>)
         let mangled = self.tcx.symbol_name(instance).name.to_string();
         if self.seen.insert(mangled.clone()) {
+            self.roots.push(mangled.clone());
             // A root is its own provenance: diagnostics fall back to its
             // definition site until a more precise user-code call site is
             // recorded along a discovery edge.
@@ -1008,6 +1047,12 @@ impl<'tcx> DeviceCollector<'tcx> {
                 export_name,
             });
         }
+    }
+
+    fn record_call_edge(&mut self, caller: Instance<'tcx>, callee: Instance<'tcx>) {
+        let caller = self.tcx.symbol_name(caller).name.to_string();
+        let callee = self.tcx.symbol_name(callee).name.to_string();
+        self.call_edges.entry(caller).or_default().insert(callee);
     }
 
     /// Runs collection to completion, returning all discovered functions and extern declarations.
@@ -1087,9 +1132,12 @@ impl<'tcx> DeviceCollector<'tcx> {
             self.result.push(func);
         }
 
+        let function_families =
+            build_device_function_families(self.tcx, &self.roots, &self.call_edges, &self.result);
         CollectionResult {
             functions: self.result,
             device_externs: self.device_externs,
+            function_families,
         }
     }
 
@@ -1223,6 +1271,7 @@ impl<'tcx> DeviceCollector<'tcx> {
 
         let mangled = self.tcx.symbol_name(drop_instance).name.to_string();
         if self.seen.contains(&mangled) {
+            self.record_call_edge(caller.instance, drop_instance);
             return;
         }
 
@@ -1273,6 +1322,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             );
         }
 
+        self.record_call_edge(caller.instance, drop_instance);
         self.discovery.insert(mangled.clone(), drop_ctx);
         self.seen.insert(mangled);
         self.used_export_names.insert(export_name.clone());
@@ -1473,6 +1523,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Skip already-seen monomorphizations (use mangled name as unique key)
         let mangled = self.tcx.symbol_name(resolved).name.to_string();
         if self.seen.contains(&mangled) {
+            self.record_call_edge(caller.instance, resolved);
             return;
         }
 
@@ -1505,6 +1556,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         if let InstanceKind::DropGlue(_, Some(_)) = resolved.def {
             let mangled = self.tcx.symbol_name(resolved).name.to_string();
             if self.seen.contains(&mangled) {
+                self.record_call_edge(caller.instance, resolved);
                 return;
             }
             if !is_fully_monomorphized(self.tcx, resolved) {
@@ -1531,6 +1583,7 @@ impl<'tcx> DeviceCollector<'tcx> {
                     export_name
                 );
             }
+            self.record_call_edge(caller.instance, resolved);
             self.discovery.insert(mangled.clone(), callee_ctx);
             self.seen.insert(mangled);
             self.used_export_names.insert(export_name.clone());
@@ -1657,6 +1710,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             eprintln!("[collector] Discovered callee: {} -> {}", name, export_name);
         }
 
+        self.record_call_edge(caller.instance, resolved);
         self.discovery.insert(mangled.clone(), callee_ctx);
         self.seen.insert(mangled);
         self.worklist.push_back(CollectedFunction {
@@ -1758,6 +1812,7 @@ impl<'tcx> DeviceCollector<'tcx> {
 
         let mangled = self.tcx.symbol_name(instance).name.to_string();
         if self.seen.contains(&mangled) {
+            self.record_call_edge(caller.instance, instance);
             return;
         }
         if !is_fully_monomorphized(self.tcx, instance) {
@@ -1783,6 +1838,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             );
         }
 
+        self.record_call_edge(caller.instance, instance);
         self.discovery.insert(mangled.clone(), ctx.clone());
         self.seen.insert(mangled);
         self.worklist.push_back(CollectedFunction {
@@ -2420,10 +2476,61 @@ pub fn dump_device_mir_info<'tcx>(tcx: TyCtxt<'tcx>, functions: &[CollectedFunct
     eprintln!("=================================\n");
 }
 
+fn build_device_function_families<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    roots: &[String],
+    call_edges: &HashMap<String, BTreeSet<String>>,
+    functions: &[CollectedFunction<'tcx>],
+) -> Vec<DeviceFunctionFamily> {
+    let functions_by_symbol = functions
+        .iter()
+        .map(|function| {
+            (
+                tcx.symbol_name(function.instance).name.to_string(),
+                function.export_name.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    build_function_families_from_symbols(roots, call_edges, &functions_by_symbol)
+}
+
+fn build_function_families_from_symbols(
+    roots: &[String],
+    call_edges: &HashMap<String, BTreeSet<String>>,
+    functions_by_symbol: &HashMap<String, &str>,
+) -> Vec<DeviceFunctionFamily> {
+    let mut canonical_roots = roots.to_vec();
+    canonical_roots.sort();
+    canonical_roots.dedup();
+    canonical_roots
+        .into_iter()
+        .filter_map(|root_symbol| {
+            let root_export_name = functions_by_symbol.get(&root_symbol)?.to_string();
+            let mut reachable = BTreeSet::new();
+            let mut pending = vec![root_symbol.clone()];
+            while let Some(symbol) = pending.pop() {
+                if !reachable.insert(symbol.clone()) {
+                    continue;
+                }
+                if let Some(callees) = call_edges.get(&symbol) {
+                    pending.extend(callees.iter().rev().cloned());
+                }
+            }
+            reachable.retain(|symbol| functions_by_symbol.contains_key(symbol));
+            Some(DeviceFunctionFamily {
+                root_symbol,
+                root_export_name,
+                function_symbols: reachable.into_iter().collect(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        device_runtime_checks_target, is_kernel_entry_def_path, is_legacy_warp_shuffle_value_path,
+        build_function_families_from_symbols, device_runtime_checks_target,
+        is_kernel_entry_def_path, is_legacy_warp_shuffle_value_path,
         unsupported_codegen_protocol_root,
     };
     use reserved_oxide_symbols::{
@@ -2431,6 +2538,55 @@ mod tests {
     };
     use rustc_index::Idx;
     use rustc_middle::mir::BasicBlock;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn function_families_are_canonical_across_root_and_edge_order() {
+        let functions = HashMap::from([
+            ("kernel_a".to_string(), "kernel_a"),
+            ("kernel_b".to_string(), "kernel_b"),
+            ("shared".to_string(), "shared"),
+            ("leaf_a".to_string(), "leaf_a"),
+            ("leaf_b".to_string(), "leaf_b"),
+        ]);
+        let edges = HashMap::from([
+            (
+                "kernel_b".to_string(),
+                BTreeSet::from(["leaf_b".to_string(), "shared".to_string()]),
+            ),
+            (
+                "kernel_a".to_string(),
+                BTreeSet::from(["leaf_a".to_string(), "shared".to_string()]),
+            ),
+        ]);
+        let roots = vec!["kernel_b".to_string(), "kernel_a".to_string()];
+        let baseline = build_function_families_from_symbols(&roots, &edges, &functions);
+
+        let mut reversed_roots = roots;
+        reversed_roots.reverse();
+        let mut edge_entries = edges.into_iter().collect::<Vec<_>>();
+        edge_entries.reverse();
+        let reversed_edges = edge_entries.into_iter().collect();
+        let reordered =
+            build_function_families_from_symbols(&reversed_roots, &reversed_edges, &functions);
+
+        assert_eq!(baseline, reordered);
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|family| family.root_export_name.as_str())
+                .collect::<Vec<_>>(),
+            ["kernel_a", "kernel_b"]
+        );
+        assert_eq!(
+            baseline[0].function_symbols,
+            ["kernel_a", "leaf_a", "shared"]
+        );
+        assert_eq!(
+            baseline[1].function_symbols,
+            ["kernel_b", "leaf_b", "shared"]
+        );
+    }
 
     #[test]
     fn scoped_cache_protocol_rejects_legacy_local_and_external_roots() {

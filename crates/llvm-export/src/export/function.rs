@@ -138,7 +138,7 @@ impl<'a> ModuleExportState<'a> {
             // Rust allocations and static shared-memory slots are private
             // implementation details of an NVVM module. Named user globals
             // retain external linkage for host-side symbol lookup.
-            let is_internal = self.nvvm_ir_dialect.is_some()
+            let is_internal = (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
                 && (name.starts_with("__device_global_") || name.starts_with("__shared_mem_"));
             if !is_internal {
                 self.public_globals.push(name.to_string());
@@ -160,6 +160,8 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "@{name} = ").unwrap();
             if is_internal {
                 write!(output, "internal ").unwrap();
+            } else if self.partitioned_owner {
+                write!(output, "linkonce_odr ").unwrap();
             }
             write!(output, "addrspace({address_space}) {storage_keyword} ").unwrap();
             self.export_type(ty, output)?;
@@ -702,8 +704,13 @@ impl<'a> ModuleExportState<'a> {
             // outside this module. Ordinary Rust definitions are module-local
             // helpers and need internal linkage so libNVVM can inline and
             // eliminate them.
-            if self.nvvm_ir_dialect.is_some() && !is_kernel && !has_device_prefix(&func_name) {
+            if (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
+                && !is_kernel
+                && !has_device_prefix(&func_name)
+            {
                 write!(output, "internal ").unwrap();
+            } else if self.partitioned_owner && !is_kernel && has_device_prefix(&func_name) {
+                write!(output, "linkonce_odr ").unwrap();
             }
             if is_kernel && self.emit_ptx_kernel_keyword {
                 write!(output, "ptx_kernel ").unwrap();

@@ -423,6 +423,7 @@ pub(super) fn export_module_with_externs_impl(
         emit_ptx_kernel_keyword,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
+        config.partitioned_owner(),
     );
     index_module_symbols(&mut state, module)?;
     index_device_externs(&mut state, device_externs)?;
@@ -617,6 +618,7 @@ pub(super) fn export_module_to_string_with_config(
         emit_ptx_kernel_keyword,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
+        config.partitioned_owner(),
     );
     index_module_symbols(&mut state, module)?;
 

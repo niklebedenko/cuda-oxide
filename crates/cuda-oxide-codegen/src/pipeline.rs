@@ -95,6 +95,7 @@ pub struct ModulePipelineRequest<'a> {
     files: OutputFiles<'a>,
     trace: PipelineTrace,
     generated_marker_policy: GeneratedMarkerPolicy,
+    partitioned_owner: bool,
 }
 
 impl<'a> ModulePipelineRequest<'a> {
@@ -103,6 +104,7 @@ impl<'a> ModulePipelineRequest<'a> {
     pub fn for_rust_pipeline(
         device_externs: &'a [DeviceExternDecl],
         request_nvvm_ir: bool,
+        partitioned_owner: bool,
         backend: &'a BackendOptions,
         debug_kind: DebugKind,
         files: OutputFiles<'a>,
@@ -117,6 +119,7 @@ impl<'a> ModulePipelineRequest<'a> {
             files,
             trace,
             generated_marker_policy: GeneratedMarkerPolicy::Required,
+            partitioned_owner,
         }
     }
 
@@ -136,6 +139,7 @@ impl<'a> ModulePipelineRequest<'a> {
             files,
             trace: PipelineTrace::default(),
             generated_marker_policy: GeneratedMarkerPolicy::Optional,
+            partitioned_owner: false,
         }
     }
 }
@@ -318,6 +322,7 @@ pub fn compile_translated_module(
             false,
             None,
             request.debug_kind,
+            request.partitioned_owner,
         )?;
         Some(detect_features_in_llvm_text(&preview))
     } else {
@@ -406,6 +411,7 @@ pub fn compile_translated_module(
         emit_nvvm_ir,
         nvvm_dialect,
         request.debug_kind,
+        request.partitioned_owner,
     )?;
     if request.trace.verbose {
         request.trace.emit(format!(

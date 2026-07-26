@@ -13,6 +13,7 @@ use crate::validation::is_valid_cubin;
 use crate::{FinalizerError, validate_name};
 use nvjitlink_sys::{InputType, LibNvJitLink, Linker};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 struct LoadedLinkerTool {
     library: Arc<LibNvJitLink>,
@@ -70,6 +71,45 @@ impl LtoLinker {
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
         self.link_inputs(inputs, LinkInputKind::Ptx, options, FinalizerOutput::Cubin)
+    }
+
+    pub(crate) fn link_ptx_streaming<F>(
+        &self,
+        options: &FinalizationOptions,
+        add_inputs: F,
+    ) -> Result<(Vec<u8>, Duration), FinalizerError>
+    where
+        F: FnOnce(&mut PtxLinkSink<'_, '_>) -> Result<(), FinalizerError>,
+    {
+        with_revalidated_tool_identity(
+            "nvJitLink",
+            self.tool.digest,
+            || current_linker_tool_digest(&self.tool),
+            || {
+                let option_storage = options.nvjitlink_ptx_options();
+                let option_refs = option_storage
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let mut linker = Linker::new(&self.tool.library, &option_refs)?;
+                let mut sink = PtxLinkSink {
+                    linker: &mut linker,
+                    input_count: 0,
+                };
+                add_inputs(&mut sink)?;
+                if sink.input_count == 0 {
+                    return Err(FinalizerError::NoLinkInputs);
+                }
+                drop(sink);
+                let started = std::time::Instant::now();
+                let image = linker.finish()?;
+                let elapsed = started.elapsed();
+                if !is_valid_cubin(&image) {
+                    return Err(FinalizerError::InvalidCubin);
+                }
+                Ok((image, elapsed))
+            },
+        )
     }
 
     fn link_inputs(
@@ -136,6 +176,20 @@ impl LtoLinker {
     }
 }
 
+pub(crate) struct PtxLinkSink<'linker, 'tool> {
+    linker: &'linker mut Linker<'tool>,
+    input_count: usize,
+}
+
+impl PtxLinkSink<'_, '_> {
+    pub(crate) fn add(&mut self, name: &str, bytes: &[u8]) -> Result<(), FinalizerError> {
+        validate_input(&NamedInput::new(name, bytes), LinkInputKind::Ptx)?;
+        self.linker.add(InputType::Ptx, bytes, name)?;
+        self.input_count += 1;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LinkInputKind {
     Ltoir,
@@ -164,21 +218,26 @@ fn validate_inputs(
         return Err(FinalizerError::NoLinkInputs);
     }
     for input in inputs {
-        validate_name(input.name)?;
-        if input.bytes.is_empty() {
-            return Err(FinalizerError::EmptyInput {
-                name: input.name.to_string(),
-            });
-        }
-        if matches!(input_kind, LinkInputKind::Ptx)
-            && let Some(offset) = input.bytes.iter().position(|byte| *byte == 0)
-            && offset + 1 != input.bytes.len()
-        {
-            return Err(FinalizerError::InteriorNulPtx {
-                name: input.name.to_string(),
-                offset,
-            });
-        }
+        validate_input(input, input_kind)?;
+    }
+    Ok(())
+}
+
+fn validate_input(input: &NamedInput<'_>, input_kind: LinkInputKind) -> Result<(), FinalizerError> {
+    validate_name(input.name)?;
+    if input.bytes.is_empty() {
+        return Err(FinalizerError::EmptyInput {
+            name: input.name.to_string(),
+        });
+    }
+    if matches!(input_kind, LinkInputKind::Ptx)
+        && let Some(offset) = input.bytes.iter().position(|byte| *byte == 0)
+        && offset + 1 != input.bytes.len()
+    {
+        return Err(FinalizerError::InteriorNulPtx {
+            name: input.name.to_string(),
+            offset,
+        });
     }
     Ok(())
 }

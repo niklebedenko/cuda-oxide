@@ -96,6 +96,13 @@ pub trait ExportBackendConfig {
     fn debug_kind(&self) -> DebugKind {
         DebugKind::Off
     }
+
+    /// Whether this module is one closure-complete partition of a larger
+    /// owner. Partition exports use coalescible linkage for public device
+    /// definitions and internal linkage for duplicated implementation detail.
+    fn partitioned_owner(&self) -> bool {
+        false
+    }
 }
 
 /// Default PTX export configuration.

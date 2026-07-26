@@ -184,6 +184,13 @@ pub struct PipelineConfig {
     ///
     /// Explicit fused operations, such as `f32::mul_add`, are unaffected.
     pub allow_fma_contraction: bool,
+    /// Whether this module is one closure-complete partition of a larger
+    /// materialized owner.
+    ///
+    /// Exporters use partition-safe linkage for duplicated private helpers and
+    /// explicit device symbols. Runtime and ordinary single-module artifacts
+    /// leave this disabled.
+    pub partitioned_owner: bool,
 }
 
 impl Default for PipelineConfig {
@@ -200,6 +207,7 @@ impl Default for PipelineConfig {
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
+            partitioned_owner: false,
         }
     }
 }
@@ -345,6 +353,7 @@ pub fn run_pipeline(
     let request = ModulePipelineRequest::for_rust_pipeline(
         device_externs,
         config.emit_nvvm_ir,
+        config.partitioned_owner,
         &backend_options,
         config.debug_kind,
         OutputFiles {
@@ -540,6 +549,7 @@ mod tests {
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
+            partitioned_owner: false,
         };
         let result = run_pipeline(&[], &[], &config).expect("pipeline run");
 
@@ -592,6 +602,7 @@ mod tests {
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
+            partitioned_owner: false,
         };
 
         let result = run_pipeline(&[], &[], &config).expect("pipeline run");
@@ -682,6 +693,7 @@ mod tests {
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
+            partitioned_owner: false,
         };
         let externs = [DeviceExternDecl {
             export_name: "consume_float".to_string(),

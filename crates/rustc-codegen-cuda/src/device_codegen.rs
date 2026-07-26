@@ -93,7 +93,7 @@
 //! The cost is one extra type conversion step, but this happens once per function
 //! and is negligible compared to actual compilation time.
 
-use crate::collector::{CollectedFunction, DeviceExternDecl};
+use crate::collector::{CollectedFunction, DeviceExternDecl, DeviceFunctionFamily};
 use llvm_export::ops::{
     DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
     DebugSourceScopeMap,
@@ -102,9 +102,10 @@ use rustc_middle::ty::{EarlyBinder, Instance, InstanceKind, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_session::config::DebugInfo;
 use rustc_span::{Span, hygiene};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::Hash;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeviceExternTypePosition {
@@ -811,6 +812,8 @@ pub struct DeviceCodegenResult {
     pub ptx_path: PathBuf,
     /// Path to generated LLVM IR file.
     pub ll_path: PathBuf,
+    /// Explicit owner-level PTX bundle path for a partitioned materialization.
+    pub ptx_bundle_path: Option<PathBuf>,
     /// GPU target architecture used (e.g., "sm_80", "sm_90a", "sm_100a").
     ///
     /// Auto-detected based on GPU features used, or overridden via
@@ -820,8 +823,11 @@ pub struct DeviceCodegenResult {
     ///
     /// NVVM IR / LTOIR flows intentionally skip PTX generation.
     pub ptx_content: Option<String>,
-    /// Device artifact payload selected for embedding.
-    pub artifact: Option<DeviceCodegenArtifact>,
+    /// Ordered device artifact partitions selected for finalization and
+    /// embedding. Ordinary and small-owner builds contain at most one item.
+    /// Large AOT owners contain several PTX and/or NVVM IR inputs that must be
+    /// linked, in this order, into one final cubin.
+    pub artifacts: Vec<DeviceCodegenArtifact>,
     /// Whether later compilation stages may contract ordinary floating-point
     /// multiply/add expressions.
     pub allow_fma_contraction: bool,
@@ -842,7 +848,13 @@ pub enum DeviceCodegenArtifactKind {
 pub struct DeviceCodegenArtifact {
     pub kind: DeviceCodegenArtifactKind,
     pub name: String,
-    pub bytes: Vec<u8>,
+    /// On-disk compiler artifact. Partition materialization consumes these
+    /// paths sequentially instead of retaining every large buffer.
+    pub path: PathBuf,
+    /// Exact PTX path used directly or populated by bounded NVVM compilation.
+    pub ptx_sidecar_path: PathBuf,
+    /// In-memory payload for the unchanged single-module path.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Configuration for device codegen.
@@ -861,6 +873,12 @@ pub struct DeviceCodegenConfig {
     pub dump_mir_dialect: bool,
     /// Dump the LLVM dialect module during compilation.
     pub dump_llvm_dialect: bool,
+    /// Partition large owner closures before LLVM/libNVVM optimization.
+    ///
+    /// This is enabled only by build-time cubin materialization. Runtime
+    /// artifacts stay single-module so their loading and fallback behavior is
+    /// unchanged.
+    pub partition_large_owner: bool,
 }
 
 impl Default for DeviceCodegenConfig {
@@ -872,7 +890,365 @@ impl Default for DeviceCodegenConfig {
             dump_rustc_mir: false,
             dump_mir_dialect: false,
             dump_llvm_dialect: false,
+            partition_large_owner: false,
         }
+    }
+}
+
+const OWNER_PARTITION_TARGET_WEIGHT: usize = 5 * 1024 * 1024;
+const OWNER_PARTITION_MAX_WEIGHT: usize = 6 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct OwnerPartitionPolicy {
+    target_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for OwnerPartitionPolicy {
+    fn default() -> Self {
+        Self {
+            target_bytes: OWNER_PARTITION_TARGET_WEIGHT,
+            max_bytes: OWNER_PARTITION_MAX_WEIGHT,
+        }
+    }
+}
+
+/// Path-independent structural proxy for the amount of IR a MIR body tends to
+/// produce. Deliberately use only collection sizes, never MIR debug text,
+/// spans, source paths, or traversal order: those would make a partition
+/// boundary depend on the checkout or diagnostic formatting.
+fn structural_mir_weight(mir: &rustc_middle::mir::Body<'_>) -> usize {
+    const BASE: usize = 512;
+    const LOCAL: usize = 96;
+    const SOURCE_SCOPE: usize = 48;
+    const DEBUG_VALUE: usize = 48;
+    const BASIC_BLOCK: usize = 192;
+    const STATEMENT: usize = 256;
+    const SUCCESSOR_EDGE: usize = 32;
+
+    let blocks = mir.basic_blocks.len();
+    let statements = mir
+        .basic_blocks
+        .iter()
+        .map(|block| block.statements.len())
+        .sum::<usize>();
+    let successor_edges = mir
+        .basic_blocks
+        .iter()
+        .map(|block| block.terminator().successors().count())
+        .sum::<usize>();
+
+    [
+        BASE,
+        mir.local_decls.len().saturating_mul(LOCAL),
+        mir.source_scopes.len().saturating_mul(SOURCE_SCOPE),
+        mir.var_debug_info.len().saturating_mul(DEBUG_VALUE),
+        blocks.saturating_mul(BASIC_BLOCK),
+        statements.saturating_mul(STATEMENT),
+        successor_edges.saturating_mul(SUCCESSOR_EDGE),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+}
+
+fn process_peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    line.split_ascii_whitespace().nth(1)?.parse().ok()
+}
+
+struct OwnerPartitionOutputGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl OwnerPartitionOutputGuard {
+    fn prepare(
+        output_dir: &Path,
+        output_name: &str,
+        partitioned_owner: bool,
+    ) -> std::io::Result<Option<Self>> {
+        let mut components = Path::new(output_name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("owner output name is not one path component: {output_name:?}"),
+            ));
+        }
+
+        let hidden_root = output_dir.join(".cuda-oxide-partitions");
+        let path = hidden_root.join(output_name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                std::fs::remove_dir_all(&path)?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "owner partition output is not a regular directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        if !partitioned_owner {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(&path)?;
+        Ok(Some(Self { path, keep: false }))
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for OwnerPartitionOutputGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnerPartitionPlan {
+    plan_id: String,
+    root_symbols: Vec<String>,
+    function_symbols: Vec<String>,
+    estimated_mir_weight: usize,
+}
+
+#[derive(Default)]
+struct WorkingOwnerPartition {
+    root_symbols: BTreeSet<String>,
+    function_symbols: BTreeSet<String>,
+    estimated_mir_weight: usize,
+}
+
+fn plan_owner_partitions(
+    function_mir_weights: &BTreeMap<String, usize>,
+    families: &[DeviceFunctionFamily],
+    policy: OwnerPartitionPolicy,
+) -> Vec<OwnerPartitionPlan> {
+    let all_function_symbols = function_mir_weights.keys().cloned().collect::<Vec<_>>();
+    let all_estimated_mir_weight = function_mir_weights.values().copied().sum::<usize>();
+    if all_estimated_mir_weight <= policy.max_bytes || families.len() <= 1 {
+        return vec![finalize_owner_partition(
+            families
+                .iter()
+                .map(|family| family.root_symbol.clone())
+                .collect(),
+            all_function_symbols,
+            function_mir_weights,
+        )];
+    }
+
+    let canonical_families = families
+        .iter()
+        .map(|family| {
+            let function_symbols = family
+                .function_symbols
+                .iter()
+                .filter(|symbol| function_mir_weights.contains_key(*symbol))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let estimated_mir_weight = function_symbols
+                .iter()
+                .map(|symbol| function_mir_weights[symbol])
+                .sum::<usize>();
+            (
+                family.root_symbol.clone(),
+                function_symbols,
+                estimated_mir_weight,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // A root may itself be reachable from another root. Roots are emitted as
+    // strong entry definitions, so overlapping root families must remain in
+    // one indivisible component. Ordinary shared helpers may still be
+    // duplicated across components because their linkage is coalescible or
+    // module-private in partitioned owners.
+    let root_owner = canonical_families
+        .iter()
+        .enumerate()
+        .map(|(index, (root, _, _))| (root.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut family_parent = (0..canonical_families.len()).collect::<Vec<_>>();
+    for (family_index, (_, function_symbols, _)) in canonical_families.iter().enumerate() {
+        for function_symbol in function_symbols {
+            if let Some(&root_index) = root_owner.get(function_symbol.as_str()) {
+                union_family_components(&mut family_parent, family_index, root_index);
+            }
+        }
+    }
+
+    let mut components = BTreeMap::<usize, WorkingOwnerPartition>::new();
+    for (family_index, (root_symbol, function_symbols, _)) in
+        canonical_families.into_iter().enumerate()
+    {
+        let component_index = find_family_component(&mut family_parent, family_index);
+        let component = components.entry(component_index).or_default();
+        component.root_symbols.insert(root_symbol);
+        component.function_symbols.extend(function_symbols);
+    }
+    for component in components.values_mut() {
+        component.estimated_mir_weight = component
+            .function_symbols
+            .iter()
+            .map(|symbol| function_mir_weights[symbol])
+            .sum();
+    }
+    let mut canonical_components = components.into_values().collect::<Vec<_>>();
+    canonical_components.sort_by(|left, right| {
+        right
+            .estimated_mir_weight
+            .cmp(&left.estimated_mir_weight)
+            .then_with(|| left.root_symbols.cmp(&right.root_symbols))
+    });
+
+    let mut partitions = Vec::<WorkingOwnerPartition>::new();
+    for component in canonical_components {
+        let candidate = partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, partition)| {
+                let additional_bytes = component
+                    .function_symbols
+                    .iter()
+                    .filter(|symbol| !partition.function_symbols.contains(*symbol))
+                    .map(|symbol| function_mir_weights[symbol])
+                    .sum::<usize>();
+                let combined_bytes = partition.estimated_mir_weight + additional_bytes;
+                (combined_bytes <= policy.max_bytes).then_some((
+                    combined_bytes.abs_diff(policy.target_bytes),
+                    index,
+                    additional_bytes,
+                ))
+            })
+            .min_by_key(|(distance, index, _)| (*distance, *index));
+
+        let (partition, additional_bytes) = if let Some((_, index, additional_bytes)) = candidate {
+            (&mut partitions[index], additional_bytes)
+        } else {
+            partitions.push(WorkingOwnerPartition::default());
+            (
+                partitions.last_mut().expect("just pushed a partition"),
+                component.estimated_mir_weight,
+            )
+        };
+        partition.root_symbols.extend(component.root_symbols);
+        partition
+            .function_symbols
+            .extend(component.function_symbols);
+        partition.estimated_mir_weight += additional_bytes;
+    }
+
+    // Collection should make every definition reachable from at least one
+    // root. Preserve any future collector-only support definition anyway,
+    // assigning it deterministically without changing the exported root set.
+    let assigned = partitions
+        .iter()
+        .flat_map(|partition| partition.function_symbols.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    for symbol in function_mir_weights
+        .keys()
+        .filter(|symbol| !assigned.contains(*symbol))
+    {
+        let bytes = function_mir_weights[symbol];
+        let index = partitions
+            .iter()
+            .enumerate()
+            .filter(|(_, partition)| partition.estimated_mir_weight + bytes <= policy.max_bytes)
+            .min_by_key(|(index, partition)| (partition.estimated_mir_weight, *index))
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| {
+                partitions.push(WorkingOwnerPartition::default());
+                partitions.len() - 1
+            });
+        partitions[index].function_symbols.insert(symbol.clone());
+        partitions[index].estimated_mir_weight += bytes;
+    }
+
+    let mut result = partitions
+        .into_iter()
+        .map(|partition| {
+            finalize_owner_partition(
+                partition.root_symbols.into_iter().collect(),
+                partition.function_symbols.into_iter().collect(),
+                function_mir_weights,
+            )
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.plan_id.cmp(&right.plan_id));
+    result
+}
+
+fn find_family_component(parent: &mut [usize], index: usize) -> usize {
+    if parent[index] != index {
+        parent[index] = find_family_component(parent, parent[index]);
+    }
+    parent[index]
+}
+
+fn union_family_components(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find_family_component(parent, left);
+    let right_root = find_family_component(parent, right);
+    if left_root == right_root {
+        return;
+    }
+    let (canonical, other) = if left_root < right_root {
+        (left_root, right_root)
+    } else {
+        (right_root, left_root)
+    };
+    parent[other] = canonical;
+}
+
+fn finalize_owner_partition(
+    mut root_symbols: Vec<String>,
+    mut function_symbols: Vec<String>,
+    function_mir_weights: &BTreeMap<String, usize>,
+) -> OwnerPartitionPlan {
+    root_symbols.sort();
+    root_symbols.dedup();
+    function_symbols.sort();
+    function_symbols.dedup();
+    let estimated_mir_weight = function_symbols
+        .iter()
+        .map(|symbol| {
+            function_mir_weights
+                .get(symbol)
+                .copied()
+                .unwrap_or_default()
+        })
+        .sum();
+    let mut digest = Sha256::new();
+    digest.update(b"cuda-oxide-owner-partition-v1\0");
+    for root in &root_symbols {
+        digest.update((root.len() as u64).to_le_bytes());
+        digest.update(root.as_bytes());
+    }
+    digest.update(b"\0functions\0");
+    for function in &function_symbols {
+        digest.update((function.len() as u64).to_le_bytes());
+        digest.update(function.as_bytes());
+    }
+    let digest = digest.finalize();
+    let plan_id = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    OwnerPartitionPlan {
+        plan_id,
+        root_symbols,
+        function_symbols,
+        estimated_mir_weight,
     }
 }
 
@@ -1035,6 +1411,7 @@ impl From<std::io::Error> for DeviceCodegenError {
 pub fn generate_device_code<'tcx>(
     tcx: TyCtxt<'tcx>,
     functions: &[CollectedFunction<'tcx>],
+    function_families: &[DeviceFunctionFamily],
     device_externs: &[DeviceExternDecl],
     config: &DeviceCodegenConfig,
 ) -> Result<DeviceCodegenResult, DeviceCodegenError> {
@@ -1074,10 +1451,75 @@ pub fn generate_device_code<'tcx>(
         .iter()
         .map(|f| (f.export_name.clone(), f.is_kernel))
         .collect();
+    let function_symbols = functions
+        .iter()
+        .map(|function| tcx.symbol_name(function.instance).name.to_string())
+        .collect::<Vec<_>>();
     let debug_scope_maps: Vec<_> = functions
         .iter()
         .map(|f| build_debug_source_scope_map(tcx, f))
         .collect();
+    let partition_stats = std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some();
+    let partition_plan_started = std::time::Instant::now();
+    let partition_plans = if config.partition_large_owner {
+        let function_mir_weights = functions
+            .iter()
+            .zip(function_symbols.iter())
+            .map(|(function, symbol)| {
+                let mir = tcx.instance_mir(function.instance.def);
+                (symbol.clone(), structural_mir_weight(mir))
+            })
+            .collect::<BTreeMap<_, _>>();
+        plan_owner_partitions(
+            &function_mir_weights,
+            function_families,
+            OwnerPartitionPolicy::default(),
+        )
+    } else {
+        Vec::new()
+    };
+    let partitioned_owner = partition_plans.len() > 1;
+    if partition_stats {
+        let estimated_mir_weight = partition_plans
+            .iter()
+            .map(|partition| partition.estimated_mir_weight)
+            .sum::<usize>();
+        eprintln!(
+            "[rustc_codegen_cuda] owner partition plan: enabled={} partitioned={} \
+             functions={} roots={} partitions={} summed_partition_mir_weight={} \
+             target_weight={} max_weight={} elapsed={:?} peak_rss_kib={:?}",
+            config.partition_large_owner,
+            partitioned_owner,
+            functions.len(),
+            function_families.len(),
+            partition_plans.len().max(1),
+            estimated_mir_weight,
+            OWNER_PARTITION_TARGET_WEIGHT,
+            OWNER_PARTITION_MAX_WEIGHT,
+            partition_plan_started.elapsed(),
+            process_peak_rss_kib(),
+        );
+        for (index, partition) in partition_plans.iter().enumerate() {
+            eprintln!(
+                "[rustc_codegen_cuda] owner partition plan item: index={index} \
+                 plan_id={} roots={} functions={} estimated_mir_weight={}",
+                partition.plan_id,
+                partition.root_symbols.len(),
+                partition.function_symbols.len(),
+                partition.estimated_mir_weight,
+            );
+        }
+    }
+    let output_dir = config.output_dir.clone();
+    let output_name = config.output_name.clone();
+    let mut partition_output_guard = if config.partition_large_owner {
+        OwnerPartitionOutputGuard::prepare(&output_dir, &output_name, partitioned_owner)?
+    } else {
+        None
+    };
+    let partition_output_dir = partition_output_guard
+        .as_ref()
+        .map(|guard| guard.path.clone());
 
     // Convert device externs to mir-importer format
     // We extract signature info from rustc here since we have access to TyCtxt
@@ -1140,8 +1582,6 @@ pub fn generate_device_code<'tcx>(
         })
         .collect::<Result<_, _>>()?;
 
-    let output_dir = config.output_dir.clone();
-    let output_name = config.output_name.clone();
     let verbose = config.verbose;
     let show_rustc_mir = config.dump_rustc_mir;
     let show_mir = config.dump_mir_dialect;
@@ -1308,54 +1748,40 @@ pub fn generate_device_code<'tcx>(
         // same shared predicate (collector::process_drop_place), so this
         // filter is a final guard that keeps translation in lockstep with
         // emission if a future collection path forgets the check.
-        let stable_functions: Vec<mir_importer::CollectedFunction> = functions
-            .iter()
-            .zip(export_names.iter())
-            .zip(debug_scope_maps.iter())
-            .zip(inline_attrs.iter())
-            .zip(device_link_always.iter())
-            .zip(deferred_full_unroll.iter())
-            .zip(device_mono_reachability.iter())
-            .filter_map(
-                |(
-                    (
-                        (
-                            (((func, (export_name, is_kernel)), debug_source_scopes), inline_attr),
-                            device_link_always,
-                        ),
-                        deferred_full_unroll,
-                    ),
-                    reachability,
-                )| {
-                    // Use rustc_internal::stable() to convert the Instance.
-                    // This is the key bridge between rustc_middle and rustc_public types.
-                    let stable_instance = rustc_internal::stable(func.instance);
+        let mut stable_functions = Vec::<(String, mir_importer::CollectedFunction)>::new();
+        for (index, func) in functions.iter().enumerate() {
+            // Use rustc_internal::stable() to convert the Instance.
+            // This is the key bridge between rustc_middle and rustc_public types.
+            let stable_instance = rustc_internal::stable(func.instance);
 
-                    // Skip no-op drop glue: the mir-importer lowers these as
-                    // plain branches (via drop_glue_is_noop) and never emits a
-                    // call, so the function body is dead. Translating it would
-                    // fail on IntoIter and similar stdlib shims whose MIR
-                    // contains constructs the device pipeline does not support.
-                    if matches!(func.instance.def, InstanceKind::DropGlue(..))
-                        && mir_importer::drop_instance_is_noop(&stable_instance)
-                    {
-                        return None;
-                    }
+            // Skip no-op drop glue: the mir-importer lowers these as plain
+            // branches (via drop_glue_is_noop) and never emits a call, so the
+            // function body is dead. Translating it would fail on IntoIter and
+            // similar stdlib shims whose MIR contains constructs the device
+            // pipeline does not support.
+            if matches!(func.instance.def, InstanceKind::DropGlue(..))
+                && mir_importer::drop_instance_is_noop(&stable_instance)
+            {
+                continue;
+            }
 
-                    Some(mir_importer::CollectedFunction {
-                        instance: stable_instance,
-                        rustc_mir_block_count: reachability.block_count,
-                        rustc_mono_successors: reachability.successors.clone(),
-                        is_kernel: *is_kernel,
-                        export_name: export_name.clone(),
-                        debug_source_scopes: Some(debug_source_scopes.clone()),
-                        inline_attr: *inline_attr,
-                        device_link_always: *device_link_always,
-                        deferred_full_unroll: *deferred_full_unroll,
-                    })
+            let (export_name, is_kernel) = &export_names[index];
+            let reachability = &device_mono_reachability[index];
+            stable_functions.push((
+                function_symbols[index].clone(),
+                mir_importer::CollectedFunction {
+                    instance: stable_instance,
+                    rustc_mir_block_count: reachability.block_count,
+                    rustc_mono_successors: reachability.successors.clone(),
+                    is_kernel: *is_kernel,
+                    export_name: export_name.clone(),
+                    debug_source_scopes: Some(debug_scope_maps[index].clone()),
+                    inline_attr: inline_attrs[index],
+                    device_link_always: device_link_always[index],
+                    deferred_full_unroll: deferred_full_unroll[index],
                 },
-            )
-            .collect();
+            ));
+        }
 
         if verbose {
             eprintln!(
@@ -1375,51 +1801,153 @@ pub fn generate_device_code<'tcx>(
             eprintln!("[device_codegen] FMA contraction disabled");
         }
 
-        // Create pipeline config
-        let pipeline_config = mir_importer::PipelineConfig {
-            output_dir: output_dir.clone(),
-            output_name: output_name.clone(),
-            verbose,
-            show_mir_dialect: show_mir,
-            show_llvm_dialect: show_llvm,
-            emit_nvvm_ir,
-            target_arch,
-            target_arch_source: "CUDA_OXIDE_TARGET",
-            device_arch_hint,
-            debug_kind,
-            allow_fma_contraction,
+        let stable_functions_by_symbol =
+            stable_functions.iter().cloned().collect::<BTreeMap<_, _>>();
+        let run_partition = |partition_output_dir: PathBuf,
+                             partition_output_name: String,
+                             partition_functions: Vec<mir_importer::CollectedFunction>,
+                             partitioned: bool,
+                             partition_index: usize| {
+            let pipeline_config = mir_importer::PipelineConfig {
+                output_dir: partition_output_dir,
+                output_name: partition_output_name,
+                verbose,
+                show_mir_dialect: show_mir,
+                show_llvm_dialect: show_llvm,
+                emit_nvvm_ir,
+                target_arch: target_arch.clone(),
+                target_arch_source: "CUDA_OXIDE_TARGET",
+                device_arch_hint: device_arch_hint.clone(),
+                debug_kind,
+                allow_fma_contraction,
+                partitioned_owner: partitioned,
+            };
+            let kernel_count = partition_functions
+                .iter()
+                .filter(|function| function.is_kernel)
+                .count();
+            let started = std::time::Instant::now();
+            let result = mir_importer::run_pipeline(
+                &partition_functions,
+                &stable_device_externs,
+                &pipeline_config,
+            );
+            if partition_stats {
+                match result.as_ref() {
+                    Ok(compilation) => {
+                        let llvm_bytes = std::fs::metadata(&compilation.ll_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default();
+                        let artifact_bytes = std::fs::metadata(&compilation.artifact_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[rustc_codegen_cuda] owner partition codegen: index={partition_index} \
+                             name={} functions={} kernels={kernel_count} llvm_bytes={llvm_bytes} \
+                             artifact_bytes={artifact_bytes} artifact_kind={:?} elapsed={:?} \
+                             peak_rss_kib={:?}",
+                            pipeline_config.output_name,
+                            partition_functions.len(),
+                            compilation.artifact_kind,
+                            started.elapsed(),
+                            process_peak_rss_kib(),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[rustc_codegen_cuda] owner partition codegen failed: \
+                             index={partition_index} name={} functions={} kernels={kernel_count} \
+                             elapsed={:?} peak_rss_kib={:?} error={error}",
+                            pipeline_config.output_name,
+                            partition_functions.len(),
+                            started.elapsed(),
+                            process_peak_rss_kib(),
+                        );
+                    }
+                }
+            }
+            result
         };
 
         // Run the cuda-oxide pipeline!
         // Rust MIR → `dialect-mir` → mem2reg → unroll → LLVM dialect → LLVM IR → PTX.
-        // Device externs are emitted as `declare` statements in LLVM IR
-        mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
+        // Device externs are emitted as `declare` statements in LLVM IR.
+        if partitioned_owner {
+            partition_plans
+                .iter()
+                .enumerate()
+                .map(|(index, partition)| {
+                    let partition_functions = partition
+                        .function_symbols
+                        .iter()
+                        .map(|symbol| {
+                            stable_functions_by_symbol.get(symbol).cloned().unwrap_or_else(|| {
+                                panic!(
+                                    "owner partition {} references missing stable MIR function {symbol}",
+                                    partition.plan_id
+                                )
+                            })
+                        })
+                        .collect();
+                    run_partition(
+                        partition_output_dir
+                            .clone()
+                            .expect("partitioned owner prepared its hidden output directory"),
+                        format!("part-{}", partition.plan_id),
+                        partition_functions,
+                        true,
+                        index,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        } else {
+            run_partition(
+                output_dir.clone(),
+                output_name.clone(),
+                stable_functions
+                    .into_iter()
+                    .map(|(_, function)| function)
+                    .collect(),
+                false,
+                0,
+            )
+            .map(|result| vec![result])
+        }
     });
 
     // Handle the result from rustc_internal::run.
     // We have nested Results: outer from run(), inner from run_pipeline().
     match result {
         Ok(pipeline_result) => match pipeline_result {
-            Ok(compilation_result) => {
-                let artifact = read_compilation_artifact(&compilation_result)?;
-                let ptx_content = match artifact.as_ref() {
-                    Some(artifact) if artifact.kind == DeviceCodegenArtifactKind::Ptx => {
-                        Some(String::from_utf8(artifact.bytes.clone()).map_err(|e| {
-                            DeviceCodegenError::PtxGeneration(format!(
-                                "generated PTX is not valid UTF-8: {e}"
-                            ))
-                        })?)
-                    }
-                    _ => None,
+            Ok(compilation_results) => {
+                let Some(first) = compilation_results.first() else {
+                    return Err(DeviceCodegenError::PtxGeneration(
+                        "device pipeline produced no owner partition".to_string(),
+                    ));
                 };
+                if compilation_results.iter().any(|result| {
+                    result.target != first.target
+                        || result.allow_fma_contraction != first.allow_fma_contraction
+                }) {
+                    return Err(DeviceCodegenError::PtxGeneration(
+                        "owner partitions selected inconsistent CUDA targets or FMA policies"
+                            .to_string(),
+                    ));
+                }
 
-                if config.verbose {
-                    if let Some(artifact) = artifact.as_ref() {
-                        eprintln!(
-                            "[device_codegen] Embeddable artifact generated: {} ({:?}, target: {})",
-                            artifact.name, artifact.kind, compilation_result.target
-                        );
-                    } else {
+                let mut artifacts = Vec::with_capacity(compilation_results.len());
+                for compilation_result in &compilation_results {
+                    if let Some(artifact) =
+                        read_compilation_artifact(compilation_result, !partitioned_owner)?
+                    {
+                        if config.verbose {
+                            eprintln!(
+                                "[device_codegen] Embeddable artifact generated: {} ({:?}, target: {})",
+                                artifact.name, artifact.kind, compilation_result.target
+                            );
+                        }
+                        artifacts.push(artifact);
+                    } else if config.verbose {
                         eprintln!(
                             "[device_codegen] No embeddable artifact found for {} (target: {})",
                             compilation_result.ll_path.display(),
@@ -1427,14 +1955,38 @@ pub fn generate_device_code<'tcx>(
                         );
                     }
                 }
+                let ptx_content = match artifacts.as_slice() {
+                    [artifact] if artifact.kind == DeviceCodegenArtifactKind::Ptx => Some(
+                        String::from_utf8(
+                            artifact
+                                .bytes
+                                .clone()
+                                .expect("single PTX artifact retains its payload"),
+                        )
+                        .map_err(|error| {
+                            DeviceCodegenError::PtxGeneration(format!(
+                                "generated PTX is not valid UTF-8: {error}"
+                            ))
+                        })?,
+                    ),
+                    _ => None,
+                };
+                if let Some(guard) = partition_output_guard.as_mut() {
+                    guard.keep();
+                }
 
                 Ok(DeviceCodegenResult {
-                    ptx_path: compilation_result.ptx_path,
-                    ll_path: compilation_result.ll_path,
-                    target: compilation_result.target,
+                    ptx_path: first.ptx_path.clone(),
+                    ll_path: first.ll_path.clone(),
+                    ptx_bundle_path: partitioned_owner.then(|| {
+                        config
+                            .output_dir
+                            .join(format!("{}.ptx.bundle", config.output_name))
+                    }),
+                    target: first.target.clone(),
                     ptx_content,
-                    artifact,
-                    allow_fma_contraction: compilation_result.allow_fma_contraction,
+                    artifacts,
+                    allow_fma_contraction: first.allow_fma_contraction,
                     debug_kind,
                 })
             }
@@ -1483,6 +2035,7 @@ fn device_debug_kind_with_override(
 
 fn read_compilation_artifact(
     result: &mir_importer::CompilationResult,
+    retain_bytes: bool,
 ) -> Result<Option<DeviceCodegenArtifact>, DeviceCodegenError> {
     let kind = match result.artifact_kind {
         mir_importer::CompilationArtifactKind::Ptx => DeviceCodegenArtifactKind::Ptx,
@@ -1491,8 +2044,8 @@ fn read_compilation_artifact(
         mir_importer::CompilationArtifactKind::Cubin => DeviceCodegenArtifactKind::Cubin,
     };
 
-    match std::fs::read(&result.artifact_path) {
-        Ok(bytes) => Ok(Some(DeviceCodegenArtifact {
+    match std::fs::metadata(&result.artifact_path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(DeviceCodegenArtifact {
             kind,
             name: result
                 .artifact_path
@@ -1500,10 +2053,15 @@ fn read_compilation_artifact(
                 .and_then(|name| name.to_str())
                 .unwrap_or("device-artifact")
                 .to_string(),
-            bytes,
+            path: result.artifact_path.clone(),
+            ptx_sidecar_path: result.ptx_path.clone(),
+            bytes: retain_bytes
+                .then(|| std::fs::read(&result.artifact_path))
+                .transpose()?,
         })),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(DeviceCodegenError::Io(e)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DeviceCodegenError::Io(error)),
     }
 }
 
@@ -1516,6 +2074,157 @@ mod tests {
         let config = DeviceCodegenConfig::default();
         assert!(!config.verbose);
         assert_eq!(config.output_name, "kernel");
+        assert!(!config.partition_large_owner);
+    }
+
+    #[test]
+    fn owner_partition_plan_and_export_inventory_ignore_input_order() {
+        let function_weights = BTreeMap::from([
+            ("kernel_a".to_string(), 4),
+            ("kernel_b".to_string(), 4),
+            ("kernel_c".to_string(), 2),
+            ("leaf_a".to_string(), 3),
+            ("leaf_b".to_string(), 3),
+            ("leaf_c".to_string(), 2),
+            ("shared".to_string(), 2),
+        ]);
+        let mut families = vec![
+            DeviceFunctionFamily {
+                root_symbol: "kernel_b".to_string(),
+                root_export_name: "kernel_b".to_string(),
+                function_symbols: vec![
+                    "shared".to_string(),
+                    "leaf_b".to_string(),
+                    "kernel_b".to_string(),
+                ],
+            },
+            DeviceFunctionFamily {
+                root_symbol: "kernel_a".to_string(),
+                root_export_name: "kernel_a".to_string(),
+                function_symbols: vec![
+                    "kernel_a".to_string(),
+                    "shared".to_string(),
+                    "leaf_a".to_string(),
+                ],
+            },
+            DeviceFunctionFamily {
+                root_symbol: "kernel_c".to_string(),
+                root_export_name: "kernel_c".to_string(),
+                function_symbols: vec!["leaf_c".to_string(), "kernel_c".to_string()],
+            },
+        ];
+        let policy = OwnerPartitionPolicy {
+            target_bytes: 10,
+            max_bytes: 12,
+        };
+        let baseline = plan_owner_partitions(&function_weights, &families, policy);
+
+        families.reverse();
+        for family in &mut families {
+            family.function_symbols.reverse();
+        }
+        let mut reversed_weights = function_weights.into_iter().collect::<Vec<_>>();
+        reversed_weights.reverse();
+        let reversed_weights = reversed_weights.into_iter().collect();
+        let reordered = plan_owner_partitions(&reversed_weights, &families, policy);
+
+        assert_eq!(baseline, reordered);
+        assert!(baseline.len() > 1);
+        let exported_roots = baseline
+            .iter()
+            .flat_map(|partition| partition.root_symbols.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            exported_roots,
+            BTreeSet::from([
+                "kernel_a".to_string(),
+                "kernel_b".to_string(),
+                "kernel_c".to_string(),
+            ])
+        );
+        for root in ["kernel_a", "kernel_b"] {
+            let partition = baseline
+                .iter()
+                .find(|partition| {
+                    partition
+                        .root_symbols
+                        .iter()
+                        .any(|candidate| candidate == root)
+                })
+                .unwrap();
+            assert!(
+                partition
+                    .function_symbols
+                    .iter()
+                    .any(|symbol| symbol == root)
+            );
+            assert!(
+                partition
+                    .function_symbols
+                    .iter()
+                    .any(|symbol| symbol == "shared")
+            );
+        }
+    }
+
+    #[test]
+    fn owner_partition_plan_co_locates_overlapping_root_definitions() {
+        let function_weights = BTreeMap::from([
+            ("kernel_a".to_string(), 4),
+            ("kernel_b".to_string(), 4),
+            ("kernel_c".to_string(), 4),
+            ("leaf_c".to_string(), 2),
+        ]);
+        let families = vec![
+            DeviceFunctionFamily {
+                root_symbol: "kernel_a".to_string(),
+                root_export_name: "kernel_a".to_string(),
+                function_symbols: vec!["kernel_a".to_string(), "kernel_b".to_string()],
+            },
+            DeviceFunctionFamily {
+                root_symbol: "kernel_b".to_string(),
+                root_export_name: "kernel_b".to_string(),
+                function_symbols: vec!["kernel_b".to_string()],
+            },
+            DeviceFunctionFamily {
+                root_symbol: "kernel_c".to_string(),
+                root_export_name: "kernel_c".to_string(),
+                function_symbols: vec!["kernel_c".to_string(), "leaf_c".to_string()],
+            },
+        ];
+        let partitions = plan_owner_partitions(
+            &function_weights,
+            &families,
+            OwnerPartitionPolicy {
+                target_bytes: 6,
+                max_bytes: 7,
+            },
+        );
+
+        assert_eq!(partitions.len(), 2);
+        let overlapping = partitions
+            .iter()
+            .find(|partition| partition.root_symbols.iter().any(|root| root == "kernel_a"))
+            .unwrap();
+        assert_eq!(
+            overlapping.root_symbols,
+            vec!["kernel_a".to_string(), "kernel_b".to_string()]
+        );
+        for root in ["kernel_a", "kernel_b", "kernel_c"] {
+            assert_eq!(
+                partitions
+                    .iter()
+                    .filter(|partition| {
+                        partition
+                            .function_symbols
+                            .iter()
+                            .any(|symbol| symbol == root)
+                    })
+                    .count(),
+                1,
+                "{root} must have exactly one strong definition"
+            );
+        }
     }
 
     #[test]
@@ -1562,16 +2271,17 @@ mod tests {
         let result = mir_importer::CompilationResult {
             ll_path: ll_path.clone(),
             ptx_path,
-            artifact_path: ll_path,
+            artifact_path: ll_path.clone(),
             artifact_kind: mir_importer::CompilationArtifactKind::NvvmIr,
             target: "sm_90".to_string(),
             allow_fma_contraction: false,
         };
 
-        let artifact = read_compilation_artifact(&result).unwrap().unwrap();
+        let artifact = read_compilation_artifact(&result, true).unwrap().unwrap();
         assert_eq!(artifact.kind, DeviceCodegenArtifactKind::NvvmIr);
         assert_eq!(artifact.name, "demo.ll");
-        assert_eq!(artifact.bytes, b"nvvm ir");
+        assert_eq!(artifact.path, ll_path);
+        assert_eq!(artifact.bytes.as_deref(), Some(&b"nvvm ir"[..]));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1594,10 +2304,10 @@ mod tests {
             allow_fma_contraction: true,
         };
 
-        let artifact = read_compilation_artifact(&result).unwrap().unwrap();
+        let artifact = read_compilation_artifact(&result, true).unwrap().unwrap();
         assert_eq!(artifact.kind, DeviceCodegenArtifactKind::Cubin);
         assert_eq!(artifact.name, "demo.cubin");
-        assert_eq!(artifact.bytes, b"cubin");
+        assert_eq!(artifact.bytes.as_deref(), Some(&b"cubin"[..]));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
