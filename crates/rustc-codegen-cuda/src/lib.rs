@@ -1172,10 +1172,13 @@ fn materialize_artifact_for_embedding(
             }
             eprintln!(
                 "[rustc_codegen_cuda] owner partition link: partitions={} cubin_bytes={} \
+                 nvvm_wall_elapsed={:?} nvvm_peak_concurrency={} \
                  ptxas_peak_concurrency={} ptxas_peak_aggregate_rss_kib={:?} \
                  link_elapsed={:?} peak_rss_kib={:?} ptx_bundle={}",
                 materialized.partitions.len(),
                 materialized.cubin.len(),
+                materialized.nvvm_wall_elapsed,
+                materialized.nvvm_peak_concurrency,
                 materialized.ptxas_peak_concurrency,
                 materialized.ptxas_peak_aggregate_rss_kib,
                 materialized.link_elapsed,

@@ -194,6 +194,7 @@ dependencies = [
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
 dependencies = [
+ "libc",
  "libnvvm-sys",
  "nvjitlink-sys",
  "object",

@@ -263,8 +263,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "partitions={} operations_per_partition={} source_bytes={} ptx_bytes={} \
-         object_bytes={} cubin_bytes={} elapsed_ms={} nvvm_ms={} ptxas_ms={} \
-         ptxas_peak_concurrency={} ptxas_peak_aggregate_rss_kib={:?} \
+         object_bytes={} cubin_bytes={} elapsed_ms={} nvvm_sum_ms={} nvvm_wall_ms={} \
+         nvvm_peak_concurrency={} ptxas_ms={} ptxas_peak_concurrency={} \
+         ptxas_peak_aggregate_rss_kib={:?} \
          link_add_ms={} link_complete_ms={} peak_rss_kib={:?} \
          static_launch_probe={} bundle_durable={} bundle={}",
         materialized.partitions.len(),
@@ -291,6 +292,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|partition| partition.nvvm_compile_elapsed.as_millis())
             .sum::<u128>(),
+        materialized.nvvm_wall_elapsed.as_millis(),
+        materialized.nvvm_peak_concurrency,
         materialized
             .partitions
             .iter()

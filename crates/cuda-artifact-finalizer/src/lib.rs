@@ -13,6 +13,7 @@
 mod link;
 mod nvvm;
 mod options;
+mod partition;
 mod provenance;
 mod ptxas;
 mod validation;
@@ -114,6 +115,23 @@ pub enum FinalizerError {
         actual_bytes: u64,
         maximum_bytes: u64,
     },
+
+    /// The bounded libNVVM worker override was not an integer from one to four.
+    #[error(
+        "invalid CUDA_OXIDE_NVVM_WORKERS value {value:?}; expected an integer from 1 through 4"
+    )]
+    InvalidNvvmWorkerCount { value: String },
+
+    /// An operating-system thread could not be created for the NVVM batch.
+    #[error("could not create a bounded libNVVM worker: {source}")]
+    NvvmWorkerSpawn {
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A bounded NVVM worker panicked instead of returning a typed error.
+    #[error("libNVVM partition worker panicked at index {index:?} for {name}")]
+    NvvmWorkerPanicked { index: Option<usize>, name: String },
 
     /// An explicitly selected ptxas path is not an executable regular file.
     #[error("ptxas path is not an executable regular file: {path}")]
@@ -333,6 +351,11 @@ pub struct MaterializedPartition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPartitionedOwner {
     pub partitions: Vec<MaterializedPartition>,
+    /// Wall time from the first libNVVM compile starting until the last one
+    /// finishes. Direct-PTX-only plans report zero.
+    pub nvvm_wall_elapsed: Duration,
+    /// Maximum number of simultaneously active libNVVM program compilations.
+    pub nvvm_peak_concurrency: usize,
     /// Maximum number of simultaneously live ptxas children.
     pub ptxas_peak_concurrency: usize,
     /// Maximum sampled sum of resident ptxas child memory.
@@ -396,18 +419,39 @@ impl Finalizer {
         Ok(MaterializedNvvmIr { ptx_input, cubin })
     }
 
-    /// Consume ordered owner partitions one at a time and link one cubin.
+    /// Consume ordered owner partitions with bounded compilation and link one cubin.
     ///
-    /// At most one source partition and its compiled PTX are resident in Rust
-    /// memory at once. PTX is retained in a private temporary directory so up
-    /// to four pinned ptxas processes can produce relocatables concurrently.
-    /// nvJitLink then consumes those objects in deterministic partition order.
+    /// Up to four source/PTX pairs are resident while distinct libNVVM programs
+    /// compile in scoped workers. Each worker writes to a private indexed PTX
+    /// file and returns only bounded metadata. Validation, bundle construction,
+    /// ptxas assembly, and nvJitLink consumption remain deterministic and
+    /// phase-separated. `CUDA_OXIDE_NVVM_WORKERS=1..4` can lower the worker
+    /// ceiling for controlled validation.
     pub fn materialize_partition_files(
         &self,
         inputs: &[PartitionFileInput<'_>],
         ptx_bundle_path: &Path,
         options: &FinalizationOptions,
     ) -> Result<MaterializedPartitionedOwner, FinalizerError> {
+        let worker_limit = partition::configured_nvvm_worker_limit()?;
+        self.materialize_partition_files_with_nvvm_workers(
+            inputs,
+            ptx_bundle_path,
+            options,
+            worker_limit,
+        )
+    }
+
+    fn materialize_partition_files_with_nvvm_workers(
+        &self,
+        inputs: &[PartitionFileInput<'_>],
+        ptx_bundle_path: &Path,
+        options: &FinalizationOptions,
+        worker_limit: usize,
+    ) -> Result<MaterializedPartitionedOwner, FinalizerError> {
+        if inputs.is_empty() {
+            return Err(FinalizerError::NoLinkInputs);
+        }
         let (pending_bundle, bundle_file) = PendingPtxBundle::create(ptx_bundle_path)?;
         let temporary_directory = tempfile::Builder::new()
             .prefix(".cuda-oxide-finalizer-")
@@ -431,56 +475,41 @@ impl Finalizer {
         let mut weak_storage_definitions = WeakStorageDefinitions::default();
         let mut expected_kernel_entries = BTreeSet::new();
         let report_partition_stages = std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some();
-        for (index, input) in inputs.iter().enumerate() {
-            validate_name(input.name)?;
-            if report_partition_stages {
-                eprintln!(
-                    "[cuda_artifact_finalizer] partition stage: index={index} name={} stage=read begin",
-                    input.name,
-                );
-            }
-            let source_limit = match input.kind {
-                PartitionFileInputKind::NvvmIr => MAX_PARTITION_NVVM_IR_BYTES,
-                PartitionFileInputKind::Ptx => MAX_PARTITION_PTX_BYTES,
-            };
-            let source = read_partition_source_capped(input.path, source_limit)?;
-            if source.is_empty() {
-                return Err(FinalizerError::EmptyInput {
-                    name: input.name.to_string(),
+        if report_partition_stages {
+            eprintln!(
+                "[cuda_artifact_finalizer] partition preparation: partitions={} \
+                 worker_limit={} begin",
+                inputs.len(),
+                worker_limit,
+            );
+        }
+        let prepared_ptx = partition::prepare_partition_ptx_files(
+            &self.compiler,
+            inputs,
+            temporary_directory.path(),
+            options,
+            worker_limit,
+            report_partition_stages,
+        )?;
+        if report_partition_stages {
+            eprintln!(
+                "[cuda_artifact_finalizer] partition preparation: nvvm_wall_elapsed={:?} \
+                 nvvm_peak_concurrency={} complete",
+                prepared_ptx.nvvm_wall_elapsed, prepared_ptx.nvvm_peak_concurrency,
+            );
+        }
+        let nvvm_wall_elapsed = prepared_ptx.nvvm_wall_elapsed;
+        let nvvm_peak_concurrency = prepared_ptx.nvvm_peak_concurrency;
+        for (index, (input, metadata)) in inputs.iter().zip(prepared_ptx.partitions).enumerate() {
+            let ptx_path = temporary_directory.path().join(format!("{index:04}.ptx"));
+            let ptx = read_partition_source_capped(&ptx_path, MAX_PARTITION_PTX_BYTES)?;
+            if ptx.len() != metadata.ptx_bytes {
+                return Err(FinalizerError::PartitionSourceChanged {
+                    path: ptx_path,
+                    initial_bytes: metadata.ptx_bytes as u64,
                 });
             }
-            let source_bytes = source.len();
-            let compile_started = std::time::Instant::now();
-            if report_partition_stages {
-                eprintln!(
-                    "[cuda_artifact_finalizer] partition stage: index={index} name={} \
-                         stage=compile begin source_kind={:?} source_bytes={source_bytes}",
-                    input.name, input.kind,
-                );
-            }
-            let (ptx, nvvm_compile_elapsed) = match input.kind {
-                PartitionFileInputKind::NvvmIr => {
-                    let ptx = self.compiler.compile_nvvm_ir_to_ptx_capped(
-                        input.name,
-                        &source,
-                        options,
-                        MAX_PARTITION_PTX_BYTES,
-                    )?;
-                    let elapsed = compile_started.elapsed();
-                    drop(source);
-                    (ptx, elapsed)
-                }
-                PartitionFileInputKind::Ptx => (source, Duration::ZERO),
-            };
             validate_compiled_ptx_size(input.name, &ptx, MAX_PARTITION_PTX_BYTES)?;
-            if report_partition_stages {
-                eprintln!(
-                    "[cuda_artifact_finalizer] partition stage: index={index} name={} \
-                         stage=compile complete ptx_bytes={} elapsed={nvvm_compile_elapsed:?}",
-                    input.name,
-                    ptx.len(),
-                );
-            }
             weak_storage_definitions.observe(input.name, &ptx)?;
             let ptx_text = std::str::from_utf8(&ptx)
                 .expect("weak-storage validation already established UTF-8 PTX");
@@ -492,12 +521,7 @@ impl Finalizer {
                 .unwrap_or(input.name)
                 .to_string();
             let ptx_sha256 = bundle.add_record(&ptx_name, &ptx)?;
-            let ptx_path = temporary_directory.path().join(format!("{index:04}.ptx"));
             let object_path = temporary_directory.path().join(format!("{index:04}.o"));
-            std::fs::write(&ptx_path, &ptx).map_err(|source| FinalizerError::Io {
-                path: ptx_path.clone(),
-                source,
-            })?;
             prepared.push(PreparedPartition {
                 ptx_name,
                 ptx_path,
@@ -505,10 +529,10 @@ impl Finalizer {
             });
             partitions.push(MaterializedPartition {
                 name: input.name.to_string(),
-                source_bytes,
+                source_bytes: metadata.source_bytes,
                 ptx_bytes: ptx.len(),
                 ptx_sha256,
-                nvvm_compile_elapsed,
+                nvvm_compile_elapsed: metadata.nvvm_compile_elapsed,
                 ptxas_elapsed: Duration::ZERO,
                 object_bytes: 0,
                 ptxas_peak_rss_kib: None,
@@ -628,6 +652,8 @@ impl Finalizer {
         let ptx_bundle_durability_warning = pending_bundle.publish(bundle_file)?;
         Ok(MaterializedPartitionedOwner {
             partitions,
+            nvvm_wall_elapsed,
+            nvvm_peak_concurrency,
             ptxas_peak_concurrency,
             ptxas_peak_aggregate_rss_kib,
             ptx_bundle_path: ptx_bundle_path.to_path_buf(),
@@ -1397,6 +1423,95 @@ entry:
     }
 
     #[test]
+    #[ignore = "requires discoverable CUDA Toolkit libNVVM, ptxas, nvJitLink, and libdevice"]
+    fn sequential_and_parallel_partition_materialization_are_byte_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let stored_inputs = (0..8)
+            .map(|index| {
+                let name = format!("equivalence-{index:04}.ll");
+                let path = directory.path().join(&name);
+                let kernel = format!("equivalence_kernel_{index}");
+                std::fs::write(&path, named_legacy_nvvm_module(&kernel)).unwrap();
+                (name, path)
+            })
+            .collect::<Vec<_>>();
+        let inputs = stored_inputs
+            .iter()
+            .map(|(name, path)| PartitionFileInput::new(name, path, PartitionFileInputKind::NvvmIr))
+            .collect::<Vec<_>>();
+        let options = FinalizationOptions::new("sm_86".parse().unwrap());
+        let finalizer = Finalizer::discover().unwrap();
+        let sequential_bundle = directory.path().join("sequential.ptx.bundle");
+        let parallel_bundle = directory.path().join("parallel.ptx.bundle");
+
+        let sequential = finalizer
+            .materialize_partition_files_with_nvvm_workers(&inputs, &sequential_bundle, &options, 1)
+            .unwrap();
+        let parallel = finalizer
+            .materialize_partition_files_with_nvvm_workers(&inputs, &parallel_bundle, &options, 4)
+            .unwrap();
+
+        assert_eq!(sequential.nvvm_peak_concurrency, 1);
+        let expected_parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(4)
+            .min(inputs.len());
+        assert!((1..=expected_parallelism).contains(&parallel.nvvm_peak_concurrency));
+        assert!(sequential.nvvm_wall_elapsed > Duration::ZERO);
+        assert!(parallel.nvvm_wall_elapsed > Duration::ZERO);
+        assert_eq!(
+            partition_identities(&parallel),
+            partition_identities(&sequential),
+        );
+        assert_eq!(
+            std::fs::read(&parallel_bundle).unwrap(),
+            std::fs::read(&sequential_bundle).unwrap(),
+        );
+        assert_eq!(parallel.cubin, sequential.cubin);
+    }
+
+    #[test]
+    #[ignore = "requires discoverable CUDA Toolkit libNVVM, ptxas, nvJitLink, and libdevice"]
+    fn failed_parallel_partition_batch_preserves_bundle_and_cleans_private_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let stored_inputs = (0..4)
+            .map(|index| {
+                let name = format!("failure-{index:04}.ll");
+                let path = directory.path().join(&name);
+                let source = if index == 1 || index == 3 {
+                    b"not valid NVVM IR".to_vec()
+                } else {
+                    named_legacy_nvvm_module(&format!("failure_kernel_{index}"))
+                };
+                std::fs::write(&path, source).unwrap();
+                (name, path)
+            })
+            .collect::<Vec<_>>();
+        let inputs = stored_inputs
+            .iter()
+            .map(|(name, path)| PartitionFileInput::new(name, path, PartitionFileInputKind::NvvmIr))
+            .collect::<Vec<_>>();
+        let bundle = directory.path().join("owner.ptx.bundle");
+        std::fs::write(&bundle, b"previous complete bundle").unwrap();
+        let options = FinalizationOptions::new("sm_86".parse().unwrap());
+        let finalizer = Finalizer::discover().unwrap();
+
+        let error = finalizer
+            .materialize_partition_files_with_nvvm_workers(&inputs, &bundle, &options, 4)
+            .expect_err("invalid NVVM IR must fail the parallel batch");
+
+        assert!(matches!(error, FinalizerError::Nvvm(_)));
+        assert_eq!(std::fs::read(&bundle).unwrap(), b"previous complete bundle",);
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.starts_with(".cuda-oxide-finalizer-"));
+            assert!(!name.starts_with("owner.ptx.bundle.tmp-"));
+        }
+    }
+
+    #[test]
     #[ignore = "requires discoverable CUDA Toolkit libNVVM, nvJitLink, and libdevice"]
     fn live_pipeline_accepts_toolkit_cubins_and_emits_ptx_for_both_fma_policies() {
         let finalizer = Finalizer::discover().unwrap();
@@ -1452,5 +1567,29 @@ entry:
                     .any(|part| part == b".version")
             );
         }
+    }
+
+    fn named_legacy_nvvm_module(kernel: &str) -> Vec<u8> {
+        std::str::from_utf8(LEGACY_NVVM_IR)
+            .unwrap()
+            .replace("@kernel", &format!("@{kernel}"))
+            .into_bytes()
+    }
+
+    fn partition_identities(
+        materialized: &MaterializedPartitionedOwner,
+    ) -> Vec<(&str, usize, usize, [u8; 32])> {
+        materialized
+            .partitions
+            .iter()
+            .map(|partition| {
+                (
+                    partition.name.as_str(),
+                    partition.source_bytes,
+                    partition.ptx_bytes,
+                    partition.ptx_sha256,
+                )
+            })
+            .collect()
     }
 }

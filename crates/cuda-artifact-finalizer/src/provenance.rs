@@ -322,6 +322,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_operation_still_performs_the_post_call_identity_check() {
+        let expected = [7; 32];
+        let checks = Cell::new(0_u32);
+
+        let error = with_revalidated_tool_identity(
+            "test CUDA tool",
+            Some(expected),
+            || {
+                checks.set(checks.get() + 1);
+                Some(expected)
+            },
+            || {
+                Err::<(), _>(FinalizerError::EmptyInput {
+                    name: "injected".to_string(),
+                })
+            },
+        )
+        .expect_err("the injected operation must fail");
+
+        assert!(matches!(
+            error,
+            FinalizerError::EmptyInput { name } if name == "injected"
+        ));
+        assert_eq!(
+            checks.get(),
+            2,
+            "tool identity must be checked after a failed operation",
+        );
+    }
+
+    #[test]
     fn tool_digest_stays_bound_to_open_file_after_path_replacement() {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
