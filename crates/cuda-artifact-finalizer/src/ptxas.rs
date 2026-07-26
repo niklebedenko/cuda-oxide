@@ -3,18 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod diagnostics;
+
 use crate::FinalizerError;
 use crate::options::FinalizationOptions;
 use crate::provenance::{digest_file_handle, with_revalidated_tool_identity};
+use diagnostics::{DiagnosticBudget, DiagnosticReaders};
 use std::fs::File;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_PTXAS_CONCURRENCY: usize = 4;
-const MAX_PTXAS_DIAGNOSTIC_BYTES: u64 = 1024 * 1024;
 
 struct PinnedPtxas {
     file: File,
@@ -138,14 +139,27 @@ impl PtxAssembler {
         inputs: &[PtxAssemblyInput<'_>],
         options: &FinalizationOptions,
     ) -> Result<PtxAssemblyBatch, FinalizerError> {
-        if inputs.is_empty() {
-            return Err(FinalizerError::NoLinkInputs);
-        }
         let concurrency = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
             .min(MAX_PTXAS_CONCURRENCY)
             .min(inputs.len());
+        self.assemble_inner_with_concurrency(inputs, options, concurrency)
+    }
+
+    fn assemble_inner_with_concurrency(
+        &self,
+        inputs: &[PtxAssemblyInput<'_>],
+        options: &FinalizationOptions,
+        concurrency: usize,
+    ) -> Result<PtxAssemblyBatch, FinalizerError> {
+        if inputs.is_empty() {
+            return Err(FinalizerError::NoLinkInputs);
+        }
+        let concurrency = concurrency
+            .clamp(1, MAX_PTXAS_CONCURRENCY)
+            .min(inputs.len());
+        let diagnostic_budget = DiagnosticBudget::for_batch(inputs.len());
         let mut children = RunningPtxasChildren::default();
         let mut next_input = 0;
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
@@ -155,7 +169,12 @@ impl PtxAssembler {
 
         while next_input < inputs.len() || !children.is_empty() {
             while next_input < inputs.len() && children.len() < concurrency {
-                children.push(self.spawn(next_input, &inputs[next_input], &semantic_options)?);
+                children.push(self.spawn(
+                    next_input,
+                    &inputs[next_input],
+                    &semantic_options,
+                    diagnostic_budget.bytes_per_stream(),
+                )?);
                 next_input += 1;
             }
             peak_concurrency = peak_concurrency.max(children.len());
@@ -207,8 +226,7 @@ impl PtxAssembler {
                 })?;
             running.reaped = true;
             let elapsed = running.started.elapsed();
-            let stdout = read_diagnostic(&running.stdout_path)?;
-            let stderr = read_diagnostic(&running.stderr_path)?;
+            let (stdout, stderr) = running.finish_diagnostics(inputs[running.index].name)?;
             if !status.success() {
                 return Err(FinalizerError::PtxasFailed {
                     name: inputs[running.index].name.to_string(),
@@ -260,17 +278,8 @@ impl PtxAssembler {
         index: usize,
         input: &PtxAssemblyInput<'_>,
         semantic_options: &[String],
+        diagnostic_bytes_per_stream: usize,
     ) -> Result<RunningPtxas, FinalizerError> {
-        let stdout_path = input.object_path.with_extension("ptxas.stdout");
-        let stderr_path = input.object_path.with_extension("ptxas.stderr");
-        let stdout = File::create(&stdout_path).map_err(|source| FinalizerError::PtxasIo {
-            path: stdout_path.clone(),
-            source,
-        })?;
-        let stderr = File::create(&stderr_path).map_err(|source| FinalizerError::PtxasIo {
-            path: stderr_path.clone(),
-            source,
-        })?;
         let mut command = self.command();
         command
             .args(semantic_options)
@@ -278,8 +287,8 @@ impl PtxAssembler {
             .arg(input.object_path)
             .arg(input.ptx_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let started = Instant::now();
         let child = command
             .spawn()
@@ -288,15 +297,18 @@ impl PtxAssembler {
                 name: input.name.to_string(),
                 source,
             })?;
-        Ok(RunningPtxas {
+        let mut running = RunningPtxas {
             index,
             child,
             started,
-            stdout_path,
-            stderr_path,
+            diagnostics: DiagnosticReaders::default(),
             peak_rss_kib: None,
             reaped: false,
-        })
+        };
+        running
+            .diagnostics
+            .attach(&mut running.child, input.name, diagnostic_bytes_per_stream)?;
+        Ok(running)
     }
 
     fn command(&self) -> Command {
@@ -354,36 +366,6 @@ fn deduplicate_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
-fn read_diagnostic(path: &Path) -> Result<String, FinalizerError> {
-    let mut file = File::open(path).map_err(|source| FinalizerError::PtxasIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let actual_bytes = file
-        .metadata()
-        .map_err(|source| FinalizerError::PtxasIo {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let retained_bytes = actual_bytes.min(MAX_PTXAS_DIAGNOSTIC_BYTES);
-    let mut bytes = vec![0; usize::try_from(retained_bytes).unwrap_or(usize::MAX)];
-    file.read_exact(&mut bytes)
-        .map_err(|source| FinalizerError::PtxasIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut diagnostic = String::from_utf8_lossy(&bytes).into_owned();
-    if actual_bytes > retained_bytes {
-        use std::fmt::Write as _;
-        let _ = write!(
-            diagnostic,
-            "\n... [ptxas diagnostic truncated: retained {retained_bytes} of {actual_bytes} bytes]"
-        );
-    }
-    Ok(diagnostic)
-}
-
 fn process_rss_kib(process_id: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{process_id}/status")).ok()?;
     let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
@@ -394,10 +376,15 @@ struct RunningPtxas {
     index: usize,
     child: Child,
     started: Instant,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+    diagnostics: DiagnosticReaders,
     peak_rss_kib: Option<u64>,
     reaped: bool,
+}
+
+impl RunningPtxas {
+    fn finish_diagnostics(&mut self, name: &str) -> Result<(String, String), FinalizerError> {
+        self.diagnostics.finish(name)
+    }
 }
 
 #[derive(Default)]
@@ -431,54 +418,9 @@ impl Drop for RunningPtxas {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        self.diagnostics.discard();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn candidate_deduplication_preserves_precedence() {
-        assert_eq!(
-            deduplicate_paths(vec![
-                PathBuf::from("/a/ptxas"),
-                PathBuf::from("/b/ptxas"),
-                PathBuf::from("/a/ptxas"),
-            ]),
-            [PathBuf::from("/a/ptxas"), PathBuf::from("/b/ptxas")]
-        );
-    }
-
-    #[test]
-    fn concurrency_is_strictly_bounded() {
-        let available = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        assert!(available.min(MAX_PTXAS_CONCURRENCY) <= 4);
-    }
-
-    #[test]
-    fn os_string_paths_remain_lossless_candidates() {
-        let value = std::ffi::OsString::from("/cuda");
-        assert_eq!(
-            PathBuf::from(value).join("bin/ptxas"),
-            Path::new("/cuda/bin/ptxas")
-        );
-    }
-
-    #[test]
-    fn diagnostic_reader_bounds_memory_and_marks_truncation() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("ptxas.stderr");
-        std::fs::write(
-            &path,
-            vec![b'x'; usize::try_from(MAX_PTXAS_DIAGNOSTIC_BYTES + 17).unwrap()],
-        )
-        .unwrap();
-        let diagnostic = read_diagnostic(&path).unwrap();
-        assert!(diagnostic.starts_with("xxxx"));
-        assert!(diagnostic.contains("diagnostic truncated"));
-        assert!(diagnostic.len() < usize::try_from(MAX_PTXAS_DIAGNOSTIC_BYTES + 256).unwrap());
-    }
-}
+mod tests;

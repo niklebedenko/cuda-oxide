@@ -352,6 +352,7 @@ name = "cuda-artifact-finalizer"
 version = "0.2.1"
 dependencies = [
  "cuda-core",
+ "libc",
  "libnvvm-sys",
  "nvjitlink-sys",
  "object",

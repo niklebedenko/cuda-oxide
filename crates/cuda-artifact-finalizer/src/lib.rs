@@ -95,6 +95,10 @@ pub enum FinalizerError {
         maximum_bytes: u64,
     },
 
+    /// An owner partition path did not identify a regular file.
+    #[error("CUDA owner partition is not a regular file: {path}")]
+    PartitionSourceNotRegular { path: PathBuf },
+
     /// An owner partition changed after its size was checked.
     #[error(
         "CUDA owner partition {path} changed while it was being read (initial size {initial_bytes} bytes)"
@@ -139,6 +143,23 @@ pub enum FinalizerError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A ptxas diagnostic pipe or capture worker could not perform I/O.
+    #[error("could not capture ptxas {stream} for {name}: {source}")]
+    PtxasDiagnosticIo {
+        name: String,
+        stream: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A launched ptxas child did not expose the configured diagnostic pipe.
+    #[error("ptxas {stream} capture pipe is unavailable for {name}")]
+    PtxasDiagnosticUnavailable { name: String, stream: &'static str },
+
+    /// A ptxas diagnostic capture worker panicked.
+    #[error("ptxas {stream} capture worker panicked for {name}")]
+    PtxasDiagnosticPanicked { name: String, stream: &'static str },
 
     /// ptxas rejected one partition.
     #[error(
@@ -439,9 +460,12 @@ impl Finalizer {
             }
             let (ptx, nvvm_compile_elapsed) = match input.kind {
                 PartitionFileInputKind::NvvmIr => {
-                    let ptx = self
-                        .compiler
-                        .compile_nvvm_ir_to_ptx(input.name, &source, options)?;
+                    let ptx = self.compiler.compile_nvvm_ir_to_ptx_capped(
+                        input.name,
+                        &source,
+                        options,
+                        MAX_PARTITION_PTX_BYTES,
+                    )?;
                     let elapsed = compile_started.elapsed();
                     drop(source);
                     (ptx, elapsed)
@@ -699,6 +723,11 @@ fn validate_cubin_kernel_inventory(
     cubin: &[u8],
     expected: &BTreeSet<String>,
 ) -> Result<(), FinalizerError> {
+    if expected.is_empty() {
+        return Err(FinalizerError::InvalidCubinKernelInventory {
+            detail: "partitioned owner PTX exposes no public kernel entries".to_string(),
+        });
+    }
     let actual = validation::cubin_kernel_entries(cubin)
         .map_err(|detail| FinalizerError::InvalidCubinKernelInventory { detail })?;
     if &actual == expected {
@@ -744,17 +773,39 @@ fn read_partition_source_capped(
     path: &Path,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, FinalizerError> {
-    let mut file = std::fs::File::open(path).map_err(|source| FinalizerError::Io {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|source| FinalizerError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let actual_bytes = file
-        .metadata()
+    if !path_metadata.file_type().is_file() {
+        return Err(FinalizerError::PartitionSourceNotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = open_options
+        .open(path)
         .map_err(|source| FinalizerError::Io {
             path: path.to_path_buf(),
             source,
-        })?
-        .len();
+        })?;
+    let opened_metadata = file.metadata().map_err(|source| FinalizerError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(FinalizerError::PartitionSourceNotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+    let actual_bytes = opened_metadata.len();
     if actual_bytes > maximum_bytes {
         return Err(FinalizerError::PartitionSourceTooLarge {
             path: path.to_path_buf(),
@@ -1222,6 +1273,40 @@ entry:
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn partition_source_reader_rejects_symlinks_and_fifos() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let regular = directory.path().join("regular.ll");
+        let symlink_path = directory.path().join("symlink.ll");
+        let fifo_path = directory.path().join("partition.fifo");
+        let directory_path = directory.path().join("partition-directory");
+        std::fs::write(&regular, b"source").unwrap();
+        symlink(&regular, &symlink_path).unwrap();
+        std::fs::create_dir(&directory_path).unwrap();
+        let fifo_path_c = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_path_c` is a live, NUL-terminated pathname.
+        let result = unsafe { libc::mkfifo(fifo_path_c.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        for path in [&symlink_path, &fifo_path, &directory_path] {
+            assert!(matches!(
+                read_partition_source_capped(path, 64).unwrap_err(),
+                FinalizerError::PartitionSourceNotRegular { path: rejected }
+                    if rejected == *path
+            ));
+        }
+    }
+
     #[test]
     fn compiled_ptx_ceiling_accepts_exact_cap_and_rejects_cap_plus_one() {
         validate_compiled_ptx_size("exact.ptx", b"12345678", 8).unwrap();
@@ -1250,6 +1335,17 @@ entry:
                 missing,
                 unexpected,
             } if missing == ["expected_kernel"] && unexpected.is_empty()
+        ));
+    }
+
+    #[test]
+    fn empty_ptx_kernel_plan_is_rejected_before_cubin_inventory_can_match() {
+        let cubin = validation::empty_inventory_cubin_fixture();
+        let error = validate_cubin_kernel_inventory(&cubin, &BTreeSet::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            FinalizerError::InvalidCubinKernelInventory { detail }
+                if detail.contains("no public kernel entries")
         ));
     }
 

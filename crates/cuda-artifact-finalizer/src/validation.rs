@@ -187,6 +187,7 @@ pub(crate) fn cubin_kernel_entries(bytes: &[u8]) -> Result<BTreeSet<String>, Str
         if st_other & STO_CUDA_ENTRY == 0
             || !symbol.is_global()
             || symbol.kind() != SymbolKind::Text
+            || !symbol.is_definition()
         {
             continue;
         }
@@ -266,14 +267,30 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 
 #[cfg(test)]
 pub(crate) fn empty_inventory_cubin_fixture() -> Vec<u8> {
+    inventory_cubin_fixture(None)
+}
+
+#[cfg(test)]
+pub(crate) fn undefined_entry_cubin_fixture(name: &str) -> Vec<u8> {
+    inventory_cubin_fixture(Some(name))
+}
+
+#[cfg(test)]
+fn inventory_cubin_fixture(undefined_entry: Option<&str>) -> Vec<u8> {
     const SECTION_COUNT: usize = 4;
     const SYMBOL_SIZE: usize = 24;
     let section_table_bytes = SECTION_COUNT * usize::from(ELF64_SECTION_HEADER_LENGTH);
     let string_names = b"\0.shstrtab\0.strtab\0.symtab\0";
     let section_names_offset = ELF64_HEADER_LENGTH + section_table_bytes;
     let string_table_offset = section_names_offset + string_names.len();
-    let symbol_table_offset = string_table_offset + 1;
-    let mut bytes = vec![0; symbol_table_offset + SYMBOL_SIZE];
+    let mut symbol_names = vec![0];
+    if let Some(name) = undefined_entry {
+        symbol_names.extend_from_slice(name.as_bytes());
+        symbol_names.push(0);
+    }
+    let symbol_table_offset = string_table_offset + symbol_names.len();
+    let symbol_count = 1 + usize::from(undefined_entry.is_some());
+    let mut bytes = vec![0; symbol_table_offset + symbol_count * SYMBOL_SIZE];
     bytes[..4].copy_from_slice(b"\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -302,20 +319,29 @@ pub(crate) fn empty_inventory_cubin_fixture() -> Vec<u8> {
     bytes[strings..strings + 4].copy_from_slice(&11_u32.to_le_bytes());
     bytes[strings + 4..strings + 8].copy_from_slice(&3_u32.to_le_bytes());
     bytes[strings + 24..strings + 32].copy_from_slice(&(string_table_offset as u64).to_le_bytes());
-    bytes[strings + 32..strings + 40].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[strings + 32..strings + 40].copy_from_slice(&(symbol_names.len() as u64).to_le_bytes());
     bytes[strings + 48..strings + 56].copy_from_slice(&1_u64.to_le_bytes());
 
     let symbols = section(3);
     bytes[symbols..symbols + 4].copy_from_slice(&19_u32.to_le_bytes());
     bytes[symbols + 4..symbols + 8].copy_from_slice(&2_u32.to_le_bytes());
     bytes[symbols + 24..symbols + 32].copy_from_slice(&(symbol_table_offset as u64).to_le_bytes());
-    bytes[symbols + 32..symbols + 40].copy_from_slice(&(SYMBOL_SIZE as u64).to_le_bytes());
+    bytes[symbols + 32..symbols + 40]
+        .copy_from_slice(&((symbol_count * SYMBOL_SIZE) as u64).to_le_bytes());
     bytes[symbols + 40..symbols + 44].copy_from_slice(&2_u32.to_le_bytes());
     bytes[symbols + 44..symbols + 48].copy_from_slice(&1_u32.to_le_bytes());
     bytes[symbols + 48..symbols + 56].copy_from_slice(&8_u64.to_le_bytes());
     bytes[symbols + 56..symbols + 64].copy_from_slice(&(SYMBOL_SIZE as u64).to_le_bytes());
 
     bytes[section_names_offset..string_table_offset].copy_from_slice(string_names);
+    bytes[string_table_offset..symbol_table_offset].copy_from_slice(&symbol_names);
+    if undefined_entry.is_some() {
+        let entry = symbol_table_offset + SYMBOL_SIZE;
+        bytes[entry..entry + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[entry + 4] = 0x12; // STB_GLOBAL | STT_FUNC
+        bytes[entry + 5] = STO_CUDA_ENTRY;
+        // `st_shndx = SHN_UNDEF` deliberately leaves this as a declaration.
+    }
     bytes
 }
 
@@ -368,6 +394,16 @@ mod tests {
         let cubin = empty_inventory_cubin_fixture();
         assert!(is_valid_cubin(&cubin));
         assert!(cubin_kernel_entries(&cubin).unwrap().is_empty());
+    }
+
+    #[test]
+    fn undefined_cuda_entry_symbol_is_not_a_kernel_definition() {
+        let cubin = undefined_entry_cubin_fixture("missing_kernel");
+        assert!(is_valid_cubin(&cubin));
+        assert!(
+            cubin_kernel_entries(&cubin).unwrap().is_empty(),
+            "an undefined CUDA entry declaration cannot satisfy kernel inventory"
+        );
     }
 
     fn program_only_cubin(memory_size: u64) -> Vec<u8> {

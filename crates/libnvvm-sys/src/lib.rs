@@ -51,6 +51,11 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use thiserror::Error;
 
+// libNVVM has no partial program-log retrieval API, so an oversized diagnostic
+// is represented by a small omission marker instead of passing a short buffer
+// to a C function that writes the whole reported result.
+const MAX_NVVM_PROGRAM_LOG_BYTES: u64 = 1024 * 1024;
+
 // ============================================================================
 // CUDA architecture
 // ============================================================================
@@ -236,6 +241,19 @@ pub enum NvvmError {
         /// Best-effort error message: program log first, then
         /// `nvvmGetErrorString`. `None` only if both were unavailable.
         log: Option<String>,
+    },
+
+    /// libNVVM reported a compiled artifact larger than the caller's allocation
+    /// ceiling. This is checked before allocating a Rust output buffer or
+    /// calling `nvvmGetCompiledResult`.
+    #[error(
+        "libNVVM compiled result is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte output limit"
+    )]
+    CompiledResultTooLarge {
+        /// Size reported by `nvvmGetCompiledResultSize`.
+        actual_bytes: u64,
+        /// Caller-selected allocation ceiling.
+        maximum_bytes: u64,
     },
 }
 
@@ -535,6 +553,24 @@ impl<'a> Program<'a> {
     ///
     /// Panics if any option string contains an interior NUL byte.
     pub fn compile(&mut self, options: &[&str]) -> Result<Vec<u8>, NvvmError> {
+        self.compile_inner(options, None)
+    }
+
+    /// Compile and reject an oversized result before allocating its output
+    /// buffer or asking libNVVM to copy the bytes.
+    pub fn compile_with_max_output_bytes(
+        &mut self,
+        options: &[&str],
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, NvvmError> {
+        self.compile_inner(options, Some(maximum_bytes))
+    }
+
+    fn compile_inner(
+        &mut self,
+        options: &[&str],
+        maximum_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, NvvmError> {
         let coptions: Vec<CString> = options
             .iter()
             .map(|s| CString::new(*s).expect("option has interior NUL"))
@@ -546,39 +582,94 @@ impl<'a> Program<'a> {
         let log = self.try_log();
         check(self.nvvm, r, "nvvmCompileProgram", log)?;
 
-        let mut size: usize = 0;
-        let r = unsafe { (self.nvvm.get_compiled_result_size)(self.handle, &mut size) };
-        check(self.nvvm, r, "nvvmGetCompiledResultSize", None)?;
-
-        let mut buf = vec![0u8; size];
-        let r = unsafe {
-            (self.nvvm.get_compiled_result)(self.handle, buf.as_mut_ptr() as *mut c_char)
-        };
-        check(self.nvvm, r, "nvvmGetCompiledResult", None)?;
-
-        Ok(buf)
+        retrieve_compiled_result(
+            maximum_bytes,
+            || {
+                let mut size = 0;
+                let result =
+                    unsafe { (self.nvvm.get_compiled_result_size)(self.handle, &mut size) };
+                check(self.nvvm, result, "nvvmGetCompiledResultSize", None)?;
+                Ok(size)
+            },
+            |output| {
+                let result = unsafe {
+                    (self.nvvm.get_compiled_result)(
+                        self.handle,
+                        output.as_mut_ptr().cast::<c_char>(),
+                    )
+                };
+                check(self.nvvm, result, "nvvmGetCompiledResult", None)
+            },
+        )
     }
 
     /// Best-effort retrieval of the program log (warnings + errors).
-    /// Returns `None` if the log is empty or cannot be fetched.
+    /// Returns `None` if the log is empty or cannot be fetched. Oversized logs
+    /// return a bounded omission marker without allocating the reported size
+    /// or asking libNVVM to copy it.
     fn try_log(&self) -> Option<String> {
-        let mut size: usize = 0;
-        let r = unsafe { (self.nvvm.get_program_log_size)(self.handle, &mut size) };
-        if r != NvvmResult::SUCCESS || size <= 1 {
-            return None;
-        }
-        let mut buf = vec![0u8; size];
-        let r =
-            unsafe { (self.nvvm.get_program_log)(self.handle, buf.as_mut_ptr() as *mut c_char) };
-        if r != NvvmResult::SUCCESS {
-            return None;
-        }
-        // Trim trailing NUL.
-        if let Some(&0) = buf.last() {
-            buf.pop();
-        }
-        Some(String::from_utf8_lossy(&buf).into_owned())
+        retrieve_program_log_capped(
+            MAX_NVVM_PROGRAM_LOG_BYTES,
+            || {
+                let mut size = 0;
+                let result = unsafe { (self.nvvm.get_program_log_size)(self.handle, &mut size) };
+                (result == NvvmResult::SUCCESS).then_some(size)
+            },
+            |output| {
+                let result = unsafe {
+                    (self.nvvm.get_program_log)(self.handle, output.as_mut_ptr().cast::<c_char>())
+                };
+                result == NvvmResult::SUCCESS
+            },
+        )
     }
+}
+
+fn retrieve_program_log_capped(
+    maximum_bytes: u64,
+    get_size: impl FnOnce() -> Option<usize>,
+    get_log: impl FnOnce(&mut [u8]) -> bool,
+) -> Option<String> {
+    let size = get_size()?;
+    if size <= 1 {
+        return None;
+    }
+    let actual_bytes = u64::try_from(size).unwrap_or(u64::MAX);
+    if actual_bytes > maximum_bytes {
+        return Some(format!(
+            "libNVVM program log omitted: reported {actual_bytes} bytes exceeds the \
+             {maximum_bytes}-byte capture limit"
+        ));
+    }
+
+    let mut output = vec![0; size];
+    if !get_log(&mut output) {
+        return None;
+    }
+    if output.last() == Some(&0) {
+        output.pop();
+    }
+    Some(String::from_utf8_lossy(&output).into_owned())
+}
+
+fn retrieve_compiled_result(
+    maximum_bytes: Option<u64>,
+    get_size: impl FnOnce() -> Result<usize, NvvmError>,
+    get_result: impl FnOnce(&mut [u8]) -> Result<(), NvvmError>,
+) -> Result<Vec<u8>, NvvmError> {
+    let size = get_size()?;
+    let actual_bytes = u64::try_from(size).unwrap_or(u64::MAX);
+    if let Some(maximum_bytes) = maximum_bytes
+        && actual_bytes > maximum_bytes
+    {
+        return Err(NvvmError::CompiledResultTooLarge {
+            actual_bytes,
+            maximum_bytes,
+        });
+    }
+    let mut output = vec![0; size];
+    get_result(&mut output)?;
+    Ok(output)
 }
 
 impl Drop for Program<'_> {
@@ -927,6 +1018,83 @@ mod tests {
         let future_code = NvvmResult(c_int::MAX);
         assert_ne!(future_code, NvvmResult::SUCCESS);
         assert_eq!(future_code.0, c_int::MAX);
+    }
+
+    #[test]
+    fn program_log_limit_accepts_exact_size_and_fetches_text() {
+        let fetched = std::cell::Cell::new(false);
+        let log = retrieve_program_log_capped(
+            4,
+            || Some(4),
+            |output| {
+                fetched.set(true);
+                output.copy_from_slice(b"bad\0");
+                true
+            },
+        )
+        .unwrap();
+
+        assert!(fetched.get());
+        assert_eq!(log, "bad");
+    }
+
+    #[test]
+    fn program_log_limit_reports_omission_without_fetching() {
+        let fetched = std::cell::Cell::new(false);
+        let log = retrieve_program_log_capped(
+            4,
+            || Some(5),
+            |_| {
+                fetched.set(true);
+                true
+            },
+        )
+        .unwrap();
+
+        assert!(!fetched.get(), "oversized log must not be copied");
+        assert!(log.contains("reported 5 bytes"));
+        assert!(log.contains("4-byte capture limit"));
+    }
+
+    #[test]
+    fn compiled_result_limit_accepts_exact_size_and_fetches_bytes() {
+        let fetched = std::cell::Cell::new(false);
+        let output = retrieve_compiled_result(
+            Some(4),
+            || Ok(4),
+            |output| {
+                fetched.set(true);
+                output.copy_from_slice(b"PTX\0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(fetched.get());
+        assert_eq!(output, b"PTX\0");
+    }
+
+    #[test]
+    fn compiled_result_limit_rejects_before_fetching_bytes() {
+        let fetched = std::cell::Cell::new(false);
+        let error = retrieve_compiled_result(
+            Some(4),
+            || Ok(5),
+            |_| {
+                fetched.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!fetched.get(), "oversized output must not be copied");
+        assert!(matches!(
+            error,
+            NvvmError::CompiledResultTooLarge {
+                actual_bytes: 5,
+                maximum_bytes: 4,
+            }
+        ));
     }
 
     #[test]

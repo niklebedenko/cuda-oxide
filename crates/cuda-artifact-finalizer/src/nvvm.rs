@@ -75,7 +75,7 @@ impl NvvmCompiler {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
-        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ltoir)
+        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ltoir, None)
     }
 
     /// Compile one NVVM IR module plus libdevice into linkable PTX.
@@ -89,7 +89,33 @@ impl NvvmCompiler {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
-        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ptx)
+        self.compile_nvvm_ir(module_name, nvvm_ir, options, NvvmOutputKind::Ptx, None)
+    }
+
+    pub(crate) fn compile_nvvm_ir_to_ptx_capped(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        match self.compile_nvvm_ir(
+            module_name,
+            nvvm_ir,
+            options,
+            NvvmOutputKind::Ptx,
+            Some(maximum_bytes),
+        ) {
+            Err(FinalizerError::Nvvm(libnvvm_sys::NvvmError::CompiledResultTooLarge {
+                actual_bytes,
+                maximum_bytes,
+            })) => Err(FinalizerError::CompiledPtxTooLarge {
+                name: module_name.to_string(),
+                actual_bytes,
+                maximum_bytes,
+            }),
+            result => result,
+        }
     }
 
     fn compile_nvvm_ir(
@@ -98,6 +124,7 @@ impl NvvmCompiler {
         nvvm_ir: &[u8],
         options: &FinalizationOptions,
         output: NvvmOutputKind,
+        maximum_output_bytes: Option<u64>,
     ) -> Result<Vec<u8>, FinalizerError> {
         validate_name(module_name)?;
         if nvvm_ir.is_empty() {
@@ -126,7 +153,12 @@ impl NvvmCompiler {
                     NvvmOutputKind::Ptx => options.nvvm_ptx_options(),
                 };
                 let compile_refs = compile.iter().map(String::as_str).collect::<Vec<_>>();
-                Ok(program.compile(&compile_refs)?)
+                match maximum_output_bytes {
+                    Some(maximum_bytes) => {
+                        Ok(program.compile_with_max_output_bytes(&compile_refs, maximum_bytes)?)
+                    }
+                    None => Ok(program.compile(&compile_refs)?),
+                }
             },
         )
     }
