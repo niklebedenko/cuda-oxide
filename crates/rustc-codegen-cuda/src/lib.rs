@@ -286,6 +286,7 @@
 //! | `CUDA_OXIDE_PTX_DIR`              | Override PTX output directory        |
 //! | `CUDA_OXIDE_TARGET`               | Override GPU target (e.g., `sm_90a`) |
 //! | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE` | Filter device owner crate names      |
+//! | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` | Select exact roots within owners     |
 //!
 //! ## Module Structure
 //!
@@ -335,7 +336,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_session::Session;
 use rustc_session::config::OutputFilenames;
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -391,6 +392,10 @@ pub struct CudaCodegenConfig {
     /// When set, emit device code only for these normalized local crate names.
     /// Host code still goes through the wrapped LLVM backend for every crate.
     pub device_codegen_crates: Option<BTreeSet<String>>,
+    /// Owner-scoped exported roots retained for device codegen.
+    pub device_codegen_roots: Option<BTreeMap<String, BTreeSet<String>>>,
+    /// Fail-closed parse error retained until rustc's diagnostic context exists.
+    pub device_codegen_roots_error: Option<String>,
 }
 
 impl CudaCodegenConfig {
@@ -404,7 +409,34 @@ impl CudaCodegenConfig {
     /// | `CUDA_OXIDE_DUMP_LLVM`               | `dump_llvm_dialect`      |
     /// | `CUDA_OXIDE_PTX_DIR`                 | `ptx_output_dir`         |
     /// | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`  | `device_codegen_crates`  |
+    /// | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`  | `device_codegen_roots`   |
     pub fn from_env() -> Self {
+        let device_codegen_crates = parse_device_codegen_crates(
+            std::env::var(reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let parsed_roots = match std::env::var_os(
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+        ) {
+            None => Ok(None),
+            Some(raw) => raw.to_str().map_or_else(
+                || {
+                    Err(format!(
+                        "{} is not valid Unicode",
+                        reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
+                    ))
+                },
+                |raw| parse_device_codegen_roots(Some(raw)),
+            ),
+        };
+        let parsed_roots = parsed_roots.and_then(|filters| {
+            validate_device_codegen_root_owners(filters, device_codegen_crates.as_ref())
+        });
+        let (device_codegen_roots, device_codegen_roots_error) = match parsed_roots {
+            Ok(filters) => (filters, None),
+            Err(error) => (None, Some(error)),
+        };
         Self {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
             dump_rustc_mir: std::env::var("CUDA_OXIDE_SHOW_RUSTC_MIR").is_ok(),
@@ -413,11 +445,9 @@ impl CudaCodegenConfig {
             ptx_output_dir: std::env::var("CUDA_OXIDE_PTX_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
-            device_codegen_crates: parse_device_codegen_crates(
-                std::env::var(reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV)
-                    .ok()
-                    .as_deref(),
-            ),
+            device_codegen_crates,
+            device_codegen_roots,
+            device_codegen_roots_error,
         }
     }
 
@@ -425,6 +455,12 @@ impl CudaCodegenConfig {
         self.device_codegen_crates
             .as_ref()
             .is_none_or(|owners| owners.contains(&normalize_device_crate_name(crate_name)))
+    }
+
+    fn device_codegen_root_selectors(&self, crate_name: &str) -> Option<&BTreeSet<String>> {
+        self.device_codegen_roots
+            .as_ref()?
+            .get(&normalize_device_crate_name(crate_name))
     }
 }
 
@@ -441,6 +477,88 @@ fn parse_device_codegen_crates(raw: Option<&str>) -> Option<BTreeSet<String>> {
             .collect();
         (!owners.is_empty()).then_some(owners)
     })
+}
+
+fn parse_device_codegen_roots(
+    raw: Option<&str>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "{} cannot be empty when it is present",
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
+        ));
+    }
+
+    let mut filters = BTreeMap::<String, BTreeSet<String>>::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        let (owner, root) = entry.split_once('=').ok_or_else(|| {
+            format!(
+                "invalid {} entry {entry:?}; expected crate_name=export_name",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
+            )
+        })?;
+        let owner = normalize_device_crate_name(owner);
+        let root = root.trim();
+        if !is_ascii_identifier(&owner) || !is_ascii_identifier(root) {
+            return Err(format!(
+                "invalid {} entry {entry:?}; crate and export names must be nonempty ASCII identifiers",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
+            ));
+        }
+        if !filters
+            .entry(owner)
+            .or_default()
+            .insert(root.to_string())
+        {
+            return Err(format!(
+                "duplicate {} entry {entry:?}",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
+            ));
+        }
+    }
+    Ok(Some(filters))
+}
+
+fn is_ascii_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn validate_device_codegen_root_owners(
+    filters: Option<BTreeMap<String, BTreeSet<String>>>,
+    owners: Option<&BTreeSet<String>>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    let Some(filters) = filters else {
+        return Ok(None);
+    };
+    let owners = owners.ok_or_else(|| {
+        format!(
+            "{} requires an explicit {} owner filter",
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+            reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV,
+        )
+    })?;
+    let unselected = filters
+        .keys()
+        .filter(|owner| !owners.contains(*owner))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unselected.is_empty() {
+        return Err(format!(
+            "{} names crates absent from {}: {}",
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+            reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV,
+            unselected.join(", "),
+        ));
+    }
+    Ok(Some(filters))
 }
 
 fn should_codegen_device_crate(
@@ -524,6 +642,11 @@ impl CodegenBackend for CudaCodegenBackend {
         // This is necessary because we use tcx.def_path_str() and other functions that
         // trigger trimmed_def_paths. rust-gpu uses the same pattern.
         with_no_trimmed_paths!({
+            if let Some(error) = &self.config.device_codegen_roots_error {
+                tcx.dcx().fatal(format!(
+                    "[rustc_codegen_cuda] Invalid device-root selection: {error}"
+                ));
+            }
             // Step 1: Analyze for device code
             let mono_partitions = tcx.collect_and_partition_mono_items(());
             let kernel_count = collector::count_kernels_in_cgus(tcx, mono_partitions.codegen_units);
@@ -545,6 +668,15 @@ impl CodegenBackend for CudaCodegenBackend {
             let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
             let owner_selected = self.config.allows_device_codegen_for(crate_name.as_str());
             let contains_device_code = kernel_count > 0 || device_fn_count > 0;
+            let root_selectors = self
+                .config
+                .device_codegen_root_selectors(crate_name.as_str());
+            if root_selectors.is_some() && !contains_device_code {
+                tcx.dcx().fatal(format!(
+                    "[rustc_codegen_cuda] Invalid device-root selection for crate \
+                     `{crate_name}`: the selected owner has no concrete exported device roots"
+                ));
+            }
             let has_device_code = should_codegen_device_crate(
                 &self.config,
                 crate_name.as_str(),
@@ -621,7 +753,28 @@ impl CodegenBackend for CudaCodegenBackend {
                     tcx,
                     mono_partitions.codegen_units,
                     self.config.verbose,
-                );
+                    root_selectors,
+                )
+                .unwrap_or_else(|error| {
+                    tcx.dcx().fatal(format!(
+                        "[rustc_codegen_cuda] Invalid device-root selection for crate \
+                         `{crate_name}`: {error}"
+                    ))
+                });
+                if root_selectors.is_some() {
+                    let candidate_root_count = if kernel_count > 0 {
+                        kernel_count
+                    } else {
+                        device_fn_count
+                    };
+                    eprintln!(
+                        "[rustc_codegen_cuda] Device-root selection for crate \
+                         `{crate_name}` retained {} of {candidate_root_count} roots and {} \
+                         reachable functions",
+                        collection_result.function_families.len(),
+                        collection_result.functions.len(),
+                    );
+                }
 
                 materialize::validate_collection(
                     materialization_request,
@@ -1517,6 +1670,67 @@ mod tests {
             ..CudaCodegenConfig::default()
         };
         assert!(config.allows_device_codegen_for("gpu_kernels"));
+    }
+
+    #[test]
+    fn device_root_filters_are_owner_scoped_normalized_and_fail_closed() {
+        let filters = parse_device_codegen_roots(Some(
+            "gpu-kernels=first_TID_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,\
+             gpu_kernels=second,math_gpu=third",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            filters["gpu_kernels"],
+            BTreeSet::from([
+                "first_TID_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "second".to_string(),
+            ])
+        );
+
+        let config = CudaCodegenConfig {
+            device_codegen_roots: Some(filters),
+            ..CudaCodegenConfig::default()
+        };
+        assert_eq!(
+            config.device_codegen_root_selectors("gpu-kernels"),
+            Some(&BTreeSet::from([
+                "first_TID_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "second".to_string(),
+            ]))
+        );
+        assert!(config.device_codegen_root_selectors("host_app").is_none());
+
+        assert!(parse_device_codegen_roots(Some("gpu_kernels")).is_err());
+        assert!(parse_device_codegen_roots(Some("")).is_err());
+        assert!(parse_device_codegen_roots(Some("   ")).is_err());
+        assert!(parse_device_codegen_roots(Some("gpu_kernels=first,")).is_err());
+        assert!(parse_device_codegen_roots(Some("gpu_kernels=")).is_err());
+        assert!(parse_device_codegen_roots(Some("gpu_kernels=bad-root")).is_err());
+        assert!(
+            parse_device_codegen_roots(Some("gpu-kernels=first,gpu_kernels=first")).is_err()
+        );
+
+        assert!(
+            validate_device_codegen_root_owners(
+                Some(BTreeMap::from([(
+                    "gpu_kernels".to_string(),
+                    BTreeSet::from(["first".to_string()])
+                )])),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_device_codegen_root_owners(
+                Some(BTreeMap::from([(
+                    "gpu_kernels".to_string(),
+                    BTreeSet::from(["first".to_string()])
+                )])),
+                Some(&BTreeSet::from(["math_gpu".to_string()])),
+            )
+            .is_err()
+        );
     }
 
     #[test]

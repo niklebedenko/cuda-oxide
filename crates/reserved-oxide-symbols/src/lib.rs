@@ -69,6 +69,14 @@ pub const MATERIALIZER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_MATERIALIZER_
 /// Optional comma-separated filter selecting crates that may own device code.
 pub const DEVICE_CODEGEN_CRATE_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_CRATE";
 
+/// Optional comma-separated, owner-scoped device-root selection.
+///
+/// Each entry has the form `crate_name=export_name`. The codegen backend
+/// retains only exact matching exported roots and their complete transitive
+/// definition closures for the named crate. This requires an explicit
+/// [`DEVICE_CODEGEN_CRATE_ENV`] filter containing every named owner.
+pub const DEVICE_CODEGEN_ROOTS_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_ROOTS";
+
 /// Reserved root that prefixes every cuda-oxide internal symbol.
 ///
 /// User code must not define functions whose name starts with this.

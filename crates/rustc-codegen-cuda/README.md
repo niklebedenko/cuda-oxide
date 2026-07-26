@@ -88,6 +88,7 @@ These are set automatically by `cargo oxide`. For manual invocations, all four a
 | `CUDA_OXIDE_SHOW_RUSTC_MIR`          | Dump raw rustc MIR                          |
 | `CUDA_OXIDE_EMIT_NVVM_IR`            | Emit NVVM IR for libNVVM                    |
 | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`    | Comma-separated device owner crate filter   |
+| `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`    | Comma-separated `owner=export` root filter  |
 
 `cargo oxide --arch <sm_XX>` sets `CUDA_OXIDE_TARGET`. When it is unset,
 PTX output auto-detects the required target from generated LLVM IR.
@@ -95,6 +96,14 @@ Owner-filter names are normalized like Cargo crate names, so hyphens match
 underscores. Host LLVM codegen still runs for every crate. An excluded target
 must not call its generated module loader; the filter suppresses its device
 artifact but does not give sibling targets separate runtime bundle names.
+Root filters require an explicit owner filter, use exact exported names, and
+retain each selected root's complete transitive device-call closure. Invalid,
+duplicate, or missing roots in a compiled owner stop compilation instead of
+falling back to broad device codegen.
+Validation occurs when rustc compiles the selected owner. Build wrappers must
+therefore include `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` in the owner's Cargo
+codegen fingerprint so a changed selection cannot reuse a stale owner
+artifact; `cargo oxide` includes it automatically.
 
 ## Source Layout
 

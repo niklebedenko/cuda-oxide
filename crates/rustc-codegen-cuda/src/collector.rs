@@ -830,17 +830,24 @@ struct DiscoveryCtx {
 /// - `tcx`: The type context containing all MIR bodies
 /// - `cgus`: Codegen units from `tcx.collect_and_partition_mono_items()`
 /// - `verbose`: If true, prints collection progress to stderr
+/// - `selected_roots`: Optional exact export-name filter applied before
+///   transitive call-graph discovery
 ///
 /// ## Returns
 ///
 /// A `CollectionResult` containing:
 /// - `functions`: Collected functions with MIR bodies (kernels first, then callees)
 /// - `device_externs`: External device function declarations (for FFI with external LTOIR)
+///
+/// Returns an error when any selected export name is absent from the concrete
+/// kernel roots, or from the standalone device roots when the crate has no
+/// kernels.
 pub fn collect_device_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
     cgus: &[CodegenUnit<'tcx>],
     verbose: bool,
-) -> CollectionResult<'tcx> {
+    selected_roots: Option<&BTreeSet<String>>,
+) -> Result<CollectionResult<'tcx>, String> {
     let mut collector = DeviceCollector::new(tcx, verbose);
     let mut roots = Vec::new();
 
@@ -893,14 +900,12 @@ pub fn collect_device_functions<'tcx>(
     }
     roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
     roots.dedup_by(|left, right| left.0 == right.0);
-    for (instance, is_kernel, export_name) in roots.drain(..) {
-        collector.add_root(instance, is_kernel, export_name);
-    }
+    let has_kernel_roots = !roots.is_empty();
 
     // Find standalone device function roots (Phase 2: device functions without kernels).
     // Only scan when there are NO kernels — when kernels exist, device functions are
     // already collected transitively via the call graph walk.
-    if collector.worklist.is_empty() {
+    if !has_kernel_roots {
         for cgu in cgus {
             for (item, _data) in cgu.items() {
                 if let MonoItem::Fn(instance) = item
@@ -934,13 +939,31 @@ pub fn collect_device_functions<'tcx>(
         }
         roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
         roots.dedup_by(|left, right| left.0 == right.0);
-        for (instance, is_kernel, export_name) in roots {
-            collector.add_root(instance, is_kernel, export_name);
+    }
+    if let Some(selected_roots) = selected_roots {
+        let available = roots
+            .iter()
+            .map(|(_, _, export_name)| export_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = selected_roots
+            .iter()
+            .filter(|selector| !available.contains(selector.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "device-root selectors do not name concrete exported roots: {}",
+                missing.join(", ")
+            ));
         }
+        roots.retain(|(_, _, export_name)| selected_roots.contains(export_name));
+    }
+    for (instance, is_kernel, export_name) in roots {
+        collector.add_root(instance, is_kernel, export_name);
     }
 
     // Process the worklist to collect all reachable functions
-    collector.collect()
+    Ok(collector.collect())
 }
 
 /// Worklist-based collector for device-reachable functions.
