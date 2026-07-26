@@ -96,10 +96,11 @@ Owner-filter names are normalized like Cargo crate names, so hyphens match
 underscores. Host LLVM codegen still runs for every crate. An excluded target
 must not call its generated module loader; the filter suppresses its device
 artifact but does not give sibling targets separate runtime bundle names.
-Root filters require an explicit owner filter, use exact exported names, and
-retain each selected root's complete transitive device-call closure. Invalid,
-duplicate, or missing roots in a compiled owner stop compilation instead of
-falling back to broad device codegen.
+Root filters require an explicit owner filter with the same owner set, use
+exact exported names, and retain each selected root's complete transitive
+device-call closure. Invalid, duplicate, uncovered-owner, or missing roots in a
+compiled owner stop compilation instead of falling back to broad device
+codegen.
 Validation occurs when rustc compiles the selected owner. Build wrappers must
 therefore include `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` in the owner's Cargo
 codegen fingerprint so a changed selection cannot reuse a stale owner

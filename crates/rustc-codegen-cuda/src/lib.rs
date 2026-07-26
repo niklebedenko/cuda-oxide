@@ -550,12 +550,18 @@ fn validate_device_codegen_root_owners(
         .filter(|owner| !owners.contains(*owner))
         .cloned()
         .collect::<Vec<_>>();
-    if !unselected.is_empty() {
+    let uncovered = owners
+        .iter()
+        .filter(|owner| !filters.contains_key(*owner))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unselected.is_empty() || !uncovered.is_empty() {
         return Err(format!(
-            "{} names crates absent from {}: {}",
+            "{} owner set must equal {}: roots outside owner filter [{}]; selected owners without roots [{}]",
             reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
             reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV,
             unselected.join(", "),
+            uncovered.join(", "),
         ));
     }
     Ok(Some(filters))
@@ -1731,6 +1737,27 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_device_codegen_root_owners(
+                Some(BTreeMap::from([(
+                    "gpu_kernels".to_string(),
+                    BTreeSet::from(["first".to_string()])
+                )])),
+                Some(&BTreeSet::from([
+                    "gpu_kernels".to_string(),
+                    "host_app".to_string(),
+                ])),
+            )
+            .is_err()
+        );
+        validate_device_codegen_root_owners(
+            Some(BTreeMap::from([(
+                "gpu_kernels".to_string(),
+                BTreeSet::from(["first".to_string()]),
+            )])),
+            Some(&BTreeSet::from(["gpu_kernels".to_string()])),
+        )
+        .expect("every selected owner has an exact root set");
     }
 
     #[test]
