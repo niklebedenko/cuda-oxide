@@ -3,12 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use object::{Object as _, ObjectSymbol as _, SymbolFlags, SymbolKind};
+use std::collections::BTreeSet;
+
 const ELF64_HEADER_LENGTH: usize = 64;
 const ELF64_PROGRAM_HEADER_LENGTH: u16 = 56;
 const ELF64_SECTION_HEADER_LENGTH: u16 = 64;
 const ELF_VERSION_CURRENT: u32 = 1;
 const CUDA_ABI_RUNTIME_JIT_LINK: u8 = 7;
 const CUDA_12_TOOLKIT_VERSIONS: std::ops::RangeInclusive<u32> = 120..=129;
+const STO_CUDA_ENTRY: u8 = 0x10;
 
 /// Check that bytes are a complete 64-bit little-endian CUDA executable ELF.
 ///
@@ -165,6 +169,60 @@ fn has_supported_cuda_elf_version(abi_version: u8, file_version: Option<u32>) ->
     }
 }
 
+pub(crate) fn cubin_kernel_entries(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
+    if !is_valid_cubin(bytes) {
+        return Err("not a complete CUDA executable ELF".to_string());
+    }
+    let file = object::File::parse(bytes)
+        .map_err(|error| format!("could not parse CUDA ELF symbol table: {error}"))?;
+    let mut entries = BTreeSet::new();
+    for symbol in file.symbols() {
+        let SymbolFlags::Elf {
+            st_info: _,
+            st_other,
+        } = symbol.flags()
+        else {
+            continue;
+        };
+        if st_other & STO_CUDA_ENTRY == 0
+            || !symbol.is_global()
+            || symbol.kind() != SymbolKind::Text
+        {
+            continue;
+        }
+        let name = symbol
+            .name()
+            .map_err(|error| format!("CUDA entry symbol has an invalid name: {error}"))?;
+        if name.is_empty() {
+            return Err("CUDA entry symbol has an empty name".to_string());
+        }
+        entries.insert(name.to_string());
+    }
+    Ok(entries)
+}
+
+pub(crate) fn ptx_kernel_entries(ptx: &str) -> BTreeSet<String> {
+    let mut source = String::with_capacity(ptx.len());
+    for line in ptx.lines() {
+        source.push_str(line.split_once("//").map_or(line, |(code, _)| code));
+        source.push(' ');
+    }
+    let tokens = source
+        .split(|character: char| {
+            character.is_ascii_whitespace()
+                || matches!(character, '(' | ')' | ',' | ';' | '{' | '}' | '[' | ']')
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut entries = BTreeSet::new();
+    for tokens in tokens.windows(3) {
+        if tokens[0] == ".visible" && tokens[1] == ".entry" {
+            entries.insert(tokens[2].to_string());
+        }
+    }
+    entries
+}
+
 fn table_bounds(
     offset: u64,
     entry_size: u16,
@@ -207,6 +265,61 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
+pub(crate) fn empty_inventory_cubin_fixture() -> Vec<u8> {
+    const SECTION_COUNT: usize = 4;
+    const SYMBOL_SIZE: usize = 24;
+    let section_table_bytes = SECTION_COUNT * usize::from(ELF64_SECTION_HEADER_LENGTH);
+    let string_names = b"\0.shstrtab\0.strtab\0.symtab\0";
+    let section_names_offset = ELF64_HEADER_LENGTH + section_table_bytes;
+    let string_table_offset = section_names_offset + string_names.len();
+    let symbol_table_offset = string_table_offset + 1;
+    let mut bytes = vec![0; symbol_table_offset + SYMBOL_SIZE];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&190_u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&0x80_u32.to_le_bytes());
+    bytes[40..48].copy_from_slice(&(ELF64_HEADER_LENGTH as u64).to_le_bytes());
+    bytes[52..54].copy_from_slice(&(ELF64_HEADER_LENGTH as u16).to_le_bytes());
+    bytes[58..60].copy_from_slice(&ELF64_SECTION_HEADER_LENGTH.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(SECTION_COUNT as u16).to_le_bytes());
+    bytes[62..64].copy_from_slice(&1_u16.to_le_bytes());
+
+    let section =
+        |index: usize| ELF64_HEADER_LENGTH + index * usize::from(ELF64_SECTION_HEADER_LENGTH);
+    let section_names = section(1);
+    bytes[section_names..section_names + 4].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[section_names + 4..section_names + 8].copy_from_slice(&3_u32.to_le_bytes());
+    bytes[section_names + 24..section_names + 32]
+        .copy_from_slice(&(section_names_offset as u64).to_le_bytes());
+    bytes[section_names + 32..section_names + 40]
+        .copy_from_slice(&(string_names.len() as u64).to_le_bytes());
+    bytes[section_names + 48..section_names + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+    let strings = section(2);
+    bytes[strings..strings + 4].copy_from_slice(&11_u32.to_le_bytes());
+    bytes[strings + 4..strings + 8].copy_from_slice(&3_u32.to_le_bytes());
+    bytes[strings + 24..strings + 32].copy_from_slice(&(string_table_offset as u64).to_le_bytes());
+    bytes[strings + 32..strings + 40].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[strings + 48..strings + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+    let symbols = section(3);
+    bytes[symbols..symbols + 4].copy_from_slice(&19_u32.to_le_bytes());
+    bytes[symbols + 4..symbols + 8].copy_from_slice(&2_u32.to_le_bytes());
+    bytes[symbols + 24..symbols + 32].copy_from_slice(&(symbol_table_offset as u64).to_le_bytes());
+    bytes[symbols + 32..symbols + 40].copy_from_slice(&(SYMBOL_SIZE as u64).to_le_bytes());
+    bytes[symbols + 40..symbols + 44].copy_from_slice(&2_u32.to_le_bytes());
+    bytes[symbols + 44..symbols + 48].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[symbols + 48..symbols + 56].copy_from_slice(&8_u64.to_le_bytes());
+    bytes[symbols + 56..symbols + 64].copy_from_slice(&(SYMBOL_SIZE as u64).to_le_bytes());
+
+    bytes[section_names_offset..string_table_offset].copy_from_slice(string_names);
+    bytes
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -232,6 +345,29 @@ mod tests {
         bytes[section + 32..section + 40].copy_from_slice(&(PAYLOAD_LENGTH as u64).to_le_bytes());
         bytes[payload_offset..].copy_from_slice(b"CUDA");
         bytes
+    }
+
+    #[test]
+    fn ptx_inventory_finds_only_public_entries() {
+        let entries = ptx_kernel_entries(
+            r#"
+            // .visible .entry commented_out() {}
+            .visible .func helper() { ret; }
+            .entry local_kernel() { ret; }
+            .visible .entry first(
+                .param .u64 value
+            ) { ret; }
+            .visible    .entry second() { ret; } // trailing comment
+            "#,
+        );
+        assert_eq!(entries.into_iter().collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    #[test]
+    fn structurally_valid_empty_cubin_has_no_kernel_inventory() {
+        let cubin = empty_inventory_cubin_fixture();
+        assert!(is_valid_cubin(&cubin));
+        assert!(cubin_kernel_entries(&cubin).unwrap().is_empty());
     }
 
     fn program_only_cubin(memory_size: u64) -> Vec<u8> {

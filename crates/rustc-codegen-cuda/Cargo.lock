@@ -196,8 +196,10 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "object",
  "oxide-artifacts",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 

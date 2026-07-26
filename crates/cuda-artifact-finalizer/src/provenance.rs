@@ -16,7 +16,7 @@ const DIGEST_DOMAIN: &[u8] = b"cuda-oxide/artifact-finalizer/digest/v1";
 // Bump this recipe version whenever tool invocation, option translation,
 // input ordering, output validation, or other output-affecting semantics
 // change. Cache keys and the cargo-oxide/backend handshake rely on it.
-const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v3";
+const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v4";
 
 /// Exact compiler inputs discovered alongside the loaded CUDA tools.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +25,9 @@ pub struct ToolProvenance {
     pub libnvvm_sha256: Option<[u8; 32]>,
     /// SHA-256 of the exact loaded nvJitLink file, if it can be proven.
     pub nvjitlink_sha256: Option<[u8; 32]>,
+    /// SHA-256 of the pinned ptxas executable. `None` selects the direct PTX
+    /// fallback and is itself part of the full-pipeline identity.
+    pub ptxas_sha256: Option<[u8; 32]>,
     /// SHA-256 of the exact libdevice bytes added to libNVVM.
     pub libdevice_sha256: [u8; 32],
 }
@@ -197,14 +200,21 @@ fn length_prefix(length: usize) -> [u8; 8] {
 pub(crate) fn common_provenance_digest(
     libnvvm: &[u8; 32],
     nvjitlink: &[u8; 32],
+    ptxas: Option<&[u8; 32]>,
     libdevice: &[u8; 32],
 ) -> [u8; 32] {
-    StableDigest::new()
+    let digest = StableDigest::new()
         .field("recipe", recipe_digest())
         .field("libnvvm-sha256", libnvvm)
         .field("libnvjitlink-sha256", nvjitlink)
-        .field("libdevice-sha256", libdevice)
-        .finish()
+        .field("libdevice-sha256", libdevice);
+    match ptxas {
+        Some(ptxas) => digest
+            .field("ptxas-route", b"relocatable-cubin-input")
+            .field("ptxas-sha256", ptxas)
+            .finish(),
+        None => digest.field("ptxas-route", b"direct-ptx-fallback").finish(),
+    }
 }
 
 pub(crate) fn compiler_provenance_digest(libnvvm: &[u8; 32], libdevice: &[u8; 32]) -> [u8; 32] {
@@ -234,7 +244,7 @@ mod tests {
 
     #[test]
     fn recipe_identifies_the_whole_ptx_finalizer() {
-        let expected: [u8; 32] = Sha256::digest(b"cuda-oxide/artifact-finalizer/recipe/v3").into();
+        let expected: [u8; 32] = Sha256::digest(b"cuda-oxide/artifact-finalizer/recipe/v4").into();
         assert_eq!(recipe_digest(), expected);
     }
 
@@ -248,8 +258,16 @@ mod tests {
             linker_provenance_digest(&linker)
         );
         assert_ne!(
-            common_provenance_digest(&nvvm, &linker, &libdevice),
-            common_provenance_digest(&nvvm, &linker, &[4; 32])
+            common_provenance_digest(&nvvm, &linker, Some(&[5; 32]), &libdevice),
+            common_provenance_digest(&nvvm, &linker, Some(&[5; 32]), &[4; 32])
+        );
+        assert_ne!(
+            common_provenance_digest(&nvvm, &linker, Some(&[5; 32]), &libdevice),
+            common_provenance_digest(&nvvm, &linker, None, &libdevice)
+        );
+        assert_ne!(
+            common_provenance_digest(&nvvm, &linker, Some(&[5; 32]), &libdevice),
+            common_provenance_digest(&nvvm, &linker, Some(&[6; 32]), &libdevice)
         );
     }
 

@@ -895,8 +895,8 @@ impl Default for DeviceCodegenConfig {
     }
 }
 
-const OWNER_PARTITION_TARGET_WEIGHT: usize = 5 * 1024 * 1024;
-const OWNER_PARTITION_MAX_WEIGHT: usize = 6 * 1024 * 1024;
+const OWNER_PARTITION_TARGET_WEIGHT: usize = 12 * 1024 * 1024;
+const OWNER_PARTITION_MAX_WEIGHT: usize = OWNER_PARTITION_TARGET_WEIGHT * 6 / 5;
 
 #[derive(Clone, Copy)]
 struct OwnerPartitionPolicy {
@@ -1416,7 +1416,7 @@ fn report_owner_partition_calibration(
     function_families: &[DeviceFunctionFamily],
 ) {
     const MIB: usize = 1024 * 1024;
-    for target_mib in [12, 24, 48, 96] {
+    for target_mib in [6, 7, 8, 9, 10, 12, 24, 48, 96] {
         let target_weight = target_mib * MIB;
         let max_weight = target_weight.saturating_mul(6) / 5;
         let plans = plan_owner_partitions(
@@ -1612,7 +1612,11 @@ pub fn generate_device_code<'tcx>(
             );
         }
     }
-    if std::env::var_os("CUDA_OXIDE_PARTITION_CALIBRATION").is_some() {
+    let partition_diagnostic_selected = std::env::var_os("CUDA_OXIDE_PARTITION_PLAN_OWNER")
+        .is_none_or(|owner| owner == std::ffi::OsStr::new(&config.output_name));
+    if partition_diagnostic_selected
+        && std::env::var_os("CUDA_OXIDE_PARTITION_CALIBRATION").is_some()
+    {
         let function_mir_weights = function_mir_weights.as_ref().ok_or_else(|| {
             DeviceCodegenError::PtxGeneration(
                 "partition calibration requires owner partitioning".to_string(),
@@ -1620,11 +1624,13 @@ pub fn generate_device_code<'tcx>(
         })?;
         report_owner_partition_calibration(function_mir_weights, function_families);
     }
-    if std::env::var_os("CUDA_OXIDE_PARTITION_PLAN_ONLY").is_some() {
+    if partition_diagnostic_selected && std::env::var_os("CUDA_OXIDE_PARTITION_PLAN_ONLY").is_some()
+    {
         return Err(DeviceCodegenError::PtxGeneration(
             "owner partition plan-only diagnostic completed".to_string(),
         ));
     }
+    drop(function_mir_weights);
     let output_dir = config.output_dir.clone();
     let output_name = config.output_name.clone();
     let mut partition_output_guard = if config.partition_large_owner {
@@ -1761,7 +1767,9 @@ pub fn generate_device_code<'tcx>(
     // context, since the query lives on `rustc_middle::TyCtxt` and is not
     // exposed through stable_mir. Preserving this hint avoids making helper
     // boundaries depend entirely on later optimizer heuristics.
-    let emit_nvvm_ir = std::env::var_os("CUDA_OXIDE_EMIT_NVVM_IR").is_some();
+    // Partitioned owners stop before libNVVM so the finalizer can compile,
+    // link, and release one bounded source partition at a time.
+    let emit_nvvm_ir = partitioned_owner || std::env::var_os("CUDA_OXIDE_EMIT_NVVM_IR").is_some();
     let inline_stats = std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some();
     let inline_plan_started = inline_stats.then(std::time::Instant::now);
     // The shared lowering pipeline can discover libdevice calls and select
@@ -1959,6 +1967,16 @@ pub fn generate_device_code<'tcx>(
                         let artifact_bytes = std::fs::metadata(&compilation.artifact_path)
                             .map(|metadata| metadata.len())
                             .unwrap_or_default();
+                        let artifact_limit_bytes = match compilation.artifact_kind {
+                            mir_importer::CompilationArtifactKind::NvvmIr => {
+                                cuda_artifact_finalizer::MAX_PARTITION_NVVM_IR_BYTES
+                            }
+                            mir_importer::CompilationArtifactKind::Ptx => {
+                                cuda_artifact_finalizer::MAX_PARTITION_PTX_BYTES
+                            }
+                            mir_importer::CompilationArtifactKind::Ltoir
+                            | mir_importer::CompilationArtifactKind::Cubin => 0,
+                        };
                         eprintln!(
                             "[rustc_codegen_cuda] owner partition codegen: index={partition_index} \
                              name={} functions={} kernels={kernel_count} llvm_bytes={llvm_bytes} \
@@ -1968,8 +1986,8 @@ pub fn generate_device_code<'tcx>(
                             pipeline_config.output_name,
                             partition_functions.len(),
                             compilation.artifact_kind,
-                            cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
-                            artifact_bytes > cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
+                            artifact_limit_bytes,
+                            artifact_bytes > artifact_limit_bytes,
                             started.elapsed(),
                             process_peak_rss_kib(),
                         );

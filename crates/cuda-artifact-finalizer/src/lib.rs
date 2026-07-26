@@ -5,7 +5,7 @@
 
 //! Driver-independent CUDA artifact finalization.
 //!
-//! This crate is the single owner of cuda-oxide's libNVVM and nvJitLink
+//! This crate is the single owner of cuda-oxide's libNVVM, ptxas, and nvJitLink
 //! compilation policy. It deliberately does not link the CUDA Driver. Both
 //! build-time materialization and runtime fallback use the same typed target,
 //! FMA, debug, input-order, validation, and provenance rules.
@@ -14,6 +14,7 @@ mod link;
 mod nvvm;
 mod options;
 mod provenance;
+mod ptxas;
 mod validation;
 
 pub use libnvvm_sys::{CudaArch, CudaArchParseError, LibdeviceNotFound, NvvmError, find_libdevice};
@@ -25,20 +26,34 @@ pub use provenance::{ToolProvenance, recipe_digest};
 pub use validation::is_valid_cubin;
 
 use provenance::common_provenance_digest;
+use ptxas::{PtxAssembler, PtxAssemblyInput};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 
-/// Maximum bytes accepted from one on-disk owner partition.
+/// Maximum bytes accepted from one on-disk NVVM IR owner partition.
 ///
 /// The partition planner targets substantially smaller artifacts. This is a
 /// fail-closed allocation ceiling for corrupt, stale, or unexpectedly large
 /// materialization inputs.
-pub const MAX_PARTITION_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_PARTITION_NVVM_IR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum bytes accepted by ptxas from one compiled PTX partition.
+///
+/// This separately bounds NVVM IR that expands pathologically during
+/// compilation. The 32 MiB ceiling retains 57% headroom over the largest
+/// measured production partition while still rejecting runaway expansion.
+pub const MAX_PARTITION_PTX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Maximum direct PTX input accepted by the slower nvJitLink fallback.
+pub const MAX_PARTITION_NVJITLINK_PTX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum relocatable object bytes read back from one ptxas child.
+pub const MAX_PARTITION_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Failures while compiling NVVM IR or linking CUDA device artifacts.
 #[derive(Debug, Error)]
@@ -85,6 +100,60 @@ pub enum FinalizerError {
         "CUDA owner partition {path} changed while it was being read (initial size {initial_bytes} bytes)"
     )]
     PartitionSourceChanged { path: PathBuf, initial_bytes: u64 },
+
+    /// Compiled PTX exceeded the selected per-record consumer ceiling.
+    #[error(
+        "CUDA owner partition {name} compiled to {actual_bytes} PTX bytes, exceeding the {maximum_bytes}-byte per-partition limit"
+    )]
+    CompiledPtxTooLarge {
+        name: String,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+
+    /// An explicitly selected ptxas path is not an executable regular file.
+    #[error("ptxas path is not an executable regular file: {path}")]
+    PtxasNotExecutable { path: PathBuf },
+
+    /// ptxas discovery, diagnostics, or output I/O failed.
+    #[error("ptxas I/O failed for {path}: {source}")]
+    PtxasIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A pinned ptxas process could not be launched.
+    #[error("could not launch pinned ptxas {path} for {name}: {source}")]
+    PtxasLaunch {
+        path: PathBuf,
+        name: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A launched ptxas process could not be observed or reaped.
+    #[error("could not wait for ptxas compiling {name}: {source}")]
+    PtxasWait {
+        name: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// ptxas rejected one partition.
+    #[error(
+        "ptxas failed compiling {name} ({status})\n--- ptxas stdout ---\n{stdout}\n--- ptxas stderr ---\n{stderr}"
+    )]
+    PtxasFailed {
+        name: String,
+        status: String,
+        stdout: String,
+        stderr: String,
+    },
+
+    /// ptxas reported success without a usable relocatable.
+    #[error("ptxas reported success for {name} but did not create a nonempty object at {path}")]
+    PtxasMissingOutput { name: String, path: PathBuf },
 
     /// Owner-level PTX bundle encoding failed.
     #[error("PTX bundle: {0}")]
@@ -149,6 +218,21 @@ pub enum FinalizerError {
     #[error("nvJitLink returned an invalid or truncated cubin")]
     InvalidCubin,
 
+    /// The cubin symbol table could not establish its public kernel inventory.
+    #[error("could not validate CUDA cubin kernel inventory: {detail}")]
+    InvalidCubinKernelInventory { detail: String },
+
+    /// The linked cubin did not preserve exactly the public PTX entry points.
+    #[error(
+        "linked CUDA cubin kernel inventory differs from PTX (expected {expected_count}, found {actual_count}; missing={missing:?}, unexpected={unexpected:?})"
+    )]
+    CubinKernelInventoryMismatch {
+        expected_count: usize,
+        actual_count: usize,
+        missing: Vec<String>,
+        unexpected: Vec<String>,
+    },
+
     /// nvJitLink returned no PTX bytes.
     #[error("nvJitLink returned an empty PTX artifact")]
     EmptyPtx,
@@ -211,7 +295,14 @@ pub struct MaterializedPartition {
     pub ptx_sha256: [u8; 32],
     /// Time spent in libNVVM. Direct PTX inputs report zero.
     pub nvvm_compile_elapsed: Duration,
-    /// Time spent adding this PTX module to the shared nvJitLink state.
+    /// Time spent compiling this PTX partition to a relocatable object.
+    /// Direct nvJitLink PTX fallback reports zero.
+    pub ptxas_elapsed: Duration,
+    /// Relocatable object size. Direct nvJitLink PTX fallback reports zero.
+    pub object_bytes: usize,
+    /// Peak resident set sampled from this ptxas child.
+    pub ptxas_peak_rss_kib: Option<u64>,
+    /// Time spent adding this PTX or relocatable module to nvJitLink.
     pub jit_link_add_elapsed: Duration,
     /// Process high-water resident set after adding this input.
     pub peak_rss_kib: Option<u64>,
@@ -221,6 +312,10 @@ pub struct MaterializedPartition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPartitionedOwner {
     pub partitions: Vec<MaterializedPartition>,
+    /// Maximum number of simultaneously live ptxas children.
+    pub ptxas_peak_concurrency: usize,
+    /// Maximum sampled sum of resident ptxas child memory.
+    pub ptxas_peak_aggregate_rss_kib: Option<u64>,
     pub ptx_bundle_path: PathBuf,
     /// Present when the complete bundle was atomically published but syncing
     /// its parent directory failed. The live file remains safe to consume;
@@ -237,6 +332,7 @@ pub struct MaterializedPartitionedOwner {
 pub struct Finalizer {
     compiler: NvvmCompiler,
     linker: LtoLinker,
+    assembler: Option<PtxAssembler>,
 }
 
 impl Finalizer {
@@ -245,6 +341,7 @@ impl Finalizer {
         Ok(Self {
             compiler: NvvmCompiler::discover()?,
             linker: LtoLinker::discover()?,
+            assembler: PtxAssembler::discover()?,
         })
     }
 
@@ -280,11 +377,10 @@ impl Finalizer {
 
     /// Consume ordered owner partitions one at a time and link one cubin.
     ///
-    /// At most one source partition and its compiled PTX are resident in the
-    /// caller at once. Each PTX module is added immediately to a single
-    /// nvJitLink state, then its buffers are dropped before the next partition
-    /// is read. This bounds libNVVM and Rust-side buffer memory while retaining
-    /// deterministic link order and one final image.
+    /// At most one source partition and its compiled PTX are resident in Rust
+    /// memory at once. PTX is retained in a private temporary directory so up
+    /// to four pinned ptxas processes can produce relocatables concurrently.
+    /// nvJitLink then consumes those objects in deterministic partition order.
     pub fn materialize_partition_files(
         &self,
         inputs: &[PartitionFileInput<'_>],
@@ -292,6 +388,13 @@ impl Finalizer {
         options: &FinalizationOptions,
     ) -> Result<MaterializedPartitionedOwner, FinalizerError> {
         let (pending_bundle, bundle_file) = PendingPtxBundle::create(ptx_bundle_path)?;
+        let temporary_directory = tempfile::Builder::new()
+            .prefix(".cuda-oxide-finalizer-")
+            .tempdir_in(nonempty_parent(ptx_bundle_path))
+            .map_err(|source| FinalizerError::Io {
+                path: nonempty_parent(ptx_bundle_path).to_path_buf(),
+                source,
+            })?;
         let mut bundle = oxide_artifacts::ptx_bundle::PtxBundleWriter::new(
             bundle_file,
             u32::try_from(inputs.len()).map_err(|_| {
@@ -303,56 +406,206 @@ impl Finalizer {
             oxide_artifacts::ptx_bundle::PtxBundleLimits::default(),
         )?;
         let mut partitions = Vec::with_capacity(inputs.len());
+        let mut prepared = Vec::with_capacity(inputs.len());
         let mut weak_storage_definitions = WeakStorageDefinitions::default();
-        let (cubin, link_elapsed) = self.linker.link_ptx_streaming(options, |linker| {
-            for input in inputs {
-                validate_name(input.name)?;
-                let source = read_partition_source_capped(input.path, MAX_PARTITION_SOURCE_BYTES)?;
-                if source.is_empty() {
-                    return Err(FinalizerError::EmptyInput {
-                        name: input.name.to_string(),
-                    });
-                }
-                let source_bytes = source.len();
-                let compile_started = std::time::Instant::now();
-                let (ptx, nvvm_compile_elapsed) = match input.kind {
-                    PartitionFileInputKind::NvvmIr => {
-                        let ptx = self
-                            .compiler
-                            .compile_nvvm_ir_to_ptx(input.name, &source, options)?;
-                        let elapsed = compile_started.elapsed();
-                        drop(source);
-                        (ptx, elapsed)
-                    }
-                    PartitionFileInputKind::Ptx => (source, Duration::ZERO),
-                };
-                weak_storage_definitions.observe(input.name, &ptx)?;
-                let ptx_name = Path::new(input.name)
-                    .with_extension("ptx")
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(input.name)
-                    .to_string();
-                let ptx_sha256 = bundle.add_record(&ptx_name, &ptx)?;
-                let link_add_started = std::time::Instant::now();
-                linker.add(&ptx_name, &ptx)?;
-                let jit_link_add_elapsed = link_add_started.elapsed();
-                partitions.push(MaterializedPartition {
+        let mut expected_kernel_entries = BTreeSet::new();
+        let report_partition_stages = std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some();
+        for (index, input) in inputs.iter().enumerate() {
+            validate_name(input.name)?;
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] partition stage: index={index} name={} stage=read begin",
+                    input.name,
+                );
+            }
+            let source_limit = match input.kind {
+                PartitionFileInputKind::NvvmIr => MAX_PARTITION_NVVM_IR_BYTES,
+                PartitionFileInputKind::Ptx => MAX_PARTITION_PTX_BYTES,
+            };
+            let source = read_partition_source_capped(input.path, source_limit)?;
+            if source.is_empty() {
+                return Err(FinalizerError::EmptyInput {
                     name: input.name.to_string(),
-                    source_bytes,
-                    ptx_bytes: ptx.len(),
-                    ptx_sha256,
-                    nvvm_compile_elapsed,
-                    jit_link_add_elapsed,
-                    peak_rss_kib: process_peak_rss_kib(),
                 });
             }
-            Ok(())
-        })?;
+            let source_bytes = source.len();
+            let compile_started = std::time::Instant::now();
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] partition stage: index={index} name={} \
+                         stage=compile begin source_kind={:?} source_bytes={source_bytes}",
+                    input.name, input.kind,
+                );
+            }
+            let (ptx, nvvm_compile_elapsed) = match input.kind {
+                PartitionFileInputKind::NvvmIr => {
+                    let ptx = self
+                        .compiler
+                        .compile_nvvm_ir_to_ptx(input.name, &source, options)?;
+                    let elapsed = compile_started.elapsed();
+                    drop(source);
+                    (ptx, elapsed)
+                }
+                PartitionFileInputKind::Ptx => (source, Duration::ZERO),
+            };
+            validate_compiled_ptx_size(input.name, &ptx, MAX_PARTITION_PTX_BYTES)?;
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] partition stage: index={index} name={} \
+                         stage=compile complete ptx_bytes={} elapsed={nvvm_compile_elapsed:?}",
+                    input.name,
+                    ptx.len(),
+                );
+            }
+            weak_storage_definitions.observe(input.name, &ptx)?;
+            let ptx_text = std::str::from_utf8(&ptx)
+                .expect("weak-storage validation already established UTF-8 PTX");
+            expected_kernel_entries.extend(validation::ptx_kernel_entries(ptx_text));
+            let ptx_name = Path::new(input.name)
+                .with_extension("ptx")
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(input.name)
+                .to_string();
+            let ptx_sha256 = bundle.add_record(&ptx_name, &ptx)?;
+            let ptx_path = temporary_directory.path().join(format!("{index:04}.ptx"));
+            let object_path = temporary_directory.path().join(format!("{index:04}.o"));
+            std::fs::write(&ptx_path, &ptx).map_err(|source| FinalizerError::Io {
+                path: ptx_path.clone(),
+                source,
+            })?;
+            prepared.push(PreparedPartition {
+                ptx_name,
+                ptx_path,
+                object_path,
+            });
+            partitions.push(MaterializedPartition {
+                name: input.name.to_string(),
+                source_bytes,
+                ptx_bytes: ptx.len(),
+                ptx_sha256,
+                nvvm_compile_elapsed,
+                ptxas_elapsed: Duration::ZERO,
+                object_bytes: 0,
+                ptxas_peak_rss_kib: None,
+                jit_link_add_elapsed: Duration::ZERO,
+                peak_rss_kib: process_peak_rss_kib(),
+            });
+        }
+
+        let mut ptxas_peak_concurrency = 0;
+        let mut ptxas_peak_aggregate_rss_kib = None;
+        let (cubin, link_elapsed) = if let Some(assembler) = &self.assembler {
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] ptxas batch: partitions={} tool={} begin",
+                    prepared.len(),
+                    assembler.path().display(),
+                );
+            }
+            let assembly_inputs = prepared
+                .iter()
+                .zip(inputs)
+                .map(|(prepared, input)| PtxAssemblyInput {
+                    name: input.name,
+                    ptx_path: &prepared.ptx_path,
+                    object_path: &prepared.object_path,
+                })
+                .collect::<Vec<_>>();
+            let assembly_batch = assembler.assemble(&assembly_inputs, options)?;
+            ptxas_peak_concurrency = assembly_batch.peak_concurrency;
+            ptxas_peak_aggregate_rss_kib = assembly_batch.peak_aggregate_rss_kib;
+            for (index, result) in assembly_batch.results.iter().enumerate() {
+                partitions[index].ptxas_elapsed = result.elapsed;
+                partitions[index].object_bytes =
+                    usize::try_from(result.object_bytes).unwrap_or(usize::MAX);
+                partitions[index].ptxas_peak_rss_kib = result.peak_rss_kib;
+                if !result.stdout.trim().is_empty() {
+                    eprintln!(
+                        "[cuda_artifact_finalizer] ptxas stdout: index={index} name={}\n{}",
+                        partitions[index].name,
+                        result.stdout.trim_end(),
+                    );
+                }
+                if !result.stderr.trim().is_empty() {
+                    eprintln!(
+                        "[cuda_artifact_finalizer] ptxas stderr: index={index} name={}\n{}",
+                        partitions[index].name,
+                        result.stderr.trim_end(),
+                    );
+                }
+                if report_partition_stages {
+                    eprintln!(
+                        "[cuda_artifact_finalizer] partition stage: index={index} name={} \
+                         stage=ptxas complete object_bytes={} elapsed={:?}",
+                        partitions[index].name, result.object_bytes, result.elapsed,
+                    );
+                }
+            }
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] ptxas batch: peak_concurrency={} \
+                     peak_aggregate_rss_kib={:?} complete",
+                    ptxas_peak_concurrency, ptxas_peak_aggregate_rss_kib,
+                );
+            }
+            self.linker.link_cubin_streaming(options, |linker| {
+                for (index, prepared) in prepared.iter().enumerate() {
+                    let object = read_partition_source_capped(
+                        &prepared.object_path,
+                        MAX_PARTITION_OBJECT_BYTES,
+                    )?;
+                    if object.len() != partitions[index].object_bytes {
+                        return Err(FinalizerError::PartitionSourceChanged {
+                            path: prepared.object_path.clone(),
+                            initial_bytes: partitions[index].object_bytes as u64,
+                        });
+                    }
+                    let object_name = Path::new(&prepared.ptx_name)
+                        .with_extension("o")
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&prepared.ptx_name)
+                        .to_string();
+                    let link_add_started = std::time::Instant::now();
+                    linker.add(&object_name, &object)?;
+                    partitions[index].jit_link_add_elapsed = link_add_started.elapsed();
+                    partitions[index].peak_rss_kib = process_peak_rss_kib();
+                }
+                Ok(())
+            })?
+        } else {
+            if report_partition_stages {
+                eprintln!(
+                    "[cuda_artifact_finalizer] ptxas unavailable; using bounded nvJitLink PTX fallback"
+                );
+            }
+            self.linker.link_ptx_streaming(options, |linker| {
+                for (index, prepared) in prepared.iter().enumerate() {
+                    let ptx = read_partition_source_capped(
+                        &prepared.ptx_path,
+                        MAX_PARTITION_NVJITLINK_PTX_BYTES,
+                    )?;
+                    validate_compiled_ptx_size(
+                        &prepared.ptx_name,
+                        &ptx,
+                        MAX_PARTITION_NVJITLINK_PTX_BYTES,
+                    )?;
+                    let link_add_started = std::time::Instant::now();
+                    linker.add(&prepared.ptx_name, &ptx)?;
+                    partitions[index].jit_link_add_elapsed = link_add_started.elapsed();
+                    partitions[index].peak_rss_kib = process_peak_rss_kib();
+                }
+                Ok(())
+            })?
+        };
+        validate_cubin_kernel_inventory(&cubin, &expected_kernel_entries)?;
         let bundle_file = bundle.finish()?;
         let ptx_bundle_durability_warning = pending_bundle.publish(bundle_file)?;
         Ok(MaterializedPartitionedOwner {
             partitions,
+            ptxas_peak_concurrency,
+            ptxas_peak_aggregate_rss_kib,
             ptx_bundle_path: ptx_bundle_path.to_path_buf(),
             ptx_bundle_durability_warning,
             cubin,
@@ -395,6 +648,10 @@ impl Finalizer {
         ToolProvenance {
             libnvvm_sha256: self.compiler.libnvvm_digest(),
             nvjitlink_sha256: self.linker.nvjitlink_digest(),
+            ptxas_sha256: self
+                .assembler
+                .as_ref()
+                .and_then(PtxAssembler::digest_if_unchanged),
             libdevice_sha256: self.compiler.libdevice_digest(),
         }
     }
@@ -402,9 +659,14 @@ impl Finalizer {
     /// Exact full-pipeline provenance, or `None` if a loaded DSO is unknown.
     pub fn provenance_digest(&self) -> Option<[u8; 32]> {
         let provenance = self.provenance();
+        let ptxas_sha256 = match &self.assembler {
+            Some(assembler) => Some(assembler.digest_if_unchanged()?),
+            None => None,
+        };
         Some(common_provenance_digest(
             &provenance.libnvvm_sha256?,
             &provenance.nvjitlink_sha256?,
+            ptxas_sha256.as_ref(),
             &provenance.libdevice_sha256,
         ))
     }
@@ -424,6 +686,57 @@ impl Finalizer {
             options,
             self.provenance(),
         )
+    }
+}
+
+struct PreparedPartition {
+    ptx_name: String,
+    ptx_path: PathBuf,
+    object_path: PathBuf,
+}
+
+fn validate_cubin_kernel_inventory(
+    cubin: &[u8],
+    expected: &BTreeSet<String>,
+) -> Result<(), FinalizerError> {
+    let actual = validation::cubin_kernel_entries(cubin)
+        .map_err(|detail| FinalizerError::InvalidCubinKernelInventory { detail })?;
+    if &actual == expected {
+        return Ok(());
+    }
+    const DIAGNOSTIC_SYMBOL_LIMIT: usize = 8;
+    let missing = expected
+        .difference(&actual)
+        .take(DIAGNOSTIC_SYMBOL_LIMIT)
+        .cloned()
+        .collect();
+    let unexpected = actual
+        .difference(expected)
+        .take(DIAGNOSTIC_SYMBOL_LIMIT)
+        .cloned()
+        .collect();
+    Err(FinalizerError::CubinKernelInventoryMismatch {
+        expected_count: expected.len(),
+        actual_count: actual.len(),
+        missing,
+        unexpected,
+    })
+}
+
+fn validate_compiled_ptx_size(
+    name: &str,
+    ptx: &[u8],
+    maximum_bytes: u64,
+) -> Result<(), FinalizerError> {
+    let actual_bytes = u64::try_from(ptx.len()).unwrap_or(u64::MAX);
+    if actual_bytes > maximum_bytes {
+        Err(FinalizerError::CompiledPtxTooLarge {
+            name: name.to_string(),
+            actual_bytes,
+            maximum_bytes,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -768,6 +1081,7 @@ entry:
         ToolProvenance {
             libnvvm_sha256: Some([1; 32]),
             nvjitlink_sha256: Some([2; 32]),
+            ptxas_sha256: Some([4; 32]),
             libdevice_sha256: [3; 32],
         }
     }
@@ -906,6 +1220,37 @@ entry:
         ));
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compiled_ptx_ceiling_accepts_exact_cap_and_rejects_cap_plus_one() {
+        validate_compiled_ptx_size("exact.ptx", b"12345678", 8).unwrap();
+        assert!(matches!(
+            validate_compiled_ptx_size("oversize.ptx", b"123456789", 8).unwrap_err(),
+            FinalizerError::CompiledPtxTooLarge {
+                name,
+                actual_bytes: 9,
+                maximum_bytes: 8,
+            } if name == "oversize.ptx"
+        ));
+    }
+
+    #[test]
+    fn nvjitlink_object_style_empty_elf_cannot_satisfy_a_ptx_kernel_plan() {
+        // nvJitLink's host `Object` input accepts a CUDA relocatable but can
+        // return a structurally valid ELF with no device entry points.
+        let cubin = validation::empty_inventory_cubin_fixture();
+        assert!(is_valid_cubin(&cubin));
+        let expected = BTreeSet::from(["expected_kernel".to_string()]);
+        assert!(matches!(
+            validate_cubin_kernel_inventory(&cubin, &expected).unwrap_err(),
+            FinalizerError::CubinKernelInventoryMismatch {
+                expected_count: 1,
+                actual_count: 0,
+                missing,
+                unexpected,
+            } if missing == ["expected_kernel"] && unexpected.is_empty()
+        ));
     }
 
     #[test]

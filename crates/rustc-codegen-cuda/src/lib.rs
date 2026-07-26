@@ -1157,20 +1157,27 @@ fn materialize_artifact_for_embedding(
                 eprintln!(
                     "[rustc_codegen_cuda] owner partition finalization: index={index} \
                      name={} source_bytes={} ptx_bytes={} nvvm_compile_elapsed={:?} \
+                     ptxas_elapsed={:?} object_bytes={} ptxas_peak_rss_kib={:?} \
                      jit_link_add_elapsed={:?} peak_rss_kib={:?}",
                     partition.name,
                     partition.source_bytes,
                     partition.ptx_bytes,
                     partition.nvvm_compile_elapsed,
+                    partition.ptxas_elapsed,
+                    partition.object_bytes,
+                    partition.ptxas_peak_rss_kib,
                     partition.jit_link_add_elapsed,
                     partition.peak_rss_kib,
                 );
             }
             eprintln!(
                 "[rustc_codegen_cuda] owner partition link: partitions={} cubin_bytes={} \
+                 ptxas_peak_concurrency={} ptxas_peak_aggregate_rss_kib={:?} \
                  link_elapsed={:?} peak_rss_kib={:?} ptx_bundle={}",
                 materialized.partitions.len(),
                 materialized.cubin.len(),
+                materialized.ptxas_peak_concurrency,
+                materialized.ptxas_peak_aggregate_rss_kib,
                 materialized.link_elapsed,
                 materialized.peak_rss_kib,
                 materialized.ptx_bundle_path.display(),

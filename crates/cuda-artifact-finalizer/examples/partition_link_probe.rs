@@ -263,8 +263,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "partitions={} operations_per_partition={} source_bytes={} ptx_bytes={} \
-         cubin_bytes={} elapsed_ms={} nvvm_ms={} link_add_ms={} link_complete_ms={} \
-         peak_rss_kib={:?} static_launch_probe={} bundle_durable={} bundle={}",
+         object_bytes={} cubin_bytes={} elapsed_ms={} nvvm_ms={} ptxas_ms={} \
+         ptxas_peak_concurrency={} ptxas_peak_aggregate_rss_kib={:?} \
+         link_add_ms={} link_complete_ms={} peak_rss_kib={:?} \
+         static_launch_probe={} bundle_durable={} bundle={}",
         materialized.partitions.len(),
         operations_per_partition,
         materialized
@@ -277,6 +279,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|partition| partition.ptx_bytes)
             .sum::<usize>(),
+        materialized
+            .partitions
+            .iter()
+            .map(|partition| partition.object_bytes)
+            .sum::<usize>(),
         materialized.cubin.len(),
         elapsed.as_millis(),
         materialized
@@ -284,6 +291,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|partition| partition.nvvm_compile_elapsed.as_millis())
             .sum::<u128>(),
+        materialized
+            .partitions
+            .iter()
+            .map(|partition| partition.ptxas_elapsed.as_millis())
+            .sum::<u128>(),
+        materialized.ptxas_peak_concurrency,
+        materialized.ptxas_peak_aggregate_rss_kib,
         materialized
             .partitions
             .iter()

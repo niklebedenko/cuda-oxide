@@ -131,6 +131,37 @@ impl FinalizationOptions {
         options
     }
 
+    pub(crate) fn nvjitlink_cubin_options(&self) -> Vec<String> {
+        vec![format!("-arch={}", self.target.sm())]
+    }
+
+    pub(crate) fn ptxas_options(&self) -> Vec<String> {
+        let optimization = if self.debug == DebugPolicy::Full {
+            "-O0"
+        } else {
+            "-O3"
+        };
+        let mut options = vec![
+            "-c".to_string(),
+            format!("-arch={}", self.target.sm()),
+            optimization.to_string(),
+            format!(
+                "-fmad={}",
+                if self.allow_fma_contraction {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+        ];
+        match self.debug {
+            DebugPolicy::None => {}
+            DebugPolicy::LineTables => options.push("-lineinfo".to_string()),
+            DebugPolicy::Full => options.push("-g".to_string()),
+        }
+        options
+    }
+
     fn fma_option(&self) -> &'static str {
         if self.allow_fma_contraction {
             "-fma=1"
@@ -226,6 +257,27 @@ mod tests {
             base.with_debug_policy(DebugPolicy::Full)
                 .nvjitlink_ptx_options(),
             ["-arch=sm_90a", "-O0", "-fma=0", "-g"]
+        );
+        assert_eq!(
+            FinalizationOptions::new("sm_86".parse().unwrap()).nvjitlink_cubin_options(),
+            ["-arch=sm_86"]
+        );
+        assert_eq!(
+            FinalizationOptions::new("sm_86".parse().unwrap()).ptxas_options(),
+            ["-c", "-arch=sm_86", "-O3", "-fmad=true"]
+        );
+        assert_eq!(
+            FinalizationOptions::new("sm_86".parse().unwrap())
+                .with_fma_contraction(false)
+                .with_debug_policy(DebugPolicy::LineTables)
+                .ptxas_options(),
+            ["-c", "-arch=sm_86", "-O3", "-fmad=false", "-lineinfo"]
+        );
+        assert_eq!(
+            FinalizationOptions::new("sm_86".parse().unwrap())
+                .with_debug_policy(DebugPolicy::Full)
+                .ptxas_options(),
+            ["-c", "-arch=sm_86", "-O0", "-fmad=true", "-g"]
         );
     }
 

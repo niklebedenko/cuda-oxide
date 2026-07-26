@@ -708,6 +708,7 @@ fn nvvm_ir_cubin_cache_key_with_compile_options(
         ToolProvenance {
             libnvvm_sha256: Some(*libnvvm_digest),
             nvjitlink_sha256: Some(*nvjitlink_digest),
+            ptxas_sha256: None,
             libdevice_sha256: Sha256::digest(libdevice).into(),
         },
     )

@@ -354,8 +354,10 @@ dependencies = [
  "cuda-core",
  "libnvvm-sys",
  "nvjitlink-sys",
+ "object",
  "oxide-artifacts",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 

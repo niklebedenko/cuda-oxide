@@ -73,34 +73,85 @@ impl LtoLinker {
         self.link_inputs(inputs, LinkInputKind::Ptx, options, FinalizerOutput::Cubin)
     }
 
+    /// Link one or more ptxas relocatable CUDA objects as cubin inputs.
+    ///
+    /// nvJitLink's `Object` input kind means a host object. CUDA device
+    /// relocatables emitted by `ptxas -c` use its `Cubin` input kind.
+    pub fn link_cubin_inputs(
+        &self,
+        inputs: &[NamedInput<'_>],
+        options: &FinalizationOptions,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        self.link_inputs(
+            inputs,
+            LinkInputKind::Cubin,
+            options,
+            FinalizerOutput::Cubin,
+        )
+    }
+
     pub(crate) fn link_ptx_streaming<F>(
         &self,
         options: &FinalizationOptions,
         add_inputs: F,
     ) -> Result<(Vec<u8>, Duration), FinalizerError>
     where
-        F: FnOnce(&mut PtxLinkSink<'_, '_>) -> Result<(), FinalizerError>,
+        F: FnOnce(&mut StreamingLinkSink<'_, '_>) -> Result<(), FinalizerError>,
     {
+        self.link_streaming(LinkInputKind::Ptx, options, add_inputs)
+    }
+
+    pub(crate) fn link_cubin_streaming<F>(
+        &self,
+        options: &FinalizationOptions,
+        add_inputs: F,
+    ) -> Result<(Vec<u8>, Duration), FinalizerError>
+    where
+        F: FnOnce(&mut StreamingLinkSink<'_, '_>) -> Result<(), FinalizerError>,
+    {
+        self.link_streaming(LinkInputKind::Cubin, options, add_inputs)
+    }
+
+    fn link_streaming<F>(
+        &self,
+        input_kind: LinkInputKind,
+        options: &FinalizationOptions,
+        add_inputs: F,
+    ) -> Result<(Vec<u8>, Duration), FinalizerError>
+    where
+        F: FnOnce(&mut StreamingLinkSink<'_, '_>) -> Result<(), FinalizerError>,
+    {
+        debug_assert!(matches!(
+            input_kind,
+            LinkInputKind::Ptx | LinkInputKind::Cubin
+        ));
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
             || current_linker_tool_digest(&self.tool),
             || {
-                let option_storage = options.nvjitlink_ptx_options();
+                let option_storage = match input_kind {
+                    LinkInputKind::Ptx => options.nvjitlink_ptx_options(),
+                    LinkInputKind::Cubin => options.nvjitlink_cubin_options(),
+                    LinkInputKind::Ltoir => unreachable!("LTOIR does not use streaming linking"),
+                };
                 let option_refs = option_storage
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 let mut linker = Linker::new(&self.tool.library, &option_refs)?;
-                let mut sink = PtxLinkSink {
-                    linker: &mut linker,
-                    input_count: 0,
+                let input_count = {
+                    let mut sink = StreamingLinkSink {
+                        linker: &mut linker,
+                        input_count: 0,
+                        input_kind,
+                    };
+                    add_inputs(&mut sink)?;
+                    sink.input_count
                 };
-                add_inputs(&mut sink)?;
-                if sink.input_count == 0 {
+                if input_count == 0 {
                     return Err(FinalizerError::NoLinkInputs);
                 }
-                drop(sink);
                 let started = std::time::Instant::now();
                 let image = linker.finish()?;
                 let elapsed = started.elapsed();
@@ -128,6 +179,7 @@ impl LtoLinker {
                 let option_storage = match input_kind {
                     LinkInputKind::Ltoir => options.nvjitlink_ltoir_options(output),
                     LinkInputKind::Ptx => options.nvjitlink_ptx_options(),
+                    LinkInputKind::Cubin => options.nvjitlink_cubin_options(),
                 };
                 let option_refs = option_storage
                     .iter()
@@ -176,15 +228,17 @@ impl LtoLinker {
     }
 }
 
-pub(crate) struct PtxLinkSink<'linker, 'tool> {
+pub(crate) struct StreamingLinkSink<'linker, 'tool> {
     linker: &'linker mut Linker<'tool>,
     input_count: usize,
+    input_kind: LinkInputKind,
 }
 
-impl PtxLinkSink<'_, '_> {
+impl StreamingLinkSink<'_, '_> {
     pub(crate) fn add(&mut self, name: &str, bytes: &[u8]) -> Result<(), FinalizerError> {
-        validate_input(&NamedInput::new(name, bytes), LinkInputKind::Ptx)?;
-        self.linker.add(InputType::Ptx, bytes, name)?;
+        validate_input(&NamedInput::new(name, bytes), self.input_kind)?;
+        self.linker
+            .add(self.input_kind.nvjitlink_type(), bytes, name)?;
         self.input_count += 1;
         Ok(())
     }
@@ -194,6 +248,7 @@ impl PtxLinkSink<'_, '_> {
 enum LinkInputKind {
     Ltoir,
     Ptx,
+    Cubin,
 }
 
 impl LinkInputKind {
@@ -201,6 +256,7 @@ impl LinkInputKind {
         match self {
             Self::Ltoir => InputType::Ltoir,
             Self::Ptx => InputType::Ptx,
+            Self::Cubin => InputType::Cubin,
         }
     }
 }
@@ -313,6 +369,7 @@ fn artifact_digest_parts(
     let (route, input_name_field, input_bytes_field) = match input_kind {
         LinkInputKind::Ltoir => ("ltoir-to-output", "ltoir-name", "ltoir"),
         LinkInputKind::Ptx => ("ptx-to-output", "ptx-name", "ptx"),
+        LinkInputKind::Cubin => ("cubin-to-output", "cubin-name", "cubin"),
     };
     let mut digest = StableDigest::new()
         .field("recipe", recipe_digest())
@@ -326,6 +383,7 @@ fn artifact_digest_parts(
     let link_options = match input_kind {
         LinkInputKind::Ltoir => options.nvjitlink_ltoir_options(output),
         LinkInputKind::Ptx => options.nvjitlink_ptx_options(),
+        LinkInputKind::Cubin => options.nvjitlink_cubin_options(),
     };
     for option in link_options {
         digest = digest.field("nvjitlink-option", option.as_bytes());

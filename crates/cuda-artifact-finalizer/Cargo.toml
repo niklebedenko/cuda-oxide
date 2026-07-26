@@ -10,8 +10,10 @@ repository.workspace = true
 [dependencies]
 libnvvm-sys = { workspace = true }
 nvjitlink-sys = { workspace = true }
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
 oxide-artifacts = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
