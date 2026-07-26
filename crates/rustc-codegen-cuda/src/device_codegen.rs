@@ -1411,6 +1411,56 @@ impl From<std::io::Error> for DeviceCodegenError {
     }
 }
 
+fn report_owner_partition_calibration(
+    function_mir_weights: &BTreeMap<String, usize>,
+    function_families: &[DeviceFunctionFamily],
+) {
+    const MIB: usize = 1024 * 1024;
+    for target_mib in [12, 24, 48, 96] {
+        let target_weight = target_mib * MIB;
+        let max_weight = target_weight.saturating_mul(6) / 5;
+        let plans = plan_owner_partitions(
+            function_mir_weights,
+            function_families,
+            OwnerPartitionPolicy {
+                target_weight,
+                max_weight,
+            },
+        );
+        let mut plan_weights = plans
+            .iter()
+            .map(|plan| plan.estimated_mir_weight)
+            .collect::<Vec<_>>();
+        plan_weights.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            let index = plan_weights
+                .len()
+                .saturating_mul(numerator)
+                .div_ceil(denominator)
+                .saturating_sub(1);
+            plan_weights
+                .get(index.min(plan_weights.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or_default()
+        };
+        let unique_weight = function_mir_weights.values().copied().sum::<usize>();
+        let summed_weight = plan_weights.iter().copied().sum::<usize>();
+        let oversize_plans = plans.iter().filter(|plan| plan.exceeds_max_weight).count();
+        eprintln!(
+            "[rustc_codegen_cuda] owner partition calibration: target_mib={target_mib} \
+             target_weight={target_weight} max_weight={max_weight} partitions={} \
+             oversize_plans={oversize_plans} unique_mir_weight={unique_weight} \
+             summed_partition_mir_weight={summed_weight} min_plan_weight={} \
+             p50_plan_weight={} p90_plan_weight={} max_plan_weight={}",
+            plans.len(),
+            plan_weights.first().copied().unwrap_or_default(),
+            percentile(1, 2),
+            percentile(9, 10),
+            plan_weights.last().copied().unwrap_or_default(),
+        );
+    }
+}
+
 /// Generates PTX for device functions using the cuda-oxide pipeline.
 ///
 /// This is the main entry point for device codegen. It bridges between
@@ -1501,17 +1551,23 @@ pub fn generate_device_code<'tcx>(
         .collect();
     let partition_stats = std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some();
     let partition_plan_started = std::time::Instant::now();
-    let partition_plans = if config.partition_large_owner {
-        let function_mir_weights = functions
-            .iter()
-            .zip(function_symbols.iter())
-            .map(|(function, symbol)| {
-                let mir = tcx.instance_mir(function.instance.def);
-                (symbol.clone(), structural_mir_weight(mir))
-            })
-            .collect::<BTreeMap<_, _>>();
+    let function_mir_weights = if config.partition_large_owner {
+        Some(
+            functions
+                .iter()
+                .zip(function_symbols.iter())
+                .map(|(function, symbol)| {
+                    let mir = tcx.instance_mir(function.instance.def);
+                    (symbol.clone(), structural_mir_weight(mir))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+    } else {
+        None
+    };
+    let partition_plans = if let Some(function_mir_weights) = &function_mir_weights {
         plan_owner_partitions(
-            &function_mir_weights,
+            function_mir_weights,
             function_families,
             OwnerPartitionPolicy::default(),
         )
@@ -1555,6 +1611,19 @@ pub fn generate_device_code<'tcx>(
                 partition.exceeds_max_weight,
             );
         }
+    }
+    if std::env::var_os("CUDA_OXIDE_PARTITION_CALIBRATION").is_some() {
+        let function_mir_weights = function_mir_weights.as_ref().ok_or_else(|| {
+            DeviceCodegenError::PtxGeneration(
+                "partition calibration requires owner partitioning".to_string(),
+            )
+        })?;
+        report_owner_partition_calibration(function_mir_weights, function_families);
+    }
+    if std::env::var_os("CUDA_OXIDE_PARTITION_PLAN_ONLY").is_some() {
+        return Err(DeviceCodegenError::PtxGeneration(
+            "owner partition plan-only diagnostic completed".to_string(),
+        ));
     }
     let output_dir = config.output_dir.clone();
     let output_name = config.output_name.clone();
@@ -1900,8 +1969,7 @@ pub fn generate_device_code<'tcx>(
                             partition_functions.len(),
                             compilation.artifact_kind,
                             cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
-                            artifact_bytes
-                                > cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
+                            artifact_bytes > cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
                             started.elapsed(),
                             process_peak_rss_kib(),
                         );
