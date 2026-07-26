@@ -900,15 +900,15 @@ const OWNER_PARTITION_MAX_WEIGHT: usize = 6 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct OwnerPartitionPolicy {
-    target_bytes: usize,
-    max_bytes: usize,
+    target_weight: usize,
+    max_weight: usize,
 }
 
 impl Default for OwnerPartitionPolicy {
     fn default() -> Self {
         Self {
-            target_bytes: OWNER_PARTITION_TARGET_WEIGHT,
-            max_bytes: OWNER_PARTITION_MAX_WEIGHT,
+            target_weight: OWNER_PARTITION_TARGET_WEIGHT,
+            max_weight: OWNER_PARTITION_MAX_WEIGHT,
         }
     }
 }
@@ -958,6 +958,7 @@ fn process_peak_rss_kib() -> Option<u64> {
 }
 
 struct OwnerPartitionOutputGuard {
+    hidden_root: PathBuf,
     path: PathBuf,
     keep: bool,
 }
@@ -977,6 +978,32 @@ impl OwnerPartitionOutputGuard {
         }
 
         let hidden_root = output_dir.join(".cuda-oxide-partitions");
+        match std::fs::symlink_metadata(&hidden_root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "owner partition root is not a regular directory: {}",
+                        hidden_root.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&hidden_root)?;
+                let metadata = std::fs::symlink_metadata(&hidden_root)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "owner partition root became unsafe while creating it: {}",
+                            hidden_root.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
         let path = hidden_root.join(output_name);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -998,8 +1025,12 @@ impl OwnerPartitionOutputGuard {
         if !partitioned_owner {
             return Ok(None);
         }
-        std::fs::create_dir_all(&path)?;
-        Ok(Some(Self { path, keep: false }))
+        std::fs::create_dir(&path)?;
+        Ok(Some(Self {
+            hidden_root,
+            path,
+            keep: false,
+        }))
     }
 
     fn keep(&mut self) {
@@ -1009,7 +1040,11 @@ impl OwnerPartitionOutputGuard {
 
 impl Drop for OwnerPartitionOutputGuard {
     fn drop(&mut self) {
-        if !self.keep {
+        let root_is_safe = std::fs::symlink_metadata(&self.hidden_root)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        let path_is_safe = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        if !self.keep && root_is_safe && path_is_safe {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -1021,6 +1056,7 @@ struct OwnerPartitionPlan {
     root_symbols: Vec<String>,
     function_symbols: Vec<String>,
     estimated_mir_weight: usize,
+    exceeds_max_weight: bool,
 }
 
 #[derive(Default)]
@@ -1037,7 +1073,7 @@ fn plan_owner_partitions(
 ) -> Vec<OwnerPartitionPlan> {
     let all_function_symbols = function_mir_weights.keys().cloned().collect::<Vec<_>>();
     let all_estimated_mir_weight = function_mir_weights.values().copied().sum::<usize>();
-    if all_estimated_mir_weight <= policy.max_bytes || families.len() <= 1 {
+    if all_estimated_mir_weight <= policy.max_weight || families.len() <= 1 {
         return vec![finalize_owner_partition(
             families
                 .iter()
@@ -1045,6 +1081,7 @@ fn plan_owner_partitions(
                 .collect(),
             all_function_symbols,
             function_mir_weights,
+            policy.max_weight,
         )];
     }
 
@@ -1125,8 +1162,8 @@ fn plan_owner_partitions(
                     .map(|symbol| function_mir_weights[symbol])
                     .sum::<usize>();
                 let combined_bytes = partition.estimated_mir_weight + additional_bytes;
-                (combined_bytes <= policy.max_bytes).then_some((
-                    combined_bytes.abs_diff(policy.target_bytes),
+                (combined_bytes <= policy.max_weight).then_some((
+                    combined_bytes.abs_diff(policy.target_weight),
                     index,
                     additional_bytes,
                 ))
@@ -1164,7 +1201,7 @@ fn plan_owner_partitions(
         let index = partitions
             .iter()
             .enumerate()
-            .filter(|(_, partition)| partition.estimated_mir_weight + bytes <= policy.max_bytes)
+            .filter(|(_, partition)| partition.estimated_mir_weight + bytes <= policy.max_weight)
             .min_by_key(|(index, partition)| (partition.estimated_mir_weight, *index))
             .map(|(index, _)| index)
             .unwrap_or_else(|| {
@@ -1182,6 +1219,7 @@ fn plan_owner_partitions(
                 partition.root_symbols.into_iter().collect(),
                 partition.function_symbols.into_iter().collect(),
                 function_mir_weights,
+                policy.max_weight,
             )
         })
         .collect::<Vec<_>>();
@@ -1214,6 +1252,7 @@ fn finalize_owner_partition(
     mut root_symbols: Vec<String>,
     mut function_symbols: Vec<String>,
     function_mir_weights: &BTreeMap<String, usize>,
+    max_weight: usize,
 ) -> OwnerPartitionPlan {
     root_symbols.sort();
     root_symbols.dedup();
@@ -1249,6 +1288,7 @@ fn finalize_owner_partition(
         root_symbols,
         function_symbols,
         estimated_mir_weight,
+        exceeds_max_weight: estimated_mir_weight > max_weight,
     }
 }
 
@@ -1484,15 +1524,20 @@ pub fn generate_device_code<'tcx>(
             .iter()
             .map(|partition| partition.estimated_mir_weight)
             .sum::<usize>();
+        let oversize_plans = partition_plans
+            .iter()
+            .filter(|partition| partition.exceeds_max_weight)
+            .count();
         eprintln!(
             "[rustc_codegen_cuda] owner partition plan: enabled={} partitioned={} \
-             functions={} roots={} partitions={} summed_partition_mir_weight={} \
+             functions={} roots={} partitions={} oversize_plans={} summed_partition_mir_weight={} \
              target_weight={} max_weight={} elapsed={:?} peak_rss_kib={:?}",
             config.partition_large_owner,
             partitioned_owner,
             functions.len(),
             function_families.len(),
             partition_plans.len().max(1),
+            oversize_plans,
             estimated_mir_weight,
             OWNER_PARTITION_TARGET_WEIGHT,
             OWNER_PARTITION_MAX_WEIGHT,
@@ -1502,11 +1547,12 @@ pub fn generate_device_code<'tcx>(
         for (index, partition) in partition_plans.iter().enumerate() {
             eprintln!(
                 "[rustc_codegen_cuda] owner partition plan item: index={index} \
-                 plan_id={} roots={} functions={} estimated_mir_weight={}",
+                 plan_id={} roots={} functions={} estimated_mir_weight={} exceeds_max_weight={}",
                 partition.plan_id,
                 partition.root_symbols.len(),
                 partition.function_symbols.len(),
                 partition.estimated_mir_weight,
+                partition.exceeds_max_weight,
             );
         }
     }
@@ -1847,11 +1893,15 @@ pub fn generate_device_code<'tcx>(
                         eprintln!(
                             "[rustc_codegen_cuda] owner partition codegen: index={partition_index} \
                              name={} functions={} kernels={kernel_count} llvm_bytes={llvm_bytes} \
-                             artifact_bytes={artifact_bytes} artifact_kind={:?} elapsed={:?} \
+                             artifact_bytes={artifact_bytes} artifact_kind={:?} \
+                             partition_source_limit_bytes={} exceeds_partition_source_limit={} elapsed={:?} \
                              peak_rss_kib={:?}",
                             pipeline_config.output_name,
                             partition_functions.len(),
                             compilation.artifact_kind,
+                            cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
+                            artifact_bytes
+                                > cuda_artifact_finalizer::MAX_PARTITION_SOURCE_BYTES,
                             started.elapsed(),
                             process_peak_rss_kib(),
                         );
@@ -2130,8 +2180,8 @@ mod tests {
             },
         ];
         let policy = OwnerPartitionPolicy {
-            target_bytes: 10,
-            max_bytes: 12,
+            target_weight: 10,
+            max_weight: 12,
         };
         let baseline = plan_owner_partitions(&function_weights, &families, policy);
 
@@ -2212,8 +2262,8 @@ mod tests {
             &function_weights,
             &families,
             OwnerPartitionPolicy {
-                target_bytes: 6,
-                max_bytes: 7,
+                target_weight: 6,
+                max_weight: 7,
             },
         );
 
@@ -2225,6 +2275,10 @@ mod tests {
         assert_eq!(
             overlapping.root_symbols,
             vec!["kernel_a".to_string(), "kernel_b".to_string()]
+        );
+        assert!(
+            overlapping.exceeds_max_weight,
+            "overlapping strong roots are indivisible and must be marked oversize"
         );
         for root in ["kernel_a", "kernel_b", "kernel_c"] {
             assert_eq!(
@@ -2241,6 +2295,39 @@ mod tests {
                 "{root} must have exactly one strong definition"
             );
         }
+    }
+
+    #[test]
+    fn owner_partition_oversize_marking_distinguishes_exact_cap_and_cap_plus_one() {
+        let family = [DeviceFunctionFamily {
+            root_symbol: "kernel".to_string(),
+            root_export_name: "kernel".to_string(),
+            function_symbols: vec!["kernel".to_string(), "leaf".to_string()],
+        }];
+        let policy = OwnerPartitionPolicy {
+            target_weight: 10,
+            max_weight: 12,
+        };
+        let exact_cap = plan_owner_partitions(
+            &BTreeMap::from([("kernel".to_string(), 7), ("leaf".to_string(), 5)]),
+            &family,
+            policy,
+        );
+        assert_eq!(exact_cap.len(), 1);
+        assert_eq!(exact_cap[0].estimated_mir_weight, 12);
+        assert!(!exact_cap[0].exceeds_max_weight);
+
+        let cap_plus_one = plan_owner_partitions(
+            &BTreeMap::from([("kernel".to_string(), 7), ("leaf".to_string(), 6)]),
+            &family,
+            policy,
+        );
+        assert_eq!(cap_plus_one.len(), 1);
+        assert_eq!(cap_plus_one[0].estimated_mir_weight, 13);
+        assert!(
+            cap_plus_one[0].exceeds_max_weight,
+            "a single-family owner cannot be split but must be marked honestly"
+        );
     }
 
     #[test]
@@ -2364,6 +2451,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_partition_cleanup_rejects_symlinked_hidden_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = unique_temp_dir("cuda-codegen-partition-symlink");
+        let output_dir = temp_dir.join("output");
+        let outside_dir = temp_dir.join("outside");
+        let outside_owner = outside_dir.join("owner");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&outside_owner).unwrap();
+        let sentinel = outside_owner.join("must-survive");
+        std::fs::write(&sentinel, b"outside").unwrap();
+        symlink(&outside_dir, output_dir.join(".cuda-oxide-partitions")).unwrap();
+
+        let error = match OwnerPartitionOutputGuard::prepare(&output_dir, "owner", true) {
+            Ok(_) => panic!("symlinked hidden partition root was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside");
+
+        std::fs::remove_file(output_dir.join(".cuda-oxide-partitions")).unwrap();
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
