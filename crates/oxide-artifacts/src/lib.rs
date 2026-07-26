@@ -17,12 +17,16 @@ pub const ARTIFACT_SECTION_NAME: &str = ".oxart";
 #[cfg(feature = "object-write")]
 const ARTIFACT_ANCHOR_SECTION_NAME: &str = ".oxlink";
 pub const ARTIFACT_MAGIC: [u8; 8] = *b"OXIDEART";
-pub const ARTIFACT_VERSION: u16 = 2;
+pub const ARTIFACT_VERSION: u16 = 3;
+const COMPILE_OPTIONS_ARTIFACT_VERSION: u16 = 2;
 const LEGACY_ARTIFACT_VERSION: u16 = 1;
 
 const HEADER_BYTES: usize = 32;
 const PAYLOAD_RECORD_BYTES: usize = 24;
 const ENTRY_RECORD_BYTES: usize = 24;
+const ENTRY_FLAG_METADATA: u16 = 1 << 0;
+const ENTRY_FLAG_ROOT_DESCRIPTOR: u16 = 1 << 1;
+const KNOWN_ENTRY_FLAGS: u16 = ENTRY_FLAG_METADATA | ENTRY_FLAG_ROOT_DESCRIPTOR;
 
 const OPTION_NO_FMA_CONTRACTION: u64 = 1 << 0;
 const OPTION_DEBUG_LINE_TABLES: u64 = 1 << 1;
@@ -230,6 +234,11 @@ pub struct ArtifactEntrySpec<'a> {
     pub symbol: &'a str,
     pub kind: ArtifactEntryKind,
     pub metadata: Option<u64>,
+    /// Versioned semantic identity of an exact device root.
+    ///
+    /// The compiler maps this stable identity to [`Self::symbol`], whose
+    /// concrete export spelling may change with rustc's TypeId hash.
+    pub root_descriptor: Option<&'a str>,
 }
 
 impl<'a> ArtifactEntrySpec<'a> {
@@ -238,11 +247,17 @@ impl<'a> ArtifactEntrySpec<'a> {
             symbol,
             kind,
             metadata: None,
+            root_descriptor: None,
         }
     }
 
     pub const fn with_metadata(mut self, metadata: u64) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub const fn with_root_descriptor(mut self, descriptor: &'a str) -> Self {
+        self.root_descriptor = Some(descriptor);
         self
     }
 }
@@ -295,6 +310,7 @@ pub struct ArtifactEntry<'a> {
     pub symbol: &'a str,
     pub kind: ArtifactEntryKind,
     pub metadata: Option<u64>,
+    pub root_descriptor: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +347,7 @@ pub struct OwnedArtifactEntry {
     pub symbol: String,
     pub kind: ArtifactEntryKind,
     pub metadata: Option<u64>,
+    pub root_descriptor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,6 +394,7 @@ impl<'a> From<ArtifactBundle<'a>> for OwnedArtifactBundle {
                     symbol: entry.symbol.to_string(),
                     kind: entry.kind,
                     metadata: entry.metadata,
+                    root_descriptor: entry.root_descriptor.map(str::to_string),
                 })
                 .collect(),
         }
@@ -391,6 +409,7 @@ pub enum ArtifactError {
     EmptyPayloadName,
     EmptyPayload,
     EmptyEntrySymbol,
+    EmptyRootDescriptor,
     Truncated(&'static str),
     BadMagic,
     UnsupportedVersion(u16),
@@ -413,6 +432,7 @@ impl fmt::Display for ArtifactError {
             Self::EmptyPayloadName => f.write_str("embedded artifact payload name is empty"),
             Self::EmptyPayload => f.write_str("embedded artifact payload is empty"),
             Self::EmptyEntrySymbol => f.write_str("embedded artifact entry symbol is empty"),
+            Self::EmptyRootDescriptor => f.write_str("embedded artifact root descriptor is empty"),
             Self::Truncated(field) => write!(f, "embedded artifact is truncated in {field}"),
             Self::BadMagic => f.write_str("embedded artifact has bad magic"),
             Self::UnsupportedVersion(version) => {
@@ -485,10 +505,24 @@ pub fn build_artifact_blob(spec: &ArtifactBundleSpec<'_>) -> Result<Vec<u8>, Art
         let symbol_offset = checked_u32(out.len(), "entry symbol offset")?;
         push_bytes(&mut out, entry.symbol.as_bytes());
         align_vec(&mut out, 8);
+        let root_descriptor = entry
+            .root_descriptor
+            .map(|descriptor| {
+                let offset = checked_u32(out.len(), "root descriptor offset")?;
+                push_bytes(&mut out, descriptor.as_bytes());
+                align_vec(&mut out, 8);
+                Ok((
+                    offset,
+                    checked_u16(descriptor.len(), "root descriptor length")?,
+                ))
+            })
+            .transpose()?;
 
         let record = entry_record_start + index * ENTRY_RECORD_BYTES;
         write_u16(&mut out, record, entry.kind.to_u16());
-        write_u16(&mut out, record + 2, u16::from(entry.metadata.is_some()));
+        let flags = u16::from(entry.metadata.is_some()) * ENTRY_FLAG_METADATA
+            | u16::from(entry.root_descriptor.is_some()) * ENTRY_FLAG_ROOT_DESCRIPTOR;
+        write_u16(&mut out, record + 2, flags);
         write_u64(&mut out, record + 4, entry.metadata.unwrap_or(0));
         write_u32(&mut out, record + 12, symbol_offset);
         write_u16(
@@ -496,17 +530,27 @@ pub fn build_artifact_blob(spec: &ArtifactBundleSpec<'_>) -> Result<Vec<u8>, Art
             record + 16,
             checked_u16(entry.symbol.len(), "entry symbol length")?,
         );
+        if let Some((descriptor_offset, descriptor_len)) = root_descriptor {
+            write_u32(&mut out, record + 18, descriptor_offset);
+            write_u16(&mut out, record + 22, descriptor_len);
+        }
     }
 
     let total_len = checked_u32(out.len(), "total length")?;
     out[0..8].copy_from_slice(&ARTIFACT_MAGIC);
-    // Keep default-policy bundles on v1 for backward compatibility. A bundle
-    // that carries required compile policy uses v2 so an older reader rejects
-    // it instead of silently ignoring the semantic flag.
-    let version = if spec.compile_options == ArtifactCompileOptions::new() {
-        LEGACY_ARTIFACT_VERSION
-    } else {
+    // Keep historical bundles on their smallest compatible version. Semantic
+    // root descriptors require v3 so older readers reject the bundle instead
+    // of silently discarding the descriptor-to-export contract.
+    let version = if spec
+        .entries
+        .iter()
+        .any(|entry| entry.root_descriptor.is_some())
+    {
         ARTIFACT_VERSION
+    } else if spec.compile_options != ArtifactCompileOptions::new() {
+        COMPILE_OPTIONS_ARTIFACT_VERSION
+    } else {
+        LEGACY_ARTIFACT_VERSION
     };
     write_u16(&mut out, 8, version);
     write_u16(&mut out, 10, HEADER_BYTES as u16);
@@ -552,7 +596,10 @@ pub fn parse_artifact_blob(bytes: &[u8]) -> Result<ArtifactBundle<'_>, ArtifactE
         return Err(ArtifactError::BadMagic);
     }
     let version = read_u16(bytes, 8)?;
-    if !matches!(version, LEGACY_ARTIFACT_VERSION | ARTIFACT_VERSION) {
+    if !matches!(
+        version,
+        LEGACY_ARTIFACT_VERSION | COMPILE_OPTIONS_ARTIFACT_VERSION | ARTIFACT_VERSION
+    ) {
         return Err(ArtifactError::UnsupportedVersion(version));
     }
     let header_len = read_u16(bytes, 10)? as usize;
@@ -624,7 +671,17 @@ pub fn parse_artifact_blob(bytes: &[u8]) -> Result<ArtifactBundle<'_>, ArtifactE
         let kind = ArtifactEntryKind::from_u16(kind_raw)
             .ok_or(ArtifactError::UnsupportedEntryKind(kind_raw))?;
         let flags = read_u16(bytes, record + 2)?;
-        let metadata = if flags & 1 != 0 {
+        if flags & !KNOWN_ENTRY_FLAGS != 0 {
+            return Err(ArtifactError::Malformed(format!(
+                "embedded artifact entry `{index}` has unknown flags {flags:#x}"
+            )));
+        }
+        if version < ARTIFACT_VERSION && flags & ENTRY_FLAG_ROOT_DESCRIPTOR != 0 {
+            return Err(ArtifactError::Malformed(format!(
+                "embedded artifact version {version} cannot carry root descriptors"
+            )));
+        }
+        let metadata = if flags & ENTRY_FLAG_METADATA != 0 {
             Some(read_u64(bytes, record + 4)?)
         } else {
             None
@@ -632,10 +689,26 @@ pub fn parse_artifact_blob(bytes: &[u8]) -> Result<ArtifactBundle<'_>, ArtifactE
         let symbol_offset = read_u32(bytes, record + 12)? as usize;
         let symbol_len = read_u16(bytes, record + 16)? as usize;
         let symbol = read_str(bytes, symbol_offset, symbol_len, "entry symbol")?;
+        let root_descriptor = if flags & ENTRY_FLAG_ROOT_DESCRIPTOR != 0 {
+            let descriptor_offset = read_u32(bytes, record + 18)? as usize;
+            let descriptor_len = read_u16(bytes, record + 22)? as usize;
+            if descriptor_len == 0 {
+                return Err(ArtifactError::EmptyRootDescriptor);
+            }
+            Some(read_str(
+                bytes,
+                descriptor_offset,
+                descriptor_len,
+                "root descriptor",
+            )?)
+        } else {
+            None
+        };
         entries.push(ArtifactEntry {
             symbol,
             kind,
             metadata,
+            root_descriptor,
         });
     }
 
@@ -988,6 +1061,9 @@ fn validate_spec(spec: &ArtifactBundleSpec<'_>) -> Result<(), ArtifactError> {
         if entry.symbol.is_empty() {
             return Err(ArtifactError::EmptyEntrySymbol);
         }
+        if entry.root_descriptor.is_some_and(str::is_empty) {
+            return Err(ArtifactError::EmptyRootDescriptor);
+        }
     }
     Ok(())
 }
@@ -1111,6 +1187,96 @@ mod tests {
             bundles[0].entry("hello").unwrap().kind,
             ArtifactEntryKind::Kernel
         );
+        assert_eq!(bundles[0].entry("hello").unwrap().root_descriptor, None);
+    }
+
+    #[test]
+    fn artifact_blob_binds_semantic_root_descriptor_to_export() {
+        let descriptor = "ins_f64_smoke_gpu\nrust-instance-v1:kernel::scale::<f32, 4>";
+        let blob = build_artifact_blob(
+            &ArtifactBundleSpec::new("demo", "sm_90")
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::Ptx,
+                    "demo.ptx",
+                    b"ptx",
+                ))
+                .with_entry(
+                    ArtifactEntrySpec::new(
+                        "scale_TID_0123456789abcdef0123456789abcdef",
+                        ArtifactEntryKind::Kernel,
+                    )
+                    .with_root_descriptor(descriptor),
+                ),
+        )
+        .unwrap();
+
+        assert_eq!(read_u16(&blob, 8).unwrap(), ARTIFACT_VERSION);
+        let bundle = parse_artifact_blob(&blob).unwrap();
+        let entry = bundle
+            .entry("scale_TID_0123456789abcdef0123456789abcdef")
+            .unwrap();
+        assert_eq!(entry.root_descriptor, Some(descriptor));
+    }
+
+    #[test]
+    fn semantic_root_descriptor_offsets_and_versions_fail_closed() {
+        let descriptor = "owner\nrust-instance-v1:kernel::scale::<f32>";
+        let make_blob = || {
+            build_artifact_blob(
+                &ArtifactBundleSpec::new("demo", "sm_90")
+                    .with_payload(ArtifactPayloadSpec::new(
+                        ArtifactPayloadKind::Ptx,
+                        "demo.ptx",
+                        b"ptx",
+                    ))
+                    .with_entry(
+                        ArtifactEntrySpec::new("scale_TID_hash", ArtifactEntryKind::Kernel)
+                            .with_root_descriptor(descriptor),
+                    ),
+            )
+            .unwrap()
+        };
+        let entry_record = sample_payload_record_start() + PAYLOAD_RECORD_BYTES;
+
+        let mut malformed_offset = make_blob();
+        write_u32(&mut malformed_offset, entry_record + 18, u32::MAX);
+        assert!(matches!(
+            parse_artifact_blob(&malformed_offset),
+            Err(ArtifactError::Truncated("root descriptor"))
+        ));
+
+        let mut downgraded = make_blob();
+        write_u16(&mut downgraded, 8, COMPILE_OPTIONS_ARTIFACT_VERSION);
+        assert!(matches!(
+            parse_artifact_blob(&downgraded),
+            Err(ArtifactError::Malformed(message))
+                if message.contains("cannot carry root descriptors")
+        ));
+
+        let mut empty_descriptor = make_blob();
+        write_u16(&mut empty_descriptor, entry_record + 22, 0);
+        assert_eq!(
+            parse_artifact_blob(&empty_descriptor),
+            Err(ArtifactError::EmptyRootDescriptor)
+        );
+    }
+
+    #[test]
+    fn empty_semantic_root_descriptor_is_rejected() {
+        let error = build_artifact_blob(
+            &ArtifactBundleSpec::new("demo", "sm_90")
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::Ptx,
+                    "demo.ptx",
+                    b"ptx",
+                ))
+                .with_entry(
+                    ArtifactEntrySpec::new("scale_TID_hash", ArtifactEntryKind::Kernel)
+                        .with_root_descriptor(""),
+                ),
+        )
+        .unwrap_err();
+        assert_eq!(error, ArtifactError::EmptyRootDescriptor);
     }
 
     #[test]
@@ -1135,7 +1301,10 @@ mod tests {
                 )),
         )
         .unwrap();
-        assert_eq!(read_u16(&blob, 8).unwrap(), ARTIFACT_VERSION);
+        assert_eq!(
+            read_u16(&blob, 8).unwrap(),
+            COMPILE_OPTIONS_ARTIFACT_VERSION
+        );
         let bundles = parse_artifact_section(&blob).unwrap();
 
         assert_eq!(bundles.len(), 1);
@@ -1173,7 +1342,7 @@ mod tests {
     #[test]
     fn version_2_rejects_unknown_compile_option_bits() {
         let mut blob = sample_blob();
-        write_u16(&mut blob, 8, ARTIFACT_VERSION);
+        write_u16(&mut blob, 8, COMPILE_OPTIONS_ARTIFACT_VERSION);
         write_u64(&mut blob, 24, 1 << 63);
 
         assert!(matches!(
@@ -1218,7 +1387,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(read_u16(&blob, 8).unwrap(), ARTIFACT_VERSION);
+            assert_eq!(
+                read_u16(&blob, 8).unwrap(),
+                COMPILE_OPTIONS_ARTIFACT_VERSION
+            );
             assert_eq!(
                 parse_artifact_blob(&blob).unwrap().compile_options,
                 expected
@@ -1229,7 +1401,7 @@ mod tests {
     #[test]
     fn version_2_rejects_conflicting_debug_bits() {
         let mut blob = sample_blob();
-        write_u16(&mut blob, 8, ARTIFACT_VERSION);
+        write_u16(&mut blob, 8, COMPILE_OPTIONS_ARTIFACT_VERSION);
         write_u64(&mut blob, 24, OPTION_DEBUG_MASK);
 
         assert!(matches!(

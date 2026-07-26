@@ -286,7 +286,8 @@
 //! | `CUDA_OXIDE_PTX_DIR`              | Override PTX output directory        |
 //! | `CUDA_OXIDE_TARGET`               | Override GPU target (e.g., `sm_90a`) |
 //! | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE` | Filter device owner crate names      |
-//! | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` | Select exact roots within owners     |
+//! | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` | Select exact exports within owners   |
+//! | `CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS` | Select semantic roots    |
 //! | `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` | Disable owner partitioning     |
 //!
 //! ## Module Structure
@@ -395,6 +396,8 @@ pub struct CudaCodegenConfig {
     pub device_codegen_crates: Option<BTreeSet<String>>,
     /// Owner-scoped exported roots retained for device codegen.
     pub device_codegen_roots: Option<BTreeMap<String, BTreeSet<String>>>,
+    /// Owner-scoped semantic root descriptors retained for device codegen.
+    pub device_codegen_root_descriptors: Option<BTreeMap<String, BTreeSet<String>>>,
     /// Fail-closed parse error retained until rustc's diagnostic context exists.
     pub device_codegen_roots_error: Option<String>,
     /// Keep a materialized device owner in the LLVM O3 single-module path.
@@ -413,6 +416,7 @@ impl CudaCodegenConfig {
     /// | `CUDA_OXIDE_PTX_DIR`                 | `ptx_output_dir`         |
     /// | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`       | `device_codegen_crates`     |
     /// | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`       | `device_codegen_roots`      |
+    /// | `CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS` | `device_codegen_root_descriptors` |
     /// | `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN`  | `monolithic_device_codegen` |
     pub fn from_env() -> Self {
         let device_codegen_crates = parse_device_codegen_crates(
@@ -437,16 +441,47 @@ impl CudaCodegenConfig {
         let parsed_roots = parsed_roots.and_then(|filters| {
             validate_device_codegen_root_owners(filters, device_codegen_crates.as_ref())
         });
-        let (device_codegen_roots, mut device_codegen_roots_error) = match parsed_roots {
-            Ok(filters) => (filters, None),
-            Err(error) => (None, Some(error)),
+        let parsed_descriptors = match std::env::var_os(
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV,
+        ) {
+            None => Ok(None),
+            Some(raw) => raw.to_str().map_or_else(
+                || {
+                    Err(format!(
+                        "{} is not valid Unicode",
+                        reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
+                    ))
+                },
+                |raw| parse_device_codegen_root_descriptors(Some(raw)),
+            ),
         };
+        let parsed_descriptors = parsed_descriptors.and_then(|filters| {
+            validate_device_codegen_root_descriptor_owners(
+                filters,
+                device_codegen_crates.as_ref(),
+            )
+        });
+        let (device_codegen_roots, device_codegen_root_descriptors, mut device_codegen_roots_error) =
+            match (parsed_roots, parsed_descriptors) {
+                (Ok(roots), Ok(descriptors)) => {
+                    match validate_device_codegen_selector_exclusivity(
+                        roots.is_some(),
+                        descriptors.is_some(),
+                    ) {
+                        Ok(()) => (roots, descriptors, None),
+                        Err(error) => (None, None, Some(error)),
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => (None, None, Some(error)),
+            };
+        let has_exact_roots =
+            device_codegen_roots.is_some() || device_codegen_root_descriptors.is_some();
         let monolithic_device_codegen =
             std::env::var_os("CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN").is_some();
         if device_codegen_roots_error.is_none() {
             device_codegen_roots_error = validate_monolithic_device_codegen(
                 monolithic_device_codegen,
-                device_codegen_roots.is_some(),
+                has_exact_roots,
             )
             .err();
         }
@@ -460,6 +495,7 @@ impl CudaCodegenConfig {
                 .map(std::path::PathBuf::from),
             device_codegen_crates,
             device_codegen_roots,
+            device_codegen_root_descriptors,
             device_codegen_roots_error,
             monolithic_device_codegen,
         }
@@ -473,6 +509,15 @@ impl CudaCodegenConfig {
 
     fn device_codegen_root_selectors(&self, crate_name: &str) -> Option<&BTreeSet<String>> {
         self.device_codegen_roots
+            .as_ref()?
+            .get(&normalize_device_crate_name(crate_name))
+    }
+
+    fn device_codegen_root_descriptor_selectors(
+        &self,
+        crate_name: &str,
+    ) -> Option<&BTreeSet<String>> {
+        self.device_codegen_root_descriptors
             .as_ref()?
             .get(&normalize_device_crate_name(crate_name))
     }
@@ -492,9 +537,25 @@ fn validate_monolithic_device_codegen(
     if monolithic_device_codegen && !has_exact_roots {
         Err(
             "CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
-             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS"
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS or \
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS"
                 .to_string(),
         )
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_device_codegen_selector_exclusivity(
+    has_export_selectors: bool,
+    has_descriptor_selectors: bool,
+) -> Result<(), String> {
+    if has_export_selectors && has_descriptor_selectors {
+        Err(format!(
+            "{} and {} are mutually exclusive",
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV,
+        ))
     } else {
         Ok(())
     }
@@ -559,6 +620,57 @@ fn parse_device_codegen_roots(
     Ok(Some(filters))
 }
 
+fn parse_device_codegen_root_descriptors(
+    raw: Option<&str>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "{} cannot be empty when it is present",
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
+        ));
+    }
+
+    let mut filters = BTreeMap::<String, BTreeSet<String>>::new();
+    for entry in raw.lines() {
+        let entry = entry.trim();
+        let (owner, descriptor) = entry.split_once('=').ok_or_else(|| {
+            format!(
+                "invalid {} entry {entry:?}; expected one crate_name=rust-instance-v1:<descriptor> per line",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
+            )
+        })?;
+        let owner = normalize_device_crate_name(owner);
+        let descriptor = descriptor.trim();
+        if !is_ascii_identifier(&owner)
+            || !descriptor.starts_with(collector::ROOT_DESCRIPTOR_VERSION_PREFIX)
+            || descriptor.len() == collector::ROOT_DESCRIPTOR_VERSION_PREFIX.len()
+            || descriptor
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(format!(
+                "invalid {} entry {entry:?}; owner must be an ASCII identifier and descriptor must be a control-free `{}...` value",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV,
+                collector::ROOT_DESCRIPTOR_VERSION_PREFIX,
+            ));
+        }
+        if !filters
+            .entry(owner)
+            .or_default()
+            .insert(descriptor.to_string())
+        {
+            return Err(format!(
+                "duplicate {} entry {entry:?}",
+                reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
+            ));
+        }
+    }
+    Ok(Some(filters))
+}
+
 fn is_ascii_identifier(value: &str) -> bool {
     let mut bytes = value.bytes();
     bytes
@@ -571,13 +683,36 @@ fn validate_device_codegen_root_owners(
     filters: Option<BTreeMap<String, BTreeSet<String>>>,
     owners: Option<&BTreeSet<String>>,
 ) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    validate_device_codegen_selector_owners(
+        filters,
+        owners,
+        reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+    )
+}
+
+fn validate_device_codegen_root_descriptor_owners(
+    filters: Option<BTreeMap<String, BTreeSet<String>>>,
+    owners: Option<&BTreeSet<String>>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    validate_device_codegen_selector_owners(
+        filters,
+        owners,
+        reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV,
+    )
+}
+
+fn validate_device_codegen_selector_owners(
+    filters: Option<BTreeMap<String, BTreeSet<String>>>,
+    owners: Option<&BTreeSet<String>>,
+    selector_env: &str,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
     let Some(filters) = filters else {
         return Ok(None);
     };
     let owners = owners.ok_or_else(|| {
         format!(
             "{} requires an explicit {} owner filter",
-            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+            selector_env,
             reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV,
         )
     })?;
@@ -594,7 +729,7 @@ fn validate_device_codegen_root_owners(
     if !unselected.is_empty() || !uncovered.is_empty() {
         return Err(format!(
             "{} owner set must equal {}: roots outside owner filter [{}]; selected owners without roots [{}]",
-            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
+            selector_env,
             reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV,
             unselected.join(", "),
             uncovered.join(", "),
@@ -713,7 +848,12 @@ impl CodegenBackend for CudaCodegenBackend {
             let root_selectors = self
                 .config
                 .device_codegen_root_selectors(crate_name.as_str());
-            if root_selectors.is_some() && !contains_device_code {
+            let root_descriptor_selectors = self
+                .config
+                .device_codegen_root_descriptor_selectors(crate_name.as_str());
+            if (root_selectors.is_some() || root_descriptor_selectors.is_some())
+                && !contains_device_code
+            {
                 tcx.dcx().fatal(format!(
                     "[rustc_codegen_cuda] Invalid device-root selection for crate \
                      `{crate_name}`: the selected owner has no concrete exported device roots"
@@ -796,6 +936,7 @@ impl CodegenBackend for CudaCodegenBackend {
                     mono_partitions.codegen_units,
                     self.config.verbose,
                     root_selectors,
+                    root_descriptor_selectors,
                 )
                 .unwrap_or_else(|error| {
                     tcx.dcx().fatal(format!(
@@ -803,7 +944,7 @@ impl CodegenBackend for CudaCodegenBackend {
                          `{crate_name}`: {error}"
                     ))
                 });
-                if root_selectors.is_some() {
+                if root_selectors.is_some() || root_descriptor_selectors.is_some() {
                     let candidate_root_count = if kernel_count > 0 {
                         kernel_count
                     } else {
@@ -816,6 +957,23 @@ impl CodegenBackend for CudaCodegenBackend {
                         collection_result.function_families.len(),
                         collection_result.functions.len(),
                     );
+                    if self.config.verbose {
+                        for function in collection_result
+                            .functions
+                            .iter()
+                            .filter(|function| function.root_descriptor.is_some())
+                        {
+                            eprintln!(
+                                "[rustc_codegen_cuda] Device-root map: owner={} descriptor={} export={}",
+                                normalize_device_crate_name(crate_name.as_str()),
+                                function
+                                    .root_descriptor
+                                    .as_deref()
+                                    .expect("filtered above"),
+                                function.export_name,
+                            );
+                        }
+                    }
                 }
 
                 materialize::validate_collection(
@@ -943,6 +1101,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             match write_device_artifact_object(
                                 &device_config.output_dir,
                                 &device_config.output_name,
+                                crate_name.as_str(),
                                 tcx.sess.target.llvm_target.as_ref(),
                                 &result,
                                 device_functions,
@@ -1055,6 +1214,7 @@ impl CodegenBackend for CudaCodegenBackend {
 fn write_device_artifact_object(
     output_dir: &Path,
     output_name: &str,
+    device_owner: &str,
     host_target: &str,
     result: &device_codegen::DeviceCodegenResult,
     functions: &[collector::CollectedFunction<'_>],
@@ -1131,16 +1291,27 @@ fn write_device_artifact_object(
                 .as_deref()
                 .ok_or("embedded artifact payload was not retained in memory")?,
         ));
-    for function in functions {
+    let root_descriptors = functions
+        .iter()
+        .map(|function| {
+            function
+                .root_descriptor
+                .as_ref()
+                .map(|descriptor| format!("{device_owner}\n{descriptor}"))
+        })
+        .collect::<Vec<_>>();
+    for (function, root_descriptor) in functions.iter().zip(&root_descriptors) {
         let kind = if function.is_kernel {
             oxide_artifacts::ArtifactEntryKind::Kernel
         } else {
             oxide_artifacts::ArtifactEntryKind::DeviceFunction
         };
-        spec = spec.with_entry(oxide_artifacts::ArtifactEntrySpec::new(
-            &function.export_name,
-            kind,
-        ));
+        let mut entry =
+            oxide_artifacts::ArtifactEntrySpec::new(&function.export_name, kind);
+        if let Some(root_descriptor) = root_descriptor {
+            entry = entry.with_root_descriptor(root_descriptor);
+        }
+        spec = spec.with_entry(entry);
     }
 
     let blob = oxide_artifacts::build_artifact_blob(&spec)?;
@@ -1690,8 +1861,13 @@ mod tests {
         assert_eq!(
             validate_monolithic_device_codegen(true, false).unwrap_err(),
             "CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
-             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS"
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOTS or \
+             CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS"
         );
+        assert!(validate_device_codegen_selector_exclusivity(true, false).is_ok());
+        assert!(validate_device_codegen_selector_exclusivity(false, true).is_ok());
+        assert!(validate_device_codegen_selector_exclusivity(false, false).is_ok());
+        assert!(validate_device_codegen_selector_exclusivity(true, true).is_err());
     }
 
     #[test]
@@ -1812,6 +1988,52 @@ mod tests {
             Some(&BTreeSet::from(["gpu_kernels".to_string()])),
         )
         .expect("every selected owner has an exact root set");
+    }
+
+    #[test]
+    fn semantic_device_root_filters_preserve_full_descriptors_and_fail_closed() {
+        let descriptor =
+            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>";
+        let filters = parse_device_codegen_root_descriptors(Some(&format!(
+            "gpu-kernels={descriptor}\nmath_gpu=rust-instance-v1:math::reduce::<f64>"
+        )))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            filters["gpu_kernels"],
+            BTreeSet::from([descriptor.to_string()])
+        );
+        validate_device_codegen_root_descriptor_owners(
+            Some(filters.clone()),
+            Some(&BTreeSet::from([
+                "gpu_kernels".to_string(),
+                "math_gpu".to_string(),
+            ])),
+        )
+        .expect("semantic selectors cover every fixed owner");
+
+        let config = CudaCodegenConfig {
+            device_codegen_root_descriptors: Some(filters),
+            ..CudaCodegenConfig::default()
+        };
+        assert_eq!(
+            config.device_codegen_root_descriptor_selectors("gpu-kernels"),
+            Some(&BTreeSet::from([descriptor.to_string()]))
+        );
+        assert!(
+            parse_device_codegen_root_descriptors(Some("gpu_kernels=scale_TID_hash")).is_err()
+        );
+        assert!(parse_device_codegen_root_descriptors(Some("gpu_kernels=")).is_err());
+        assert!(parse_device_codegen_root_descriptors(Some(
+            "gpu_kernels=rust-instance-v1:"
+        ))
+        .is_err());
+        assert!(
+            parse_device_codegen_root_descriptors(Some(&format!(
+                "gpu_kernels={descriptor}\ngpu-kernels={descriptor}"
+            )))
+            .is_err()
+        );
     }
 
     #[test]

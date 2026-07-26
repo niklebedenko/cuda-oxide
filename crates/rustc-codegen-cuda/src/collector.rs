@@ -134,7 +134,10 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+/// Versioned prefix for compiler-emitted semantic device-root descriptors.
+pub const ROOT_DESCRIPTOR_VERSION_PREFIX: &str = "rust-instance-v1:";
 
 /// Blocks reachable under the values CUDA Oxide emits for device-only runtime
 /// checks.
@@ -337,6 +340,11 @@ pub struct CollectedFunction<'tcx> {
     /// For kernels: the user-visible name (e.g., `add_one`)
     /// For generics: the mangled symbol name (e.g., `_RNvMNtNtCs...`)
     pub export_name: String,
+
+    /// Stable semantic identity for an exact root.
+    ///
+    /// Helpers and roots in broad builds do not carry a descriptor.
+    pub root_descriptor: Option<String>,
 }
 
 /// An external device function declaration (for linking with external LTOIR).
@@ -842,11 +850,107 @@ struct DiscoveryCtx {
 /// Returns an error when any selected export name is absent from the concrete
 /// kernel roots, or from the standalone device roots when the crate has no
 /// kernels.
+fn semantic_root_descriptor<'tcx>(
+    collector: &DeviceCollector<'tcx>,
+    instance: Instance<'tcx>,
+    is_kernel: bool,
+) -> Option<String> {
+    let fqdn = collector.fqdn(instance);
+    let prefixes = if is_kernel {
+        [
+            reserved_oxide_symbols::KERNEL_PREFIX,
+            reserved_oxide_symbols::LEGACY_KERNEL_PREFIX,
+        ]
+    } else {
+        [
+            reserved_oxide_symbols::DEVICE_PREFIX,
+            reserved_oxide_symbols::LEGACY_DEVICE_PREFIX,
+        ]
+    };
+    let (position, prefix) = prefixes
+        .into_iter()
+        .find_map(|prefix| fqdn.find(prefix).map(|position| (position, prefix)))?;
+    let mut semantic = String::with_capacity(
+        ROOT_DESCRIPTOR_VERSION_PREFIX.len() + fqdn.len() - prefix.len(),
+    );
+    semantic.push_str(ROOT_DESCRIPTOR_VERSION_PREFIX);
+    semantic.push_str(&fqdn[..position]);
+    semantic.push_str(&fqdn[position + prefix.len()..]);
+
+    // Source locations are part of rustc's display spelling for anonymous
+    // types. They are useful diagnostics but not durable selector identities.
+    // Raw-export selection remains available for those specializations.
+    if ["{closure", "{coroutine", "{async", "{opaque"]
+        .iter()
+        .any(|marker| semantic.contains(marker))
+    {
+        None
+    } else {
+        Some(semantic)
+    }
+}
+
+fn resolve_selected_device_root_indices(
+    available: &[(Option<String>, String)],
+    selected_exports: Option<&BTreeSet<String>>,
+    selected_descriptors: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<usize>, String> {
+    if selected_exports.is_some() && selected_descriptors.is_some() {
+        return Err("export and semantic device-root selectors are mutually exclusive".to_string());
+    }
+    let (selected, identities, selector_kind) = if let Some(selected) = selected_descriptors {
+        let mut identities = BTreeMap::<&str, Vec<usize>>::new();
+        for (index, (descriptor, _)) in available.iter().enumerate() {
+            if let Some(descriptor) = descriptor {
+                identities
+                    .entry(descriptor.as_str())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        (selected, identities, "semantic")
+    } else if let Some(selected) = selected_exports {
+        let mut identities = BTreeMap::<&str, Vec<usize>>::new();
+        for (index, (_, export)) in available.iter().enumerate() {
+            identities.entry(export.as_str()).or_default().push(index);
+        }
+        (selected, identities, "export")
+    } else {
+        return Ok((0..available.len()).collect());
+    };
+
+    let missing = selected
+        .iter()
+        .filter(|selector| !identities.contains_key(selector.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "device-root selectors do not name concrete {selector_kind} roots: {}",
+            missing.join(", ")
+        ));
+    }
+
+    let mut selected_indices = BTreeSet::new();
+    for selector in selected {
+        let indices = &identities[selector.as_str()];
+        if indices.len() != 1 {
+            return Err(format!(
+                "ambiguous {selector_kind} device-root selector `{selector}` matched {} concrete roots",
+                indices.len()
+            ));
+        }
+        selected_indices.insert(indices[0]);
+    }
+    Ok(selected_indices)
+}
+
 pub fn collect_device_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
     cgus: &[CodegenUnit<'tcx>],
     verbose: bool,
     selected_roots: Option<&BTreeSet<String>>,
+    selected_root_descriptors: Option<&BTreeSet<String>>,
 ) -> Result<CollectionResult<'tcx>, String> {
     let mut collector = DeviceCollector::new(tcx, verbose);
     let mut roots = Vec::new();
@@ -894,11 +998,12 @@ pub fn collect_device_functions<'tcx>(
                     eprintln!("[collector] Found kernel: {} -> {}", name, export_name);
                 }
 
-                roots.push((*instance, true, export_name));
+                let descriptor = semantic_root_descriptor(&collector, *instance, true);
+                roots.push((*instance, true, export_name, descriptor));
             }
         }
     }
-    roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
+    roots.sort_by_cached_key(|(instance, _, _, _)| tcx.symbol_name(*instance).name.to_string());
     roots.dedup_by(|left, right| left.0 == right.0);
     let has_kernel_roots = !roots.is_empty();
 
@@ -933,33 +1038,33 @@ pub fn collect_device_functions<'tcx>(
                     }
 
                     // Add as a non-kernel root — produces .func (not .entry) in PTX
-                    roots.push((*instance, false, export_name));
+                    let descriptor = semantic_root_descriptor(&collector, *instance, false);
+                    roots.push((*instance, false, export_name, descriptor));
                 }
             }
         }
-        roots.sort_by_cached_key(|(instance, _, _)| tcx.symbol_name(*instance).name.to_string());
+        roots.sort_by_cached_key(|(instance, _, _, _)| tcx.symbol_name(*instance).name.to_string());
         roots.dedup_by(|left, right| left.0 == right.0);
     }
-    if let Some(selected_roots) = selected_roots {
-        let available = roots
-            .iter()
-            .map(|(_, _, export_name)| export_name.as_str())
-            .collect::<BTreeSet<_>>();
-        let missing = selected_roots
-            .iter()
-            .filter(|selector| !available.contains(selector.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "device-root selectors do not name concrete exported roots: {}",
-                missing.join(", ")
-            ));
+    let available = roots
+        .iter()
+        .map(|(_, _, export, descriptor)| (descriptor.clone(), export.clone()))
+        .collect::<Vec<_>>();
+    let selected_indices = resolve_selected_device_root_indices(
+        &available,
+        selected_roots,
+        selected_root_descriptors,
+    )?;
+    let exact_selection = selected_roots.is_some() || selected_root_descriptors.is_some();
+    for (index, (instance, is_kernel, export_name, descriptor)) in roots.into_iter().enumerate() {
+        if selected_indices.contains(&index) {
+            collector.add_root(
+                instance,
+                is_kernel,
+                export_name,
+                exact_selection.then_some(descriptor).flatten(),
+            );
         }
-        roots.retain(|(_, _, export_name)| selected_roots.contains(export_name));
-    }
-    for (instance, is_kernel, export_name) in roots {
-        collector.add_root(instance, is_kernel, export_name);
     }
 
     // Process the worklist to collect all reachable functions
@@ -1045,7 +1150,13 @@ impl<'tcx> DeviceCollector<'tcx> {
     }
 
     /// Adds a root function (kernel) to start collection from.
-    fn add_root(&mut self, instance: Instance<'tcx>, is_kernel: bool, export_name: String) {
+    fn add_root(
+        &mut self,
+        instance: Instance<'tcx>,
+        is_kernel: bool,
+        export_name: String,
+        root_descriptor: Option<String>,
+    ) {
         // Use mangled name as the unique key - this distinguishes different
         // monomorphizations of the same generic function (e.g., map<f32, Closure1>
         // vs map<f32, Closure2>)
@@ -1068,6 +1179,7 @@ impl<'tcx> DeviceCollector<'tcx> {
                 instance,
                 is_kernel,
                 export_name,
+                root_descriptor,
             });
         }
     }
@@ -1353,6 +1465,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             instance: drop_instance,
             is_kernel: false,
             export_name,
+            root_descriptor: None,
         });
     }
 
@@ -1614,6 +1727,7 @@ impl<'tcx> DeviceCollector<'tcx> {
                 instance: resolved,
                 is_kernel: false,
                 export_name,
+                root_descriptor: None,
             });
             return;
         }
@@ -1740,6 +1854,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             instance: resolved,
             is_kernel: false,
             export_name,
+            root_descriptor: None,
         });
     }
 
@@ -1868,6 +1983,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             instance,
             is_kernel: false,
             export_name,
+            root_descriptor: None,
         });
     }
 
@@ -2554,7 +2670,7 @@ mod tests {
     use super::{
         build_function_families_from_symbols, device_runtime_checks_target,
         is_kernel_entry_def_path, is_legacy_warp_shuffle_value_path,
-        unsupported_codegen_protocol_root,
+        resolve_selected_device_root_indices, unsupported_codegen_protocol_root,
     };
     use reserved_oxide_symbols::{
         DEVICE_PREFIX, KERNEL_PREFIX, LEGACY_DEVICE_PREFIX, LEGACY_KERNEL_PREFIX,
@@ -2562,6 +2678,62 @@ mod tests {
     use rustc_index::Idx;
     use rustc_middle::mir::BasicBlock;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn semantic_root_selection_survives_export_hash_churn() {
+        let descriptor =
+            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
+        let selected = BTreeSet::from([descriptor.clone()]);
+        let old = vec![(
+            Some(descriptor.clone()),
+            "scale_TID_0123456789abcdef0123456789abcdef".to_string(),
+        )];
+        let new = vec![(
+            Some(descriptor),
+            "scale_TID_fedcba9876543210fedcba9876543210".to_string(),
+        )];
+
+        assert_eq!(
+            resolve_selected_device_root_indices(&old, None, Some(&selected)).unwrap(),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            resolve_selected_device_root_indices(&new, None, Some(&selected)).unwrap(),
+            BTreeSet::from([0])
+        );
+    }
+
+    #[test]
+    fn semantic_root_selection_fails_closed_on_missing_or_ambiguous_descriptors() {
+        let descriptor =
+            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
+        let selected = BTreeSet::from([descriptor.clone()]);
+        let missing = vec![(
+            Some("rust-instance-v1:kernel_crate::kernels::scale::<f64, 4>".to_string()),
+            "scale_TID_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )];
+        assert!(
+            resolve_selected_device_root_indices(&missing, None, Some(&selected))
+                .unwrap_err()
+                .contains("do not name concrete semantic roots")
+        );
+
+        let ambiguous = vec![
+            (
+                Some(descriptor.clone()),
+                "scale_TID_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            (
+                Some(descriptor),
+                "scale_TID_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+        ];
+        assert!(
+            resolve_selected_device_root_indices(&ambiguous, None, Some(&selected))
+                .unwrap_err()
+                .contains("ambiguous semantic device-root selector")
+        );
+    }
 
     #[test]
     fn function_families_are_canonical_across_root_and_edge_order() {

@@ -77,6 +77,14 @@ pub const DEVICE_CODEGEN_CRATE_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_CRATE";
 /// [`DEVICE_CODEGEN_CRATE_ENV`] filter containing every named owner.
 pub const DEVICE_CODEGEN_ROOTS_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_ROOTS";
 
+/// Optional newline-separated, owner-scoped semantic device-root selection.
+///
+/// Each entry has the form `crate_name=rust-instance-v1:<descriptor>`. The
+/// backend resolves the stable descriptor to the concrete export emitted by
+/// the current compiler. It is mutually exclusive with
+/// [`DEVICE_CODEGEN_ROOTS_ENV`].
+pub const DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS";
+
 /// Reserved root that prefixes every cuda-oxide internal symbol.
 ///
 /// User code must not define functions whose name starts with this.

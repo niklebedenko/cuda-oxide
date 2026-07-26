@@ -89,6 +89,7 @@ These are set automatically by `cargo oxide`. For manual invocations, all four a
 | `CUDA_OXIDE_EMIT_NVVM_IR`            | Emit NVVM IR for libNVVM                    |
 | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`    | Comma-separated device owner crate filter   |
 | `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`    | Comma-separated `owner=export` root filter  |
+| `CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS` | Newline-separated semantic root filter |
 | `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` | Keep selected owners on LLVM O3           |
 
 `cargo oxide --arch <sm_XX>` sets `CUDA_OXIDE_TARGET`. When it is unset,
@@ -106,10 +107,23 @@ Validation occurs when rustc compiles the selected owner. Build wrappers must
 therefore include `CUDA_OXIDE_DEVICE_CODEGEN_ROOTS` in the owner's Cargo
 codegen fingerprint so a changed selection cannot reuse a stale owner
 artifact; `cargo oxide` includes it automatically.
+For durable exact-root catalogs, prefer
+`CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS`. Each line is
+`owner=rust-instance-v1:<fully-qualified kernel instance>`, with ordered,
+fully-resolved type and const arguments. The compiler resolves that semantic
+identity to the current export before walking the device call graph, rejects
+missing or ambiguous identities, and embeds the owner-qualified
+descriptor-to-export map in the artifact entry. Anonymous closure, coroutine,
+async, and opaque types do not receive v1 descriptors because their displayed
+source locations are not stable selector identities. The semantic and raw
+selector variables are mutually exclusive; raw selection remains available
+for compatibility and emits mappings for stable selected instances so catalogs
+can migrate without broad codegen. With `CUDA_OXIDE_VERBOSE=1`, each mapping is
+also printed as one `Device-root map` line.
 `CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN` opts selected materialized owners out of
 partitioning so their complete closure is optimized as one LLVM module. It is
 restricted to measured, bounded exact-root artifacts and fails closed without
-`CUDA_OXIDE_DEVICE_CODEGEN_ROOTS`; wrappers include it in the same CUDA
+one of the two exact-root selectors; wrappers include it in the same CUDA
 environment fingerprint.
 
 ## Source Layout

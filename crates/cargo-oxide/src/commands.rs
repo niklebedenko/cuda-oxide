@@ -8483,6 +8483,22 @@ device-owner = { path = "../device-owner" }
             ),
             "exact CUDA-tool provenance must change Cargo's rustc fingerprint"
         );
+        let descriptor_env = BTreeMap::from([(
+            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV.to_string(),
+            b"gpu_kernel=rust-instance-v1:kernel_crate::scale::<f32>".to_vec(),
+        )]);
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("sm_80"),
+                &MaterializationMode::default(),
+                &descriptor_env,
+            ),
+            "semantic root selection must change Cargo's rustc fingerprint"
+        );
     }
 
     #[test]
@@ -8531,6 +8547,7 @@ device-owner = { path = "../device-owner" }
             device_codegen_crate: None,
             device_cfgs: &[],
             no_fmad: false,
+            unchecked_indexing: false,
             materialize_cubin: false,
         };
         let fingerprint = |ctx: &Context, inherited_env: &BTreeMap<String, Vec<u8>>| {
