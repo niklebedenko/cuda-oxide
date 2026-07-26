@@ -2,8 +2,10 @@ use cuda_artifact_finalizer::{
     CudaArch, FinalizationOptions, Finalizer, PartitionFileInput, PartitionFileInputKind,
     is_valid_cubin,
 };
+use cuda_core::{CudaContext, DeviceBuffer};
 use std::error::Error;
 use std::ffi::OsString;
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -13,6 +15,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
 target triple = "nvptx64-nvidia-cuda"
 
 @__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+@_ZN5probe8CONSTANTE = linkonce_odr addrspace(4) global i32 13, align 4
 
 define linkonce_odr i32 @shared_device(i32 %value) #0 {
 entry:
@@ -23,7 +26,9 @@ entry:
 define void @kernel_a(i32* %output) {
 entry:
   %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
-  %value = call i32 @shared_device(i32 %global_value)
+  %constant_value = load i32, i32 addrspace(4)* @_ZN5probe8CONSTANTE, align 4
+  %input = add i32 %global_value, %constant_value
+  %value = call i32 @shared_device(i32 %input)
   store i32 %value, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
   store i32 %value, i32* %output, align 4
   ret void
@@ -44,6 +49,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
 target triple = "nvptx64-nvidia-cuda"
 
 @__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+@_ZN5probe8CONSTANTE = linkonce_odr addrspace(4) global i32 13, align 4
 
 define linkonce_odr i32 @shared_device(i32 %value) #0 {
 entry:
@@ -54,7 +60,9 @@ entry:
 define void @kernel_b(i32* %output) {
 entry:
   %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
-  %value = call i32 @shared_device(i32 %global_value)
+  %constant_value = load i32, i32 addrspace(4)* @_ZN5probe8CONSTANTE, align 4
+  %input = add i32 %global_value, %constant_value
+  %value = call i32 @shared_device(i32 %input)
   store i32 %value, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
   store i32 %value, i32* %output, align 4
   ret void
@@ -95,6 +103,7 @@ fn pressure_module(index: usize, operations: usize) -> Vec<u8> {
 target triple = "nvptx64-nvidia-cuda"
 
 @__device_global__ZN5probe6SHAREDE = linkonce_odr addrspace(1) global i32 11, align 4
+@_ZN5probe8CONSTANTE = linkonce_odr addrspace(4) global i32 13, align 4
 
 define linkonce_odr i32 @shared_device(i32 %value) #0 {{
 entry:
@@ -105,7 +114,9 @@ entry:
 define void @kernel_{index}(i32* %output) {{
 entry:
   %global_value = load i32, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4
-  %seed = call i32 @shared_device(i32 %global_value)
+  %constant_value = load i32, i32 addrspace(4)* @_ZN5probe8CONSTANTE, align 4
+  %input = add i32 %global_value, %constant_value
+  %seed = call i32 @shared_device(i32 %input)
   store i32 %seed, i32 addrspace(1)* @__device_global__ZN5probe6SHAREDE, align 4"#
     )
     .expect("writing a String cannot fail");
@@ -140,6 +151,48 @@ attributes #0 = {{ noinline }}
     module.into_bytes()
 }
 
+fn validate_static_coalescence_on_gpu(cubin: &[u8]) -> Result<(), Box<dyn Error>> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = context.load_module_from_image(cubin)?;
+    let (global_pointer, global_bytes) = module.get_global("__device_global__ZN5probe6SHAREDE")?;
+    let (constant_pointer, constant_bytes) = module.get_global("_ZN5probe8CONSTANTE")?;
+    if global_pointer == constant_pointer || global_bytes != 4 || constant_bytes != 4 {
+        return Err(format!(
+            "unexpected linked storage: global=({global_pointer:#x}, {global_bytes}) \
+             constant=({constant_pointer:#x}, {constant_bytes})"
+        )
+        .into());
+    }
+
+    let output = DeviceBuffer::from_host(&stream, &[0_i32])?;
+    let mut output_pointer = output.cu_deviceptr();
+    for (kernel_name, expected) in [("kernel_a", 31_i32), ("kernel_b", 51_i32)] {
+        let kernel = module.load_function(kernel_name)?;
+        let mut arguments = [std::ptr::addr_of_mut!(output_pointer).cast::<c_void>()];
+        // SAFETY: both generated probe kernels take one writable i32 device
+        // pointer, use no thread coordinates, and are launched as one thread.
+        unsafe {
+            cuda_core::launch_kernel_on_stream(
+                &kernel,
+                (1, 1, 1),
+                (1, 1, 1),
+                0,
+                &stream,
+                &mut arguments,
+            )?;
+        }
+        let actual = output.to_host_vec(&stream)?;
+        if actual != [expected] {
+            return Err(format!(
+                "{kernel_name} observed {actual:?}; expected [{expected}] from shared linked state"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let output = arguments
@@ -148,8 +201,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| std::env::temp_dir().join("cuda-oxide-partition-probe.cubin"));
     let partition_count = parse_count(arguments.next(), 2, "partition count")?;
     let operations_per_partition = parse_count(arguments.next(), 0, "operations per partition")?;
-    if partition_count < 2 {
-        return Err("partition count must be at least two".into());
+    if partition_count == 0 {
+        return Err("partition count must be at least one".into());
     }
     if arguments.next().is_some() {
         return Err(
@@ -184,6 +237,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let elapsed = started.elapsed();
     assert!(is_valid_cubin(&materialized.cubin));
     assert_eq!(materialized.partitions.len(), partition_count);
+    let ran_static_launch_probe = partition_count == 2 && operations_per_partition == 0;
+    if ran_static_launch_probe {
+        validate_static_coalescence_on_gpu(&materialized.cubin)?;
+    }
     std::fs::write(&output, &materialized.cubin)?;
     for (_, path) in &owned_inputs {
         std::fs::remove_file(path)?;
@@ -207,7 +264,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "partitions={} operations_per_partition={} source_bytes={} ptx_bytes={} \
          cubin_bytes={} elapsed_ms={} nvvm_ms={} link_add_ms={} link_complete_ms={} \
-         peak_rss_kib={:?} bundle={}",
+         peak_rss_kib={:?} static_launch_probe={} bundle={}",
         materialized.partitions.len(),
         operations_per_partition,
         materialized
@@ -234,6 +291,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .sum::<u128>(),
         materialized.link_elapsed.as_millis(),
         materialized.peak_rss_kib,
+        ran_static_launch_probe,
         materialized.ptx_bundle_path.display(),
     );
     Ok(())

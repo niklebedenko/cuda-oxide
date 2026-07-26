@@ -25,10 +25,20 @@ pub use provenance::{ToolProvenance, recipe_digest};
 pub use validation::is_valid_cubin;
 
 use provenance::common_provenance_digest;
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+
+/// Maximum bytes accepted from one on-disk owner partition.
+///
+/// The partition planner targets substantially smaller artifacts. This is a
+/// fail-closed allocation ceiling for corrupt, stale, or unexpectedly large
+/// materialization inputs.
+pub const MAX_PARTITION_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Failures while compiling NVVM IR or linking CUDA device artifacts.
 #[derive(Debug, Error)]
@@ -59,6 +69,22 @@ pub enum FinalizerError {
         #[source]
         source: std::io::Error,
     },
+
+    /// One owner partition exceeded the finalizer's hard allocation ceiling.
+    #[error(
+        "CUDA owner partition {path} is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte source limit"
+    )]
+    PartitionSourceTooLarge {
+        path: PathBuf,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+
+    /// An owner partition changed after its size was checked.
+    #[error(
+        "CUDA owner partition {path} changed while it was being read (initial size {initial_bytes} bytes)"
+    )]
+    PartitionSourceChanged { path: PathBuf, initial_bytes: u64 },
 
     /// Owner-level PTX bundle encoding failed.
     #[error("PTX bundle: {0}")]
@@ -93,6 +119,26 @@ pub enum FinalizerError {
         name: String,
         /// Byte offset of the first non-trailing NUL.
         offset: usize,
+    },
+
+    /// PTX is textual input and must be valid UTF-8 for deterministic
+    /// cross-partition definition validation.
+    #[error("CUDA PTX input {name:?} is not valid UTF-8")]
+    InvalidPtxText { name: String },
+
+    /// A generated weak storage declaration was truncated or malformed.
+    #[error("CUDA PTX input {name:?} has malformed weak storage declaration: {declaration:?}")]
+    MalformedWeakStorageDefinition { name: String, declaration: String },
+
+    /// ODR-coalesced statics must have identical type, address space,
+    /// alignment, and initializer in every partition.
+    #[error(
+        "CUDA PTX inputs {first_input:?} and {second_input:?} define incompatible weak storage symbol {symbol:?}"
+    )]
+    IncompatibleWeakStorageDefinition {
+        symbol: String,
+        first_input: String,
+        second_input: String,
     },
 
     /// nvJitLink was invoked without an input module.
@@ -253,13 +299,11 @@ impl Finalizer {
             oxide_artifacts::ptx_bundle::PtxBundleLimits::default(),
         )?;
         let mut partitions = Vec::with_capacity(inputs.len());
+        let mut weak_storage_definitions = WeakStorageDefinitions::default();
         let (cubin, link_elapsed) = self.linker.link_ptx_streaming(options, |linker| {
             for input in inputs {
                 validate_name(input.name)?;
-                let source = std::fs::read(input.path).map_err(|source| FinalizerError::Io {
-                    path: input.path.to_path_buf(),
-                    source,
-                })?;
+                let source = read_partition_source_capped(input.path, MAX_PARTITION_SOURCE_BYTES)?;
                 if source.is_empty() {
                     return Err(FinalizerError::EmptyInput {
                         name: input.name.to_string(),
@@ -278,6 +322,7 @@ impl Finalizer {
                     }
                     PartitionFileInputKind::Ptx => (source, Duration::ZERO),
                 };
+                weak_storage_definitions.observe(input.name, &ptx)?;
                 let ptx_name = Path::new(input.name)
                     .with_extension("ptx")
                     .file_name()
@@ -374,6 +419,160 @@ impl Finalizer {
             options,
             self.provenance(),
         )
+    }
+}
+
+fn read_partition_source_capped(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, FinalizerError> {
+    let mut file = std::fs::File::open(path).map_err(|source| FinalizerError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let actual_bytes = file
+        .metadata()
+        .map_err(|source| FinalizerError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if actual_bytes > maximum_bytes {
+        return Err(FinalizerError::PartitionSourceTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes,
+            maximum_bytes,
+        });
+    }
+    let source_len =
+        usize::try_from(actual_bytes).map_err(|_| FinalizerError::PartitionSourceTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes,
+            maximum_bytes,
+        })?;
+    let mut source = vec![0; source_len];
+    file.read_exact(&mut source)
+        .map_err(|source| FinalizerError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    // Partition artifacts are immutable regular files. A byte beyond the
+    // opened file's metadata means the input changed while it was consumed.
+    // Reject it without growing the allocation.
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|source| FinalizerError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        != 0
+    {
+        return Err(FinalizerError::PartitionSourceChanged {
+            path: path.to_path_buf(),
+            initial_bytes: actual_bytes,
+        });
+    }
+    Ok(source)
+}
+
+#[derive(Default)]
+struct WeakStorageDefinitions {
+    by_symbol: BTreeMap<String, ([u8; 32], String)>,
+}
+
+impl WeakStorageDefinitions {
+    fn observe(&mut self, input_name: &str, ptx: &[u8]) -> Result<(), FinalizerError> {
+        let ptx = std::str::from_utf8(ptx).map_err(|_| FinalizerError::InvalidPtxText {
+            name: input_name.to_string(),
+        })?;
+        let mut pending = None::<String>;
+        for raw_line in ptx.lines() {
+            let line = raw_line
+                .split_once("//")
+                .map_or(raw_line, |(code, _)| code)
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(declaration) = pending.as_mut() {
+                declaration.push(' ');
+                declaration.push_str(line);
+                if declaration.contains(';') {
+                    let complete = pending.take().expect("pending declaration exists");
+                    self.observe_declaration(input_name, &complete)?;
+                }
+                continue;
+            }
+            if line.contains(".weak") && (line.contains(".global") || line.contains(".const")) {
+                if line.contains(';') {
+                    self.observe_declaration(input_name, line)?;
+                } else {
+                    pending = Some(line.to_string());
+                }
+            }
+        }
+        if let Some(declaration) = pending {
+            return Err(FinalizerError::MalformedWeakStorageDefinition {
+                name: input_name.to_string(),
+                declaration,
+            });
+        }
+        Ok(())
+    }
+
+    fn observe_declaration(
+        &mut self,
+        input_name: &str,
+        declaration: &str,
+    ) -> Result<(), FinalizerError> {
+        let semicolon = declaration.find(';').ok_or_else(|| {
+            FinalizerError::MalformedWeakStorageDefinition {
+                name: input_name.to_string(),
+                declaration: declaration.to_string(),
+            }
+        })?;
+        let declaration = &declaration[..=semicolon];
+        let left = declaration
+            .split_once('=')
+            .map_or(declaration.trim_end_matches(';'), |(left, _)| left);
+        let symbol_token = left.split_ascii_whitespace().last().ok_or_else(|| {
+            FinalizerError::MalformedWeakStorageDefinition {
+                name: input_name.to_string(),
+                declaration: declaration.to_string(),
+            }
+        })?;
+        let symbol = symbol_token
+            .split_once('[')
+            .map_or(symbol_token, |(symbol, _)| symbol);
+        if symbol.is_empty() || symbol.starts_with('.') {
+            return Err(FinalizerError::MalformedWeakStorageDefinition {
+                name: input_name.to_string(),
+                declaration: declaration.to_string(),
+            });
+        }
+        let mut definition_hasher = Sha256::new();
+        for token in declaration.split_ascii_whitespace() {
+            definition_hasher.update((token.len() as u64).to_le_bytes());
+            definition_hasher.update(token.as_bytes());
+        }
+        let definition_digest = definition_hasher.finalize().into();
+        if let Some((first_digest, first_input)) = self.by_symbol.get(symbol) {
+            if first_digest != &definition_digest {
+                return Err(FinalizerError::IncompatibleWeakStorageDefinition {
+                    symbol: symbol.to_string(),
+                    first_input: first_input.clone(),
+                    second_input: input_name.to_string(),
+                });
+            }
+        } else {
+            self.by_symbol.insert(
+                symbol.to_string(),
+                (definition_digest, input_name.to_string()),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -577,6 +776,89 @@ entry:
 
         assert_eq!(std::fs::read(&target).unwrap(), b"previous complete bundle");
         assert!(!temporary_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn weak_storage_odr_validation_accepts_identical_and_rejects_mismatch() {
+        let mut definitions = WeakStorageDefinitions::default();
+        definitions
+            .observe(
+                "part-a.ptx",
+                b".weak .global .align 4 .u32 shared_mut = 11;\n\
+                  .weak .const .align 8 .b8 LOOKUP[2] = {1, 2};\n",
+            )
+            .unwrap();
+        definitions
+            .observe(
+                "part-b.ptx",
+                b"// .weak helper comment\n\
+                  .weak   .global .align 4 .u32 shared_mut = 11;\n\
+                  .weak .const .align 8 .b8 LOOKUP[2]\n = {1, 2};\n",
+            )
+            .unwrap();
+
+        let error = definitions
+            .observe(
+                "part-c.ptx",
+                b".weak .global .align 4 .u32 shared_mut = 12;\n",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            FinalizerError::IncompatibleWeakStorageDefinition {
+                symbol,
+                first_input,
+                second_input,
+            } if symbol == "shared_mut"
+                && first_input == "part-a.ptx"
+                && second_input == "part-c.ptx"
+        ));
+    }
+
+    #[test]
+    fn weak_storage_odr_validation_fails_closed_on_truncation_and_non_text() {
+        let mut definitions = WeakStorageDefinitions::default();
+        assert!(matches!(
+            definitions
+                .observe("truncated.ptx", b".weak .global .align 4 .u32 shared = 1")
+                .unwrap_err(),
+            FinalizerError::MalformedWeakStorageDefinition { .. }
+        ));
+        assert!(matches!(
+            definitions
+                .observe("binary.ptx", &[0xff, 0xfe])
+                .unwrap_err(),
+            FinalizerError::InvalidPtxText { .. }
+        ));
+    }
+
+    #[test]
+    fn partition_source_reader_accepts_exact_cap_and_rejects_cap_plus_one() {
+        let sequence = PTX_BUNDLE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "cuda-oxide-partition-source-cap-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exact_cap = directory.join("exact.ll");
+        let cap_plus_one = directory.join("oversize.ll");
+        std::fs::write(&exact_cap, b"12345678").unwrap();
+        std::fs::write(&cap_plus_one, b"123456789").unwrap();
+
+        assert_eq!(
+            read_partition_source_capped(&exact_cap, 8).unwrap(),
+            b"12345678"
+        );
+        assert!(matches!(
+            read_partition_source_capped(&cap_plus_one, 8).unwrap_err(),
+            FinalizerError::PartitionSourceTooLarge {
+                actual_bytes: 9,
+                maximum_bytes: 8,
+                ..
+            }
+        ));
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 

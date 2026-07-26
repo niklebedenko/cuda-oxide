@@ -1519,6 +1519,7 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
         ("__device_global_0", 1),
         ("__shared_mem_0", 3),
         ("HOST_GLOBAL", 1),
+        ("_ZN5probe8CONSTANTE", 4),
     ] {
         let global = GlobalOp::new(&mut ctx, name.try_into().unwrap(), i32_ty.into());
         global.set_address_space(&mut ctx, address_space);
@@ -1565,7 +1566,12 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
     .expect("NVVM export succeeds");
     assert_eq!(
         nvvm.public_symbols,
-        ["HOST_GLOBAL", "entry_kernel", "standalone_export"]
+        [
+            "HOST_GLOBAL",
+            "_ZN5probe8CONSTANTE",
+            "entry_kernel",
+            "standalone_export"
+        ]
     );
     assert!(
         nvvm.llvm_ir
@@ -1581,6 +1587,12 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
     );
     assert!(
         nvvm.llvm_ir.contains("@HOST_GLOBAL = addrspace(1) global"),
+        "{}",
+        nvvm.llvm_ir
+    );
+    assert!(
+        nvvm.llvm_ir
+            .contains("@_ZN5probe8CONSTANTE = addrspace(4) global"),
         "{}",
         nvvm.llvm_ir
     );
@@ -1629,7 +1641,12 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
     .expect("partition PTX export succeeds");
     assert_eq!(
         partition.public_symbols,
-        ["HOST_GLOBAL", "entry_kernel", "standalone_export"]
+        [
+            "HOST_GLOBAL",
+            "_ZN5probe8CONSTANTE",
+            "entry_kernel",
+            "standalone_export"
+        ]
     );
     assert!(
         partition
@@ -1641,7 +1658,21 @@ fn nvvm_export_internalizes_only_module_private_definitions() {
     assert!(
         partition
             .llvm_ir
+            .contains("@__shared_mem_0 = internal addrspace(3) global"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
             .contains("@HOST_GLOBAL = linkonce_odr addrspace(1) global"),
+        "{}",
+        partition.llvm_ir
+    );
+    assert!(
+        partition
+            .llvm_ir
+            .contains("@_ZN5probe8CONSTANTE = linkonce_odr addrspace(4) global"),
         "{}",
         partition.llvm_ir
     );

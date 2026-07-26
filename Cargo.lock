@@ -351,6 +351,7 @@ dependencies = [
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
 dependencies = [
+ "cuda-core",
  "libnvvm-sys",
  "nvjitlink-sys",
  "oxide-artifacts",
