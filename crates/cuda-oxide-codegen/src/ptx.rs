@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// Links `libdevice.10.bc` into the emitted IR using `llvm-link`.
 ///
 /// Resolves `__nv_*` calls (CUDA math library) at the IR level so they are
-/// inlined and optimized by `opt -O2` before `llc` lowers to PTX. This
+/// inlined and optimized by LLVM's O3 pipeline before `llc` lowers to PTX. This
 /// avoids the legacy NVVM IR path (which uses the LLVM 7 dialect and cannot
 /// represent f16 types on pre-Blackwell targets).
 ///
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// __nv_*` PTX body (a one-call kernel balloons from ~130 to ~22,000 lines
 /// and later cuLink/nvJitLink steps hit duplicate-symbol collisions). With
 /// the flags, only the referenced bodies are imported, as `internal`, and
-/// `opt -O2` inlines or discards them.
+/// LLVM optimization inlines or discards them.
 ///
 /// Failure is a hard error: the pipeline chooses the PTX path for a
 /// libdevice kernel only after confirming `llvm-link` is resolvable, so a
@@ -96,9 +96,10 @@ fn link_libdevice(
 /// Runs LLVM's middle-end on the emitted IR before `llc`.
 ///
 /// Modules with explicit `@llvm.used` roots internalize every other definition
-/// before the default O2 pipeline so fully inlined helpers are eligible for
-/// global dead-code elimination. LLVM's standard O2 profitability model handles
-/// loop unrolling without a module-wide threshold override.
+/// before the default O3 pipeline so fully inlined helpers are eligible for
+/// global dead-code elimination. LLVM's standard O3 profitability model handles
+/// fixed-trip loop unrolling without a module-wide threshold override and
+/// exposes the resulting fixed aggregates to SROA.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
 /// LoadStoreVectorizer fuses aligned aggregate/element accesses, SROA
@@ -204,7 +205,7 @@ fn optimize_ll(
 /// internalization lets GlobalDCE remove it instead of asking `llc` to emit an
 /// unreachable `.visible .func` body.
 fn optimization_args(public_symbols: &[String]) -> Result<Vec<String>, PipelineError> {
-    const OPTIMIZATION_PIPELINE: &str = "default<O2>";
+    const OPTIMIZATION_PIPELINE: &str = "default<O3>";
 
     if public_symbols.is_empty() {
         return Ok(vec![format!("-passes={OPTIMIZATION_PIPELINE}")]);
@@ -426,14 +427,14 @@ fn generate_ptx_impl(
     };
     let post_link_input: &Path = linked.as_deref().unwrap_or(module.llvm_ir);
 
-    // Run the LLVM middle-end (opt -O2) before llc. Source requirements are
+    // Run the optimized LLVM middle-end before llc. Source requirements are
     // detected above so target selection cannot lose a source-level contract
     // merely because optimization elides it. Requirements are detected again
     // from the exact llc input below because linking and optimization can also
     // introduce backend intrinsics (notably llvm.stacksave/stackrestore).
     //
     // Full-debug is a `-G`-style build: it keeps every local in memory and
-    // describes it with `llvm.dbg.declare`. Running `opt -O2` would promote
+    // describes it with `llvm.dbg.declare`. Running the optimizer would promote
     // those slots to registers and collapse their live ranges, turning most
     // in-scope locals into `<optimized out>` under cuda-gdb. So we feed the
     // unoptimized IR straight to llc when variable info is requested, matching
@@ -443,7 +444,7 @@ fn generate_ptx_impl(
             record_diagnostic(
                 &mut diagnostics,
                 diagnostic_sink,
-                "Skipping opt -O2 (full debug keeps locals inspectable)".to_string(),
+                "Skipping opt -O3 (full debug keeps locals inspectable)".to_string(),
             );
         }
         None
@@ -712,15 +713,15 @@ mod tests {
         assert_eq!(
             optimization_args(&symbols).unwrap(),
             [
-                "-passes=internalize,default<O2>",
+                "-passes=internalize,default<O3>",
                 "-internalize-public-api-list=constant_data,first_kernel",
             ]
         );
     }
 
     #[test]
-    fn modules_without_public_roots_use_the_default_o2_pipeline() {
-        assert_eq!(optimization_args(&[]).unwrap(), ["-passes=default<O2>"]);
+    fn modules_without_public_roots_use_the_default_o3_pipeline() {
+        assert_eq!(optimization_args(&[]).unwrap(), ["-passes=default<O3>"]);
     }
 
     #[test]
@@ -951,7 +952,7 @@ mod tests {
 
     /// Regression test for IR-level libdevice linking: without
     /// `--internalize --only-needed` on the `llvm-link` invocation, all ~350
-    /// libdevice bodies keep external linkage, survive `opt -O2`, and a
+    /// libdevice bodies keep external linkage, survive LLVM optimization, and a
     /// one-call kernel's PTX balloons from ~130 to ~22,000 lines with 349
     /// exported `.visible .func __nv_*` definitions.
     #[test]

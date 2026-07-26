@@ -1418,7 +1418,7 @@ impl<'a> ModuleExportState<'a> {
 
         // Every device call is emitted `convergent` (attr group #0). GPU code is
         // convergent-by-default (as in Clang/nvcc): if the callee transitively
-        // performs a barrier / shuffle / vote, `opt -O2` must not sink or
+        // performs a barrier / shuffle / vote, LLVM optimization must not sink or
         // duplicate the call across divergent control flow. opt strips the
         // attribute from calls it proves never reach a convergent op.
         let noreturn_attr = if is_noreturn { " noreturn" } else { "" };

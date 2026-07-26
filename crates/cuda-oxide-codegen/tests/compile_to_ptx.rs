@@ -239,6 +239,38 @@ exit 9
         tools
     }
 
+    fn requiring_default_o3() -> Self {
+        let mut tools = Self::successful(false);
+        tools.opt = Some(write_tool(
+            &tools.root,
+            "opt",
+            r#"#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "LLVM version 21.0.0"
+  exit 0
+fi
+input=""
+out=""
+saw_o3=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    '-passes=default<O3>'|'-passes=internalize,default<O3>') saw_o3=1 ;;
+    -o) shift; out="$1" ;;
+    -*) ;;
+    *) input="$1" ;;
+  esac
+  shift
+done
+if [ "$saw_o3" -ne 1 ]; then
+  echo "expected the default O3 optimization pipeline" >&2
+  exit 10
+fi
+cp "$input" "$out"
+"#,
+        ));
+        tools
+    }
+
     fn compiler(&self) -> Compiler {
         let toolchain = Toolchain::from_paths(self.llc.clone(), self.opt.clone()).unwrap();
         Compiler::new(toolchain)
@@ -713,6 +745,21 @@ fn requirements_introduced_by_opt_reach_llc() {
 
     assert_eq!(compilation.target(), &Target::parse("sm_80").unwrap());
     assert!(compilation.ptx().starts_with(b".version 7.3\n"));
+}
+
+#[test]
+fn default_optimization_invokes_the_o3_middle_end_pipeline() {
+    let tools = FakeTools::requiring_default_o3();
+    let compiler = tools.compiler();
+    let mut module = CodegenModule::new("default_o3").unwrap();
+    add_empty_function(&mut module, true);
+
+    compiler
+        .compile(
+            &mut module,
+            &CompileOptions::new(Target::parse("sm_80").unwrap()),
+        )
+        .expect("the public O3 default must invoke LLVM's O3 pass pipeline");
 }
 
 #[test]

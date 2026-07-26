@@ -242,7 +242,7 @@ In any compiler IR, you need to answer two questions constantly:
 Traditional compilers implement these chains with raw pointers and manual
 bookkeeping. Forget to update a use-list when you delete an operation? Dangling
 pointer. Replace a value but miss one use? Stale reference. Welcome to your
-afternoon of debugging a segfault in `opt -O2`.
+afternoon of debugging a segfault in LLVM's optimizer.
 
 Pliron implements def-use chains using Rust's type system. A `Value` in pliron
 is an enum:

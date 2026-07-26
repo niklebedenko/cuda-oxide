@@ -290,7 +290,7 @@ So `CUDA_OXIDE_DEBUG=full` is a `-G`-style build. It automatically:
 
 - keeps every source local in its stack slot (skips Pliron `mem2reg`),
 - skips annotated loop unrolling, which requires `mem2reg`'s SSA form,
-- skips LLVM `opt -O2`, and
+- skips LLVM optimization, and
 - runs `llc` at `-O0`,
 
 so the locals you see in cuda-gdb are real and stable. You do not need to set
@@ -307,7 +307,7 @@ optimization well; locals do not, which is why full mode steps off it.
 
 > The promotion-aware `mir.dbg_value` salvage that Pliron `mem2reg` performs is
 > the building block for a future *optimized* debug tier (locals through
-> `opt -O2`, best-effort). It is not what `full` uses today.
+> optimized LLVM middle-end, best-effort). It is not what `full` uses today.
 
 ### What works today
 

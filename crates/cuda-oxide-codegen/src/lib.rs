@@ -83,7 +83,7 @@ mod verify;
 /// # LLVM tools
 ///
 /// Compilation shells out to `llc` and, for
-/// [`Optimization::O2`](experimental::Optimization::O2), a matching `opt`.
+/// [`Optimization::O3`](experimental::Optimization::O3), a matching `opt`.
 /// LLVM 21 is the general floor; targets that require PTX 9.0 need LLVM 22.
 /// [`Toolchain`](experimental::Toolchain) discovers these programs explicitly
 /// or accepts caller-supplied paths.

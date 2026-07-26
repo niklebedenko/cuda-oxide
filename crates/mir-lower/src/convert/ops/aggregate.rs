@@ -1191,7 +1191,7 @@ fn convert_small_array_extract(
 /// to LLVM, while Rust may require 8.
 ///
 /// The alloca lands at the use site, same as
-/// [`convert_extract_array_element`]; the standard `opt -O2` run (SROA)
+/// [`convert_extract_array_element`]; the standard LLVM O3 run (SROA)
 /// removes it again. Hoisting these into the function's entry block is a
 /// known follow-up for the unoptimized (`CUDA_OXIDE_NO_OPT=1`) path.
 fn spill_enum_value(
