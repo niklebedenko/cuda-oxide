@@ -878,8 +878,11 @@ fn write_device_artifact_object(
                 (&materialized_artifact, true)
             }
             None => {
-                if result.artifacts.len() != 1 {
+                if result.ptx_bundle_path.is_some() {
                     return Err("partitioned device artifacts require cubin materialization".into());
+                }
+                if result.artifacts.len() != 1 {
+                    return Err("unpartitioned device codegen must produce one artifact".into());
                 }
                 materialized_ptx_audit_path = None;
                 (source_artifact, false)
@@ -1102,13 +1105,16 @@ fn materialize_artifact_for_embedding(
         }
         llvm_export::export::DebugKind::Full => cuda_artifact_finalizer::DebugPolicy::Full,
     };
-    if result.artifacts.len() > 1 {
+    if let Some(bundle_path) = result.ptx_bundle_path.as_deref() {
+        if result.artifacts.len() < 2 {
+            return Err(format!(
+                "partitioned owner expected at least two artifacts, found {}",
+                result.artifacts.len()
+            )
+            .into());
+        }
         let _partition_intermediates =
             PartitionIntermediatesCleanup::for_artifacts(&result.artifacts)?;
-        let bundle_path = result
-            .ptx_bundle_path
-            .as_deref()
-            .ok_or("partitioned owner has no PTX bundle path")?;
         let inputs = result
             .artifacts
             .iter()
@@ -1171,6 +1177,13 @@ fn materialize_artifact_for_embedding(
             materialized.cubin,
             Some(materialized.ptx_bundle_path),
         )));
+    }
+    if result.artifacts.len() != 1 {
+        return Err(format!(
+            "unpartitioned owner expected one artifact, found {}",
+            result.artifacts.len()
+        )
+        .into());
     }
 
     let artifact = result

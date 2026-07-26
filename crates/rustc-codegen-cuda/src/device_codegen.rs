@@ -1937,9 +1937,11 @@ pub fn generate_device_code<'tcx>(
 
                 let mut artifacts = Vec::with_capacity(compilation_results.len());
                 for compilation_result in &compilation_results {
-                    if let Some(artifact) =
-                        read_compilation_artifact(compilation_result, !partitioned_owner)?
-                    {
+                    if let Some(artifact) = read_compilation_artifact(
+                        compilation_result,
+                        !partitioned_owner,
+                        partitioned_owner,
+                    )? {
                         if config.verbose {
                             eprintln!(
                                 "[device_codegen] Embeddable artifact generated: {} ({:?}, target: {})",
@@ -2036,6 +2038,7 @@ fn device_debug_kind_with_override(
 fn read_compilation_artifact(
     result: &mir_importer::CompilationResult,
     retain_bytes: bool,
+    required: bool,
 ) -> Result<Option<DeviceCodegenArtifact>, DeviceCodegenError> {
     let kind = match result.artifact_kind {
         mir_importer::CompilationArtifactKind::Ptx => DeviceCodegenArtifactKind::Ptx,
@@ -2059,7 +2062,17 @@ fn read_compilation_artifact(
                 .then(|| std::fs::read(&result.artifact_path))
                 .transpose()?,
         })),
+        Ok(_) if required => Err(DeviceCodegenError::PtxGeneration(format!(
+            "required owner partition artifact is not a regular file: {}",
+            result.artifact_path.display()
+        ))),
         Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && required => {
+            Err(DeviceCodegenError::PtxGeneration(format!(
+                "required owner partition artifact was not produced: {}",
+                result.artifact_path.display()
+            )))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(DeviceCodegenError::Io(error)),
     }
@@ -2277,7 +2290,9 @@ mod tests {
             allow_fma_contraction: false,
         };
 
-        let artifact = read_compilation_artifact(&result, true).unwrap().unwrap();
+        let artifact = read_compilation_artifact(&result, true, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(artifact.kind, DeviceCodegenArtifactKind::NvvmIr);
         assert_eq!(artifact.name, "demo.ll");
         assert_eq!(artifact.path, ll_path);
@@ -2304,10 +2319,46 @@ mod tests {
             allow_fma_contraction: true,
         };
 
-        let artifact = read_compilation_artifact(&result, true).unwrap().unwrap();
+        let artifact = read_compilation_artifact(&result, true, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(artifact.kind, DeviceCodegenArtifactKind::Cubin);
         assert_eq!(artifact.name, "demo.cubin");
         assert_eq!(artifact.bytes.as_deref(), Some(&b"cubin"[..]));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn required_partition_artifact_fails_closed_when_missing() {
+        let temp_dir = unique_temp_dir("cuda-codegen-missing-partition");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let missing_path = temp_dir.join("part-missing.ll");
+        let result = mir_importer::CompilationResult {
+            ll_path: missing_path.clone(),
+            ptx_path: temp_dir.join("part-missing.ptx"),
+            artifact_path: missing_path.clone(),
+            artifact_kind: mir_importer::CompilationArtifactKind::NvvmIr,
+            target: "sm_90".to_string(),
+            allow_fma_contraction: true,
+        };
+
+        assert!(
+            read_compilation_artifact(&result, false, false)
+                .unwrap()
+                .is_none()
+        );
+        let error = match read_compilation_artifact(&result, false, true) {
+            Ok(_) => panic!("missing required partition artifact was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("required owner partition artifact")
+                && error.to_string().contains("part-missing.ll"),
+            "unexpected error: {error}"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
