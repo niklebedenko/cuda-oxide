@@ -99,6 +99,13 @@ pub struct CollectedFunction {
     /// Request LLVM full-unroll metadata after helper inlining exposes a
     /// constant array extent.
     pub deferred_full_unroll: bool,
+    /// Exact compiler identity of core's `Index` lang item.
+    ///
+    /// The stable MIR API exposes definition identities but not
+    /// `TyCtxt::lang_items()`. `rustc-codegen-cuda` therefore resolves this
+    /// once and threads it into call translation so fixed-array indexing can
+    /// be recognized without matching printed function names.
+    pub core_index_trait: Option<rustc_public::DefId>,
 }
 
 /// Device artifact format produced by a successful pipeline run.
@@ -314,6 +321,7 @@ pub fn run_pipeline(
             func.inline_attr,
             func.device_link_always,
             func.deferred_full_unroll,
+            func.core_index_trait,
             Some(&func.export_name),
             &mut legaliser,
             config.debug_kind,

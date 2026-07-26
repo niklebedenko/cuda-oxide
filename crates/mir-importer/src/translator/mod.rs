@@ -151,6 +151,7 @@ pub fn translate_function(
         false,
         false,
         None,
+        None,
         legaliser,
         DebugKind::Off,
         None,

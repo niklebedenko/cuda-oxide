@@ -64,8 +64,8 @@ use crate::translator::location::span_to_location;
 use crate::translator::rvalue;
 use crate::translator::values::{ValueMap, maybe_ptr_coerce};
 use dialect_mir::ops::{
-    MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp, MirNotOp, MirReturnOp,
-    MirUnrollHintOp,
+    MirArrayElementAddrOp, MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp,
+    MirLtOp, MirNotOp, MirReturnOp, MirUnrollHintOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::OperandSegmentInterface;
@@ -107,6 +107,7 @@ pub fn translate_terminator(
     prev_op: Option<Ptr<Operation>>,
     block_map: &[Ptr<BasicBlock>],
     rustc_mono_successors: &[usize],
+    core_index_trait: Option<rustc_public::DefId>,
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
     let loc = span_to_location(ctx, term.span);
@@ -149,6 +150,7 @@ pub fn translate_terminator(
             prev_op,
             value_map,
             block_map,
+            core_index_trait,
             loc,
             legaliser,
         ),
@@ -961,6 +963,7 @@ fn translate_call(
     prev_op: Option<Ptr<Operation>>,
     value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
+    core_index_trait: Option<rustc_public::DefId>,
     loc: Location,
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
@@ -1046,6 +1049,30 @@ fn translate_call(
         return Ok(emit_elided_call_goto(
             ctx, target_idx, block_ptr, prev_op, block_map, loc,
         ));
+    }
+
+    // Lower core's fixed-array `Index<usize>::index` call at the call site.
+    //
+    // Generic code retains this trait call until LLVM inlining. By then the
+    // dynamic GEP appears too late for `mir.array_element_addr`'s bounded
+    // scalar-selection lowering, pinning otherwise register-resident
+    // aggregates in local memory. The exact Index lang-item identity comes
+    // from rustc; receiver/index types provide the remaining semantic guard.
+    // Preserve ordinary indexing's bounds check with `mir.assert`.
+    if let Some(array_extent) = fixed_array_index_extent(func, args, body, core_index_trait) {
+        return translate_fixed_array_index_call(
+            ctx,
+            body,
+            args,
+            destination,
+            &target_usize,
+            array_extent,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        );
     }
 
     // Identify the actual core callable-trait methods. Matching text in an
@@ -1367,6 +1394,181 @@ fn translate_call(
         block_map,
         loc,
     )
+}
+
+/// Recognize `Index<usize>::index(&[T; N], usize)` by compiler identity.
+///
+/// Printed paths are deliberately not consulted. A user-defined `Index`
+/// spelling must remain an ordinary call, while the exact lang item remains
+/// stable across core's module/re-export layout.
+fn fixed_array_index_extent(
+    func: &mir::Operand,
+    args: &[mir::Operand],
+    body: &mir::Body,
+    core_index_trait: Option<rustc_public::DefId>,
+) -> Option<u64> {
+    use rustc_public::ty::{RigidTy, TyKind, UintTy};
+
+    let index_trait = core_index_trait?;
+    let mir::Operand::Constant(constant) = func else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(definition, _)) = constant.const_.ty().kind() else {
+        return None;
+    };
+    if definition.def_id().parent() != Some(index_trait) || args.len() != 2 {
+        return None;
+    }
+
+    let receiver_ty = args[0].ty(body.locals()).ok()?;
+    let TyKind::RigidTy(RigidTy::Ref(_, array_ty, _)) = receiver_ty.kind() else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::Array(_, extent)) = array_ty.kind() else {
+        return None;
+    };
+    let index_ty = args[1].ty(body.locals()).ok()?;
+    if !matches!(
+        index_ty.kind(),
+        TyKind::RigidTy(RigidTy::Uint(UintTy::Usize))
+    ) {
+        return None;
+    }
+
+    extent.eval_target_usize().ok()
+}
+
+/// Emit a bounds-checked `mir.array_element_addr` for a fixed-array Index
+/// trait call.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "TODO: group call-lowering state into a translation context"
+)]
+fn translate_fixed_array_index_call(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    array_extent: u64,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::utils::apint::APInt;
+    use std::num::NonZeroUsize;
+
+    let Some(target_idx) = target else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "fixed-array Index::index call without a return target".to_string(),
+            )
+        );
+    };
+
+    let (array_ptr, after_array) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (index, after_index) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        after_array,
+        loc.clone(),
+    )?;
+
+    let usize_ty = types::get_usize_type(ctx);
+    let width = usize_ty.deref(ctx).width() as usize;
+    let extent_value = APInt::from_u64(
+        array_extent,
+        NonZeroUsize::new(width).expect("usize has nonzero width"),
+    );
+    let extent_op = Operation::new(
+        ctx,
+        MirConstantOp::get_concrete_op_info(),
+        vec![usize_ty.to_handle()],
+        vec![],
+        vec![],
+        0,
+    );
+    extent_op.deref_mut(ctx).set_loc(loc.clone());
+    MirConstantOp::new(extent_op).set_attr_value(ctx, IntegerAttr::new(usize_ty, extent_value));
+    match after_index {
+        Some(previous) => extent_op.insert_after(ctx, previous),
+        None => extent_op.insert_at_front(block_ptr, ctx),
+    }
+    let extent = extent_op.deref(ctx).get_result(0);
+
+    let bool_ty = types::get_bool_type(ctx).to_handle();
+    let bounds_op = Operation::new(
+        ctx,
+        MirLtOp::get_concrete_op_info(),
+        vec![bool_ty],
+        vec![index, extent],
+        vec![],
+        0,
+    );
+    bounds_op.deref_mut(ctx).set_loc(loc.clone());
+    bounds_op.insert_after(ctx, extent_op);
+    let in_bounds = bounds_op.deref(ctx).get_result(0);
+
+    // Keep address formation behind the successful bounds edge. In
+    // particular, an out-of-range inbounds GEP must not become poison before
+    // the trap that gives Rust indexing its defined panic behavior.
+    let success_block = BasicBlock::new(ctx, None, vec![]);
+    success_block.insert_after(ctx, block_ptr);
+    let (operands, segment_sizes) =
+        MirAssertOp::compute_segment_sizes(vec![vec![in_bounds], vec![]]);
+    let assert_op = Operation::new(
+        ctx,
+        MirAssertOp::get_concrete_op_info(),
+        vec![],
+        operands,
+        vec![success_block],
+        0,
+    );
+    Operation::get_op::<MirAssertOp>(assert_op, ctx)
+        .expect("MirAssertOp")
+        .set_operand_segment_sizes(ctx, segment_sizes);
+    assert_op.deref_mut(ctx).set_loc(loc.clone());
+    assert_op.insert_after(ctx, bounds_op);
+
+    let result_ty = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let address_op = Operation::new(
+        ctx,
+        MirArrayElementAddrOp::get_concrete_op_info(),
+        vec![result_ty],
+        vec![array_ptr, index],
+        vec![],
+        0,
+    );
+    address_op.deref_mut(ctx).set_loc(loc.clone());
+    address_op.insert_at_front(success_block, ctx);
+    let element_ptr = address_op.deref(ctx).get_result(0);
+
+    let goto_prev = value_map
+        .store_local(
+            ctx,
+            destination.local,
+            element_ptr,
+            success_block,
+            Some(address_op),
+        )
+        .unwrap_or(address_op);
+    helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc);
+    Ok(assert_op)
 }
 
 /// Handle `FnOnce::call_once`, `FnMut::call_mut`, or `Fn::call` when the

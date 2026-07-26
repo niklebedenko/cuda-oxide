@@ -994,6 +994,7 @@ fn emit_entry_allocas(
 /// * `inline_attr` - Preserve Rust inline intent on non-kernel functions
 /// * `device_link_always` - Add orthogonal NVVM-link mandatory-inline intent
 /// * `deferred_full_unroll` - Preserve bounded deferred loop-unroll intent
+/// * `core_index_trait` - Exact compiler identity of core's `Index` lang item
 /// * `override_name` - Custom export name (defaults to instance name)
 pub fn translate_body(
     ctx: &mut Context,
@@ -1005,6 +1006,7 @@ pub fn translate_body(
     inline_attr: crate::pipeline::InlineAttr,
     device_link_always: bool,
     deferred_full_unroll: bool,
+    core_index_trait: Option<rustc_public::DefId>,
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
     debug_kind: DebugKind,
@@ -1433,6 +1435,7 @@ pub fn translate_body(
             &mut value_map,
             &block_map,
             &rustc_mono_successors[idx],
+            core_index_trait,
             legaliser,
             entry_prev_op,
         )?;

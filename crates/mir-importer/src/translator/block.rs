@@ -44,6 +44,7 @@ use rustc_public::mir;
 /// * `block_map` - Block index → Pliron IR block mapping
 /// * `rustc_mono_successors` - Exact successors selected by rustc's
 ///   monomorphization traversal for this block
+/// * `core_index_trait` - Exact compiler identity of core's `Index` lang item
 /// * `legaliser` - Shared identifier legaliser for name uniqueness
 /// * `entry_prev_op` - For the entry block only: the last op emitted by
 ///   `body::translate_body`'s alloca/store setup (see `emit_entry_allocas`),
@@ -59,6 +60,7 @@ pub fn translate_block(
     value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
     rustc_mono_successors: &[usize],
+    core_index_trait: Option<rustc_public::DefId>,
     legaliser: &mut Legaliser,
     entry_prev_op: Option<Ptr<Operation>>,
 ) -> TranslationResult<()> {
@@ -98,6 +100,7 @@ pub fn translate_block(
         prev_op,
         block_map,
         rustc_mono_successors,
+        core_index_trait,
         legaliser,
     )?;
 

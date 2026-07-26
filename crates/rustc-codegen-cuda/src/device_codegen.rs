@@ -1736,8 +1736,10 @@ pub fn generate_device_code<'tcx>(
         .iter()
         .map(|func| crate::collector::device_mono_reachability(tcx, func.instance))
         .collect();
+    let core_index_trait = tcx.lang_items().index_trait();
 
     let result = rustc_internal::run(tcx, || {
+        let stable_core_index_trait = core_index_trait.map(rustc_internal::stable);
         // Convert internal Instance<'tcx> to stable_mir Instance.
         // Drop glue instances whose bodies are provably no-ops are filtered
         // out: the mir-importer's translate_drop fast-path emits a plain
@@ -1779,6 +1781,7 @@ pub fn generate_device_code<'tcx>(
                     inline_attr: inline_attrs[index],
                     device_link_always: device_link_always[index],
                     deferred_full_unroll: deferred_full_unroll[index],
+                    core_index_trait: stable_core_index_trait,
                 },
             ));
         }
