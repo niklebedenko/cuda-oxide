@@ -30,7 +30,9 @@ cuobjdump --dump-sass image.cubin |
   rg -c 'CALL|STL|LDL'
 ```
 
-The compiler limits callback promotion to bodies no larger than 24 MIR blocks
-/ 128 MIR statements, captures no larger than 256 bytes, output layouts no
-larger than 32 KiB, and concrete array extents no larger than 128. Those are
-compile-work budgets rather than source-language semantics.
+The compiler normally limits callback promotion to 24 MIR blocks / 128 MIR
+statements. A concrete one-to-three-element builder may promote a callback up
+to 96 blocks / 1024 statements when its fully unrolled block and statement
+totals remain bounded. Captures remain limited to 256 bytes, output layouts to
+32 KiB, and concrete array extents to 128. Those are compile-work budgets
+rather than source-language semantics.

@@ -156,6 +156,16 @@ struct DeviceInlinePlan<'tcx> {
 // array scaffolds retain their ordinary Rust inline hints.
 const MAX_DEVICE_LINK_INLINE_BLOCKS: usize = 24;
 const MAX_DEVICE_LINK_INLINE_STATEMENTS: usize = 128;
+// Three-axis tensor operators can have a large optimized callback even though
+// the array builder invokes it only three times. Bound that special case by
+// both its individual body and the total code duplicated by full unrolling.
+const MAX_DEVICE_LINK_WIDE_CALLBACK_ARRAY_EXTENT: u64 = 3;
+const MAX_DEVICE_LINK_WIDE_CALLBACK_BLOCKS: usize = 96;
+const MAX_DEVICE_LINK_WIDE_CALLBACK_STATEMENTS: usize = 1024;
+const MAX_DEVICE_LINK_WIDE_CALLBACK_TOTAL_BLOCKS: usize =
+    MAX_DEVICE_LINK_WIDE_CALLBACK_BLOCKS * MAX_DEVICE_LINK_WIDE_CALLBACK_ARRAY_EXTENT as usize;
+const MAX_DEVICE_LINK_WIDE_CALLBACK_TOTAL_STATEMENTS: usize =
+    MAX_DEVICE_LINK_WIDE_CALLBACK_STATEMENTS * MAX_DEVICE_LINK_WIDE_CALLBACK_ARRAY_EXTENT as usize;
 const MAX_DEVICE_LINK_CLOSURE_CAPTURE_BYTES: u64 = 256;
 const MAX_DEVICE_LINK_ARRAY_EXTENT: usize = 128;
 const MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES: u64 = 32 * 1024;
@@ -196,10 +206,13 @@ fn build_device_inline_plan<'tcx>(
             continue;
         }
         let closure = *closures.iter().next().expect("checked exact closure count");
+        let array_extent = concrete_array_extent(tcx, instance);
         let accepted = is_bounded_inline_body(tcx, def_id)
-            && array_extents_within_budget(tcx, instance)
+            && array_extent.is_some_and(array_extent_within_budget)
             && array_output_layout_within_budget(tcx, instance)
-            && is_bounded_inline_body(tcx, closure.def_id())
+            && array_extent.is_some_and(|extent| {
+                is_bounded_array_callback_body(tcx, closure.def_id(), extent)
+            })
             && closure_capture_layout_bytes(tcx, closure)
                 .is_some_and(closure_capture_size_within_budget);
         if trace_plan {
@@ -212,7 +225,9 @@ fn build_device_inline_plan<'tcx>(
             plan.rejected_array_builders += 1;
         }
         if accepted
-            && array_extents_within_limit(tcx, instance, MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT)
+            && array_extent.is_some_and(|extent| {
+                array_extent_within_limit(extent, MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT)
+            })
         {
             accepted_deferred_unroll_closures.insert(closure);
         } else {
@@ -314,13 +329,21 @@ fn trace_array_inline_seed<'tcx>(
             )
         },
     );
+    let builder_body = inline_body_size(tcx, instance.def_id());
+    let closure_body = closures
+        .iter()
+        .next()
+        .map(|closure| inline_body_size(tcx, closure.def_id()));
     eprintln!(
         "[rustc_codegen_cuda] array callback inline candidate: builder={path} \
          builder_symbol={} accepted={accepted} \
          closures={} closure={closure_path} \
+         array_extent={:?} \
+         builder_body={builder_body:?} closure_body={closure_body:?} \
          capture_bytes={capture_bytes:?} output_bytes={:?}",
         tcx.symbol_name(instance).name,
         closures.len(),
+        concrete_array_extent(tcx, instance),
         array_output_layout_bytes(tcx, instance)
     );
 }
@@ -428,30 +451,18 @@ fn is_core_def(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
         .is_some_and(|core_item| core_item.krate == def_id.krate)
 }
 
-fn array_extents_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    array_extents_within_limit(tcx, instance, MAX_DEVICE_LINK_ARRAY_EXTENT)
-}
-
-fn array_extents_within_limit<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    max_extent: usize,
-) -> bool {
-    let mut saw_concrete_extent = false;
+fn concrete_array_extent<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<u64> {
+    let mut extent = None;
     for arg in instance.args.iter() {
         let Some(value) = arg.as_const() else {
             continue;
         };
-        let Some(extent) = value.try_to_target_usize(tcx) else {
-            return false;
+        let value = value.try_to_target_usize(tcx)?;
+        if extent.replace(value).is_some() {
+            return None;
         };
-        saw_concrete_extent = true;
-        if !array_extent_within_limit(extent, max_extent) {
-            return false;
-        }
     }
-
-    saw_concrete_extent
+    extent
 }
 
 fn array_output_layout_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
@@ -481,13 +492,50 @@ fn array_extent_within_limit(extent: u64, max_extent: usize) -> bool {
 }
 
 fn is_bounded_inline_body(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    let (basic_blocks, statements) = inline_body_size(tcx, def_id);
+    inline_body_within_budget(basic_blocks, statements)
+}
+
+fn is_bounded_array_callback_body(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+    array_extent: u64,
+) -> bool {
+    let (basic_blocks, statements) = inline_body_size(tcx, def_id);
+    array_callback_body_within_budget(basic_blocks, statements, array_extent)
+}
+
+fn array_callback_body_within_budget(
+    basic_blocks: usize,
+    statements: usize,
+    array_extent: u64,
+) -> bool {
+    if inline_body_within_budget(basic_blocks, statements) {
+        return true;
+    }
+    if !(1..=MAX_DEVICE_LINK_WIDE_CALLBACK_ARRAY_EXTENT).contains(&array_extent)
+        || basic_blocks > MAX_DEVICE_LINK_WIDE_CALLBACK_BLOCKS
+        || statements > MAX_DEVICE_LINK_WIDE_CALLBACK_STATEMENTS
+    {
+        return false;
+    }
+    let array_extent = array_extent as usize;
+    basic_blocks
+        .checked_mul(array_extent)
+        .is_some_and(|total| total <= MAX_DEVICE_LINK_WIDE_CALLBACK_TOTAL_BLOCKS)
+        && statements
+            .checked_mul(array_extent)
+            .is_some_and(|total| total <= MAX_DEVICE_LINK_WIDE_CALLBACK_TOTAL_STATEMENTS)
+}
+
+fn inline_body_size(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> (usize, usize) {
     let body = tcx.optimized_mir(def_id);
     let statement_count = body
         .basic_blocks
         .iter()
         .map(|block| block.statements.len())
         .sum();
-    inline_body_within_budget(body.basic_blocks.len(), statement_count)
+    (body.basic_blocks.len(), statement_count)
 }
 
 fn inline_body_within_budget(basic_blocks: usize, statements: usize) -> bool {
@@ -514,9 +562,10 @@ fn is_erased_array_builder_helper_path(path: &str) -> bool {
 #[cfg(test)]
 mod inline_plan_tests {
     use super::{
-        array_callable_type, array_extent_within_budget, array_extent_within_limit,
-        array_output_size_within_budget, inline_body_within_budget, is_concrete_array_builder_path,
-        is_erased_array_builder_helper_path, retain_uncontested_closures,
+        array_callable_type, array_callback_body_within_budget, array_extent_within_budget,
+        array_extent_within_limit, array_output_size_within_budget, inline_body_within_budget,
+        is_concrete_array_builder_path, is_erased_array_builder_helper_path,
+        retain_uncontested_closures,
     };
     use std::collections::HashSet;
 
@@ -572,6 +621,17 @@ mod inline_plan_tests {
         assert!(inline_body_within_budget(24, 128));
         assert!(!inline_body_within_budget(25, 128));
         assert!(!inline_body_within_budget(24, 129));
+    }
+
+    #[test]
+    fn bounds_wide_callbacks_by_their_three_element_trip_count() {
+        assert!(array_callback_body_within_budget(24, 128, 128));
+        assert!(array_callback_body_within_budget(66, 751, 3));
+        assert!(!array_callback_body_within_budget(66, 751, 4));
+        assert!(!array_callback_body_within_budget(97, 751, 3));
+        assert!(!array_callback_body_within_budget(66, 1025, 3));
+        assert!(!array_callback_body_within_budget(usize::MAX, 1, 3));
+        assert!(!array_callback_body_within_budget(1, usize::MAX, 3));
     }
 
     #[test]
