@@ -692,7 +692,7 @@ impl<'a> ModuleExportState<'a> {
             || attrs
                 .get::<pliron::builtin::attributes::StringAttr>(&device_alwaysinline_key)
                 .is_some()
-            || self.nvvm_ir_dialect.is_some()
+            || (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
                 && attrs
                     .get::<pliron::builtin::attributes::StringAttr>(&device_link_alwaysinline_key)
                     .is_some();

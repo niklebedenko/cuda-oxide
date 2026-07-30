@@ -2545,7 +2545,7 @@ fn export_device_alwaysinline_reaches_nvvm_ir() {
 }
 
 #[test]
-fn export_device_link_alwaysinline_only_reaches_nvvm_ir() {
+fn export_device_link_alwaysinline_only_reaches_device_link_ir() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
     let module_block = module_top_block(&mut ctx, &module);
@@ -2586,6 +2586,18 @@ fn export_device_link_alwaysinline_only_reaches_nvvm_ir() {
     assert!(
         ptx_define.contains("inlinehint") && !ptx_define.contains("alwaysinline"),
         "direct PTX compilation must retain the original hint and helper boundary:\n{ptx_ir}"
+    );
+
+    let partitioned_ir =
+        export_module_to_string_with_config(&ctx, &module, &PartitionedConfig(PtxExportConfig))
+            .expect("partitioned owner export succeeds");
+    let partitioned_define = partitioned_ir
+        .lines()
+        .find(|line| line.starts_with("define internal void @device_link_helper("))
+        .expect("partitioned device-link helper definition");
+    assert_eq!(
+        partitioned_define, "define internal void @device_link_helper() alwaysinline #0 {",
+        "partitioned owner linking must receive mandatory-inline intent:\n{partitioned_ir}"
     );
 
     let nvvm_ir = export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
