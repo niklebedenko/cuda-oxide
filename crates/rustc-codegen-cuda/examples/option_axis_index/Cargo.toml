@@ -1,0 +1,19 @@
+[package]
+name = "option_axis_index"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+# Regression coverage for preserving the bounded fieldless-enum payload of
+# `Option<Axis>` in SSA through iterator lowering.
+#
+# Run with:
+#   cargo oxide run option_axis_index
+#   ./verify-code-shape.sh
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

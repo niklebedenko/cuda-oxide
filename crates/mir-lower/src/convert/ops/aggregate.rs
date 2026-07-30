@@ -1297,15 +1297,19 @@ fn extract_integer_from_byte_array(
     packed
 }
 
-/// Reconstruct a pointer-bearing slotless enum payload directly from its
-/// byte-faithful LLVM storage when every semantic field has one exact physical
-/// carrier.
+/// Reconstruct a slotless enum payload directly from its byte-faithful LLVM
+/// storage when every semantic field has one exact physical carrier.
 ///
 /// Niche enums such as `Option<(usize, &mut T)>` store the integer tuple field
 /// as `[8 x i8]` beside the pointer carrier. Going through an alloca solely to
 /// reinterpret those initialized bytes prevents SROA inside iterator loops.
-/// Integer-only payloads retain the ordinary spill path so this targeted niche
-/// optimization does not alter unrelated range and axis iterator inlining.
+///
+/// Integer-only payloads retain the ordinary spill path except for the
+/// explicitly bounded fieldless-enum case selected by
+/// [`is_bounded_fieldless_enum_niche_payload`]. That case covers iterators
+/// returning `Option<Axis>`: keeping the `Axis` payload in SSA preserves its
+/// finite discriminant dataflow so LLVM can remove unreachable array-bounds
+/// traps.
 fn try_extract_byte_faithful_enum_payload(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -1313,10 +1317,11 @@ fn try_extract_byte_faithful_enum_payload(
     storage_ty: TypeHandle,
     payload_ty: TypeHandle,
     payload_offset: u64,
+    allow_integer_only: bool,
 ) -> Option<Value> {
     let storage_fields = llvm_struct_fields_at_offsets(ctx, storage_ty)?;
     let payload_fields = llvm_struct_fields_at_offsets(ctx, payload_ty)?;
-    if !has_top_level_pointer_field(ctx, &payload_fields) {
+    if !allow_integer_only && !has_top_level_pointer_field(ctx, &payload_fields) {
         return None;
     }
     let undef = llvm::UndefOp::new(ctx, payload_ty);
@@ -1360,6 +1365,78 @@ fn has_top_level_pointer_field(ctx: &Context, fields: &[(u32, u64, TypeHandle)])
     fields
         .iter()
         .any(|(_, _, field_ty)| field_ty.deref(ctx).is::<llvm_types::PointerType>())
+}
+
+/// Whether a slotless niche payload is the narrow integer-only shape for
+/// which SSA reconstruction is useful and semantically self-contained.
+///
+/// This deliberately does not reopen SSA reconstruction for arbitrary
+/// integer aggregates. It accepts only an integer-carried two-variant niche
+/// whose untagged variant owns one payload field, where that field is a small
+/// direct fieldless enum with inhabited discriminants `0..N`.
+fn is_bounded_fieldless_enum_niche_payload(
+    ctx: &Context,
+    outer: &MirEnumType,
+    variant_index: usize,
+    field_index: usize,
+) -> bool {
+    if outer.layout_kind != EnumLayoutKind::Niche
+        || outer.carrier_kind != EnumCarrierKind::Integer
+        || outer.variant_count() != 2
+        || outer.variant_field_counts.len() != 2
+        || outer.all_field_types.len() != 1
+        || outer.variant_inhabited.len() != 2
+        || variant_index != outer.untagged_variant as usize
+        || field_index != 0
+        || outer.variant_inhabited.contains(&0)
+    {
+        return false;
+    }
+
+    let Some(&payload_field_count) = outer.variant_field_counts.get(variant_index) else {
+        return false;
+    };
+    if payload_field_count != 1
+        || outer
+            .variant_field_counts
+            .iter()
+            .enumerate()
+            .any(|(variant, &count)| variant != variant_index && count != 0)
+    {
+        return false;
+    }
+
+    let field_base = outer
+        .variant_field_counts
+        .iter()
+        .take(variant_index)
+        .map(|&count| count as usize)
+        .sum::<usize>();
+    let Some(payload_ty) = outer.all_field_types.get(field_base + field_index) else {
+        return false;
+    };
+    let payload_ref = payload_ty.deref(ctx);
+    let Some(payload_enum) = payload_ref.downcast_ref::<MirEnumType>() else {
+        return false;
+    };
+
+    let variant_count = payload_enum.variant_count();
+    payload_enum.layout_kind == EnumLayoutKind::Direct
+        && payload_enum.carrier_kind == EnumCarrierKind::Integer
+        && (2..=16).contains(&variant_count)
+        && payload_enum.variant_field_counts.len() == variant_count
+        && payload_enum.variant_inhabited.len() == variant_count
+        && payload_enum
+            .variant_field_counts
+            .iter()
+            .all(|&count| count == 0)
+        && !payload_enum.variant_inhabited.contains(&0)
+        && payload_enum.variant_discriminants.len() == variant_count
+        && payload_enum
+            .variant_discriminants
+            .iter()
+            .enumerate()
+            .all(|(variant, &discriminant)| discriminant == variant as u64)
 }
 
 /// Pointer to `base + offset` bytes, for reaching a payload field inside
@@ -1988,16 +2065,15 @@ pub(crate) fn convert_enum_payload(
         .map(|attr| attr.0 as usize)
         .unwrap_or(0);
 
-    let variant_field_counts = {
-        match operands_info.lookup_most_recent_of_type::<MirEnumType>(ctx, enum_val) {
-            Some(r) => r.variant_field_counts.clone(),
-            None => {
-                return pliron::input_err_noloc!(
-                    "Expected MirEnumType for enum payload extraction"
-                );
-            }
+    let enum_ty = match operands_info.lookup_most_recent_of_type::<MirEnumType>(ctx, enum_val) {
+        Some(enum_ty) => enum_ty.clone(),
+        None => {
+            return pliron::input_err_noloc!("Expected MirEnumType for enum payload extraction");
         }
     };
+    let variant_field_counts = enum_ty.variant_field_counts.clone();
+    let allow_integer_only =
+        is_bounded_fieldless_enum_niche_payload(ctx, &enum_ty, variant_index, field_index);
     let (slot_map, abi_align) = enum_slot_map_of_operand(ctx, operands_info, enum_val)?;
 
     let field_base: usize = variant_field_counts
@@ -2041,6 +2117,7 @@ pub(crate) fn convert_enum_payload(
                 slot_map.llvm_struct_ty,
                 slot_map.field_llvm_types[flat],
                 slot_map.field_offsets[flat],
+                allow_integer_only,
             ) {
                 rewriter.replace_operation_with_values(ctx, op, vec![payload]);
                 return Ok(());
@@ -2419,6 +2496,58 @@ mod tests {
 
     fn empty_struct_ty(ctx: &mut Context, name: &str) -> TypeHandle {
         MirStructType::get(ctx, name.to_string(), vec![], vec![]).into()
+    }
+
+    fn bounded_axis_option_types(ctx: &mut Context) -> (TypeHandle, TypeHandle, TypeHandle) {
+        let usize_ty: TypeHandle = IntegerType::get(ctx, 64, Signedness::Unsigned).into();
+        let axis_ty: TypeHandle = MirEnumType::get_with_encoding(
+            ctx,
+            "Axis".into(),
+            usize_ty,
+            vec![0, 1, 2],
+            vec![
+                EnumVariant::unit("X".into()),
+                EnumVariant::unit("Y".into()),
+                EnumVariant::unit("Z".into()),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 8,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 64,
+                variant_inhabited: vec![1, 1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let option_ty: TypeHandle = MirEnumType::get_with_encoding(
+            ctx,
+            "Option".into(),
+            usize_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new_with_layout("Some".into(), vec![axis_ty], vec![0], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 8,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 64,
+                niche_start: 3,
+                niche_variant_start: 0,
+                niche_variant_end: 0,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        (usize_ty, axis_ty, option_ty)
     }
 
     fn padded_struct_with_zst_ty(ctx: &mut Context) -> (TypeHandle, TypeHandle) {
@@ -3602,7 +3731,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_faithful_enum_ssa_requires_a_top_level_pointer_payload() {
+    fn byte_faithful_enum_ssa_accepts_pointer_payload_without_bounded_override() {
         let mut ctx = make_ctx();
         let integer: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
         let mir_pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, integer, false).into();
@@ -3616,6 +3745,80 @@ mod tests {
         let pointer_fields = llvm_struct_fields_at_offsets(&ctx, pointer_payload).unwrap();
         assert!(!has_top_level_pointer_field(&ctx, &integer_fields));
         assert!(has_top_level_pointer_field(&ctx, &pointer_fields));
+    }
+
+    #[test]
+    fn bounded_fieldless_enum_niche_payload_is_the_only_integer_override() {
+        let mut ctx = make_ctx();
+        let (usize_ty, _axis_ty, option_ty) = bounded_axis_option_types(&mut ctx);
+        let option_ref = option_ty.deref(&ctx);
+        let option_enum = option_ref.downcast_ref::<MirEnumType>().unwrap();
+        assert!(is_bounded_fieldless_enum_niche_payload(
+            &ctx,
+            option_enum,
+            1,
+            0
+        ));
+
+        let mut integer_option = option_enum.clone();
+        integer_option.all_field_types[0] = usize_ty;
+        assert!(
+            !is_bounded_fieldless_enum_niche_payload(&ctx, &integer_option, 1, 0),
+            "an arbitrary integer Option payload must retain the spill path"
+        );
+        assert!(!is_bounded_fieldless_enum_niche_payload(
+            &ctx,
+            option_enum,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn option_axis_payload_extraction_stays_in_ssa() {
+        let mut ctx = make_ctx();
+        let (usize_ty, axis_ty, option_ty) = bounded_axis_option_types(&mut ctx);
+        let slot_map = build_enum_slot_map(&mut ctx, option_ty).unwrap();
+        assert_eq!(
+            slot_map.field_slots,
+            vec![None],
+            "Option<Axis> shares its integer niche carrier with the Axis payload"
+        );
+
+        let (module, block) = build_kernel(&mut ctx, vec![option_ty], vec![usize_ty]);
+        let option = block.deref(&ctx).get_argument(0);
+        let payload = Operation::new(
+            &mut ctx,
+            mir::MirEnumPayloadOp::get_concrete_op_info(),
+            vec![axis_ty],
+            vec![option],
+            vec![],
+            0,
+        );
+        let payload_op = mir::MirEnumPayloadOp::new(payload);
+        payload_op.set_attr_payload_variant_index(&ctx, VariantIndexAttr(1));
+        payload_op.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+        payload.insert_at_back(block, &ctx);
+        let axis = payload.deref(&ctx).get_result(0);
+
+        let discriminant = Operation::new(
+            &mut ctx,
+            mir::MirGetDiscriminantOp::get_concrete_op_info(),
+            vec![usize_ty],
+            vec![axis],
+            vec![],
+            0,
+        );
+        discriminant.insert_at_back(block, &ctx);
+        let axis_index = discriminant.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![axis_index]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<mir::MirEnumPayloadOp>(&ctx, &body), 0);
     }
 
     /// SetDiscriminant must use the slot map instead of assuming that the tag
