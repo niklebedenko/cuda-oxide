@@ -1297,12 +1297,15 @@ fn extract_integer_from_byte_array(
     packed
 }
 
-/// Reconstruct a slotless enum payload directly from its byte-faithful LLVM
-/// storage when every semantic field has one exact physical carrier.
+/// Reconstruct a pointer-bearing slotless enum payload directly from its
+/// byte-faithful LLVM storage when every semantic field has one exact physical
+/// carrier.
 ///
 /// Niche enums such as `Option<(usize, &mut T)>` store the integer tuple field
 /// as `[8 x i8]` beside the pointer carrier. Going through an alloca solely to
 /// reinterpret those initialized bytes prevents SROA inside iterator loops.
+/// Integer-only payloads retain the ordinary spill path so this targeted niche
+/// optimization does not alter unrelated range and axis iterator inlining.
 fn try_extract_byte_faithful_enum_payload(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -1313,6 +1316,9 @@ fn try_extract_byte_faithful_enum_payload(
 ) -> Option<Value> {
     let storage_fields = llvm_struct_fields_at_offsets(ctx, storage_ty)?;
     let payload_fields = llvm_struct_fields_at_offsets(ctx, payload_ty)?;
+    if !has_top_level_pointer_field(ctx, &payload_fields) {
+        return None;
+    }
     let undef = llvm::UndefOp::new(ctx, payload_ty);
     rewriter.insert_operation(ctx, undef.get_operation());
     let mut payload = undef.get_operation().deref(ctx).get_result(0);
@@ -1348,6 +1354,12 @@ fn try_extract_byte_faithful_enum_payload(
         payload = insert.get_operation().deref(ctx).get_result(0);
     }
     Some(payload)
+}
+
+fn has_top_level_pointer_field(ctx: &Context, fields: &[(u32, u64, TypeHandle)]) -> bool {
+    fields
+        .iter()
+        .any(|(_, _, field_ty)| field_ty.deref(ctx).is::<llvm_types::PointerType>())
 }
 
 /// Pointer to `base + offset` bytes, for reaching a payload field inside
@@ -3587,6 +3599,23 @@ mod tests {
             0,
             "payload extraction must reconstruct the complete {{i64, ptr}} tuple in SSA"
         );
+    }
+
+    #[test]
+    fn byte_faithful_enum_ssa_requires_a_top_level_pointer_payload() {
+        let mut ctx = make_ctx();
+        let integer: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let mir_pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, integer, false).into();
+        let pointer = convert_type(&mut ctx, mir_pointer).unwrap();
+        let integer_payload: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![integer]).into();
+        let pointer_payload: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![integer, pointer]).into();
+
+        let integer_fields = llvm_struct_fields_at_offsets(&ctx, integer_payload).unwrap();
+        let pointer_fields = llvm_struct_fields_at_offsets(&ctx, pointer_payload).unwrap();
+        assert!(!has_top_level_pointer_field(&ctx, &integer_fields));
+        assert!(has_top_level_pointer_field(&ctx, &pointer_fields));
     }
 
     /// SetDiscriminant must use the slot map instead of assuming that the tag
