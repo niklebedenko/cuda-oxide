@@ -297,6 +297,77 @@ pub fn counted_loop_from_step(ctx: &mut Context, start: i64, n: i64, step: i64) 
     }
 }
 
+/// Build `while i < bound { acc += i; i += 1 }` with both `i` and `bound`
+/// supplied as function arguments.
+pub fn dynamic_counted_loop(ctx: &mut Context) -> CountedLoop {
+    let u32 = u32t(ctx);
+    let i1 = i1(ctx);
+    let (module, region) = func(ctx, vec![u32.into(), u32.into()], vec![]);
+
+    let preheader = block(ctx, region, vec![u32.into(), u32.into()]);
+    let header = block(ctx, region, vec![u32.into(), u32.into()]); // (acc, i)
+    let latch = block(ctx, region, vec![]);
+    let exit = block(ctx, region, vec![]);
+
+    let start = preheader.deref(ctx).get_argument(0);
+    let bound = preheader.deref(ctx).get_argument(1);
+    let acc0 = iconst(ctx, preheader, u32, 0);
+    goto(ctx, preheader, header, vec![acc0, start]);
+
+    let acc = header.deref(ctx).get_argument(0);
+    let i = header.deref(ctx).get_argument(1);
+    let lt = op2!(
+        ctx,
+        header,
+        MirLtOp::get_concrete_op_info(),
+        i1.into(),
+        i,
+        bound
+    );
+    let done = {
+        let op = Operation::new(
+            ctx,
+            MirNotOp::get_concrete_op_info(),
+            vec![i1.into()],
+            vec![lt],
+            vec![],
+            0,
+        );
+        op.insert_at_back(header, ctx);
+        op.deref(ctx).get_result(0)
+    };
+    cond_br(ctx, header, done, exit, latch);
+
+    let acc1 = op2!(
+        ctx,
+        latch,
+        MirAddOp::get_concrete_op_info(),
+        u32.into(),
+        acc,
+        i
+    );
+    let one = iconst(ctx, latch, u32, 1);
+    let inext = op2!(
+        ctx,
+        latch,
+        MirAddOp::get_concrete_op_info(),
+        u32.into(),
+        i,
+        one
+    );
+    goto(ctx, latch, header, vec![acc1, inext]);
+    ret(ctx, exit);
+
+    CountedLoop {
+        module,
+        region,
+        preheader,
+        header,
+        latch,
+        exit,
+    }
+}
+
 /// A built nested counted loop (outer `while i < n` containing inner
 /// `while j < m`) and the blocks worth asserting on.
 pub struct NestedLoop {

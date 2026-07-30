@@ -144,6 +144,7 @@ fn inline_attr_for_device_function(
 struct DeviceInlinePlan<'tcx> {
     array_closures: HashSet<Instance<'tcx>>,
     borrowed_kernel_closures: HashSet<Instance<'tcx>>,
+    borrowed_always_inline_helper_closures: HashSet<Instance<'tcx>>,
     deferred_full_unroll_helpers: HashSet<Instance<'tcx>>,
     considered_array_builders: usize,
     rejected_array_builders: usize,
@@ -173,6 +174,10 @@ const MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES: u64 = 32 * 1024;
 // Eight copies is the accepted bounded code-growth policy for this targeted
 // array-builder optimization.
 const MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT: usize = 8;
+// A fixed array borrowed by an always-inline helper cannot stay in SSA while a
+// loop indexes it dynamically. Preserve full-unroll intent until the helper is
+// inlined and LLVM can see the concrete trip count.
+const MAX_DEFERRED_FIXED_ARRAY_REF_EXTENT: u64 = 16;
 
 fn build_device_inline_plan<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -258,12 +263,32 @@ fn build_device_inline_plan<'tcx>(
                     .all(|closure| accepted_deferred_unroll_closures.contains(closure))
         })
         .collect();
+    plan.deferred_full_unroll_helpers.extend(
+        functions
+            .iter()
+            .filter(|function| !function.is_kernel)
+            .map(|function| function.instance)
+            .filter(|instance| {
+                let def_id = instance.def_id();
+                matches!(
+                    tcx.codegen_fn_attrs(def_id).inline,
+                    rustc_hir::attrs::InlineAttr::Always
+                        | rustc_hir::attrs::InlineAttr::Force { .. }
+                ) && is_bounded_inline_body(tcx, def_id)
+                    && has_bounded_fixed_array_reference_argument(tcx, *instance)
+            }),
+    );
     plan.borrowed_kernel_closures = functions
         .iter()
         .map(|function| function.instance)
         .filter(|instance| {
             is_direct_kernel_closure(tcx, *instance) && closure_has_borrowed_capture(*instance)
         })
+        .collect();
+    plan.borrowed_always_inline_helper_closures = functions
+        .iter()
+        .map(|function| function.instance)
+        .filter(|instance| is_bounded_borrowed_closure_in_always_inline_helper(tcx, *instance))
         .collect();
     plan
 }
@@ -302,6 +327,44 @@ fn closure_has_borrowed_capture(closure: Instance<'_>) -> bool {
     captures
         .iter()
         .any(|capture| matches!(capture.kind(), TyKind::Ref(..)))
+}
+
+/// Return whether a bounded borrowed closure is lexically nested in a helper
+/// whose source contract already requires inlining.
+///
+/// Trait default methods can invoke a caller-provided closure several times
+/// after the enclosing always-inline helper has been expanded. If that closure
+/// keeps ordinary heuristic inline intent, aggregate captures must be
+/// materialized solely to cross the remaining helper boundary. Promoting only
+/// bounded borrowed closures under an explicit always-inline parent preserves
+/// the parent's source intent without applying a module-wide closure policy.
+fn is_bounded_borrowed_closure_in_always_inline_helper<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> bool {
+    let def_id = instance.def_id();
+    if tcx.def_kind(def_id) != rustc_hir::def::DefKind::Closure
+        || tcx.is_coroutine(def_id)
+        || matches!(
+            tcx.codegen_fn_attrs(def_id).inline,
+            rustc_hir::attrs::InlineAttr::Never
+        )
+        || !closure_has_borrowed_capture(instance)
+        || !is_bounded_inline_body(tcx, def_id)
+        || !closure_capture_layout_bytes(tcx, instance)
+            .is_some_and(closure_capture_size_within_budget)
+    {
+        return false;
+    }
+
+    tcx.opt_parent(def_id).is_some_and(|parent| {
+        !crate::collector::is_kernel_function(tcx, parent)
+            && matches!(
+                tcx.codegen_fn_attrs(parent).inline,
+                rustc_hir::attrs::InlineAttr::Always
+                    | rustc_hir::attrs::InlineAttr::Force { .. }
+            )
+    })
 }
 
 fn retain_uncontested_closures<T: Eq + Hash>(
@@ -467,6 +530,27 @@ fn concrete_array_extent<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> O
 
 fn array_output_layout_within_budget<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     array_output_layout_bytes(tcx, instance).is_some_and(array_output_size_within_budget)
+}
+
+fn has_bounded_fixed_array_reference_argument<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> bool {
+    let signature = tcx
+        .fn_sig(instance.def_id())
+        .instantiate(tcx, instance.args)
+        .skip_binder();
+    signature.inputs().iter().any(|input| {
+        let TyKind::Ref(_, pointee, _) = input.kind() else {
+            return false;
+        };
+        let TyKind::Array(_, extent) = pointee.kind() else {
+            return false;
+        };
+        extent
+            .try_to_target_usize(tcx)
+            .is_some_and(|extent| extent <= MAX_DEFERRED_FIXED_ARRAY_REF_EXTENT)
+    })
 }
 
 fn array_output_layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<u64> {
@@ -1860,6 +1944,14 @@ pub fn generate_device_code<'tcx>(
                     .contains(&function.instance)
             })
             .count();
+        let matched_borrowed_always_inline_helper_closures = functions
+            .iter()
+            .filter(|function| {
+                inline_plan
+                    .borrowed_always_inline_helper_closures
+                    .contains(&function.instance)
+            })
+            .count();
         let matched_deferred_full_unroll_helpers = functions
             .iter()
             .filter(|function| {
@@ -1879,14 +1971,19 @@ pub fn generate_device_code<'tcx>(
              matched_deferred_full_unroll_helpers={matched_deferred_full_unroll_helpers} \
              borrowed_kernel_closures={} \
              matched_borrowed_kernel_closures={matched_borrowed_kernel_closures} \
-             strategy=bounded_callbacks_deferred_array_unroll_and_borrowed_kernel_frames",
+             borrowed_always_inline_helper_closures={} \
+             matched_borrowed_always_inline_helper_closures={matched_borrowed_always_inline_helper_closures} \
+             strategy=bounded_callbacks_deferred_array_unroll_and_borrowed_frames",
             inline_plan.considered_array_builders,
             inline_plan.rejected_array_builders,
             inline_plan.conflicting_array_closures,
             inline_plan.array_closures.len(),
             inline_plan.conflicting_deferred_unroll_closures,
             inline_plan.deferred_full_unroll_helpers.len(),
-            inline_plan.borrowed_kernel_closures.len()
+            inline_plan.borrowed_kernel_closures.len(),
+            inline_plan
+                .borrowed_always_inline_helper_closures
+                .len()
         );
     }
     let inline_attrs: Vec<mir_importer::InlineAttr> = functions
@@ -1895,6 +1992,9 @@ pub fn generate_device_code<'tcx>(
             if inline_plan
                 .borrowed_kernel_closures
                 .contains(&func.instance)
+                || inline_plan
+                    .borrowed_always_inline_helper_closures
+                    .contains(&func.instance)
             {
                 mir_importer::InlineAttr::DeviceAlways
             } else {

@@ -62,6 +62,17 @@ mod kernels {
     }
 
     #[inline(always)]
+    fn hdiv_quadratic_helper(values: &[f64; 10], matrix: &[[f64; 10]; 10]) -> f64 {
+        let mut quadratic = 0.0_f64;
+        for row in 0..10 {
+            for column in 0..10 {
+                quadratic += values[row] * matrix[row][column] * values[column];
+            }
+        }
+        quadratic
+    }
+
+    #[inline(always)]
     fn triple(x: u32) -> u32 {
         x * 3
     }
@@ -278,6 +289,57 @@ mod kernels {
                 + components[2].values[1];
         }
     }
+
+    /// Compiler-only reproduction of the fixed observation arrays in
+    /// Impulse's H(div) affine residual. The arrays are populated through a
+    /// constant-bound loop and then read through a fixed-size quadratic form.
+    #[kernel]
+    pub unsafe fn hdiv_quadratic_array(
+        input: &[f64],
+        matrix: *const [[f64; 10]; 10],
+        mut out: DisjointSlice<f64>,
+    ) {
+        let tid = thread::index_1d();
+        let index = tid.get();
+        if let Some(out_elem) = out.get_mut(tid) {
+            let mut values = [0.0_f64; 10];
+            for row in 0..10 {
+                values[row] = input[index * 10 + row];
+            }
+            // SAFETY: this compiler-only shape is never launched by the host
+            // harness; the pointer models Impulse's validated fixed metric.
+            *out_elem = hdiv_quadratic_helper(&values, unsafe { &*matrix });
+        }
+    }
+
+    /// Runtime reproduction of the repeated
+    /// `reaction.iter_mut().enumerate()` loops in Impulse's H(div)
+    /// mass-Riesz reaction.
+    #[kernel]
+    pub fn hdiv_iter_mut_accumulate(input: &[f64], mut out: DisjointSlice<f64>) {
+        let tid = thread::index_1d();
+        let index = tid.get();
+        if let Some(out_elem) = out.get_mut(tid) {
+            let mut reaction = [0.0_f64; 3];
+            for row in 0..10 {
+                let multiplier = input[index * 40 + row];
+                for (component, reaction_component) in reaction.iter_mut().enumerate() {
+                    *reaction_component +=
+                        multiplier * input[index * 40 + 10 + 3 * row + component];
+                }
+            }
+            for row in 0..4 {
+                let multiplier = input[index * 40 + row];
+                for (component, reaction_component) in reaction.iter_mut().enumerate() {
+                    *reaction_component += multiplier * input[index * 40 + component];
+                }
+            }
+            for (component, reaction_component) in reaction.iter_mut().enumerate() {
+                *reaction_component *= input[index * 40 + component];
+            }
+            *out_elem = reaction[0] + reaction[1] + reaction[2];
+        }
+    }
 }
 
 fn kernel_body<'a>(ptx: &'a str, kernel_prefix: &str) -> &'a str {
@@ -363,10 +425,8 @@ fn main() {
     let mut d_runtime_index = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
     // SAFETY: the 32-thread 1D block matches the kernel's indexing model and
     // the 32-element output allocation.
-    unsafe {
-        module.runtime_aggregate_array_index(stream.as_ref(), cfg, &mut d_runtime_index)
-    }
-    .expect("launch runtime_aggregate_array_index");
+    unsafe { module.runtime_aggregate_array_index(stream.as_ref(), cfg, &mut d_runtime_index) }
+        .expect("launch runtime_aggregate_array_index");
     let got_runtime_index = d_runtime_index.to_host_vec(&stream).unwrap();
 
     let mut d_aligned_map = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
@@ -375,6 +435,23 @@ fn main() {
     unsafe { module.map_over_aligned_array(stream.as_ref(), cfg, &mut d_aligned_map) }
         .expect("launch map_over_aligned_array");
     let got_aligned_map = d_aligned_map.to_host_vec(&stream).unwrap();
+
+    let hdiv_input = (0..N * 40)
+        .map(|index| {
+            let lane = index % 40;
+            let thread = index / 40;
+            0.125 + thread as f64 * 0.03125 + lane as f64 * 0.015625
+        })
+        .collect::<Vec<_>>();
+    let d_hdiv_input = DeviceBuffer::from_host(&stream, &hdiv_input)
+        .expect("upload H(div) iter_mut regression input");
+    let mut d_hdiv_iter_mut = DeviceBuffer::<f64>::zeroed(&stream, N).unwrap();
+    // SAFETY: every thread owns one 40-value input segment and one output.
+    unsafe {
+        module.hdiv_iter_mut_accumulate(stream.as_ref(), cfg, &d_hdiv_input, &mut d_hdiv_iter_mut)
+    }
+    .expect("launch hdiv_iter_mut_accumulate");
+    let got_hdiv_iter_mut = d_hdiv_iter_mut.to_host_vec(&stream).unwrap();
 
     let ptx = std::fs::read_to_string(ptx_path).expect("read generated PTX");
     let fixed_axis_ptx = kernel_body(&ptx, "fixed_axis_aggregate_arrays");
@@ -397,6 +474,13 @@ fn main() {
             && !aligned_map_ptx.contains("ld.local")
             && !aligned_map_ptx.contains("st.local"),
         "over-aligned array::map must not use local memory:\n{aligned_map_ptx}"
+    );
+    let hdiv_quadratic_ptx = kernel_body(&ptx, "hdiv_quadratic_array");
+    assert!(
+        !hdiv_quadratic_ptx.contains(".local")
+            && !hdiv_quadratic_ptx.contains("ld.local")
+            && !hdiv_quadratic_ptx.contains("st.local"),
+        "bounded H(div) quadratic arrays must remain stackless:\n{hdiv_quadratic_ptx}"
     );
 
     let mut failures = 0usize;
@@ -473,6 +557,33 @@ fn main() {
             println!(
                 "FAIL tid={tid}: map_over_aligned_array={} expected={want_aligned_map}",
                 got_aligned_map[tid]
+            );
+            failures += 1;
+        }
+        let input = &hdiv_input[tid * 40..(tid + 1) * 40];
+        let mut reaction = [0.0_f64; 3];
+        for row in 0..10 {
+            let multiplier = input[row];
+            for (component, reaction_component) in reaction.iter_mut().enumerate() {
+                *reaction_component += multiplier * input[10 + 3 * row + component];
+            }
+        }
+        for row in 0..4 {
+            let multiplier = input[row];
+            for (component, reaction_component) in reaction.iter_mut().enumerate() {
+                *reaction_component += multiplier * input[component];
+            }
+        }
+        for (component, reaction_component) in reaction.iter_mut().enumerate() {
+            *reaction_component *= input[component];
+        }
+        let want_hdiv_iter_mut = reaction.iter().sum::<f64>();
+        if (got_hdiv_iter_mut[tid] - want_hdiv_iter_mut).abs()
+            > 1.0e-11 * want_hdiv_iter_mut.abs().max(1.0)
+        {
+            println!(
+                "FAIL tid={tid}: hdiv_iter_mut_accumulate={} expected={want_hdiv_iter_mut}",
+                got_hdiv_iter_mut[tid]
             );
             failures += 1;
         }

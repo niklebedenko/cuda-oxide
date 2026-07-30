@@ -1549,6 +1549,13 @@ run_cargo() {
             CARGO_EC=1
         fi
     fi
+    if [[ ${CARGO_EC} -eq 0 && ${COMPILE_ONLY} -eq 1 && "${ex}" == "warp_reduce" ]]; then
+        local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
+        if ! "${shape_check}" >>"${log}" 2>&1; then
+            printf 'warp_reduce failed its warp-uniform PTX or SASS shape assertions\n' >>"${log}"
+            CARGO_EC=1
+        fi
+    fi
     if [[ ${CARGO_EC} -eq 0 && ${COMPILE_ONLY} -eq 1 && "${ex}" == "helper_fn" ]]; then
         local ptx="crates/rustc-codegen-cuda/examples/${ex}/${ex}.ptx"
         local llvm="crates/rustc-codegen-cuda/examples/${ex}/${ex}.ll"

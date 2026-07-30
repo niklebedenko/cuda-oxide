@@ -560,6 +560,17 @@ pub fn shuffle_up_f64(var: f64, delta: u32) -> f64 {
 /// Vote ALL (masked): true if `predicate` holds for every participating lane.
 ///
 /// PTX `vote.sync.all`. The full-warp shorthand is [`all`].
+///
+/// The returned predicate is identical in every participating lane. This is
+/// useful when a value is warp-uniform by program construction but the backend
+/// cannot prove it, for example when every lane loads the same warp-indexed
+/// metadata element. Branching on `all_sync(mask, predicate)` makes the
+/// uniformity visible to PTX assembly and avoids divergent-control fallbacks
+/// around later warp collectives.
+///
+/// This computes a consensus; it is not an assertion. If `predicate` genuinely
+/// differs between participating lanes, the result is false in all of them.
+/// Do not use it where preserving lane-local branch behaviour is required.
 #[inline(never)]
 pub fn all_sync(mask: u32, predicate: bool) -> bool {
     // Recognized through the generated intrinsic catalog.
@@ -598,6 +609,13 @@ pub fn ballot_sync(mask: u32, predicate: bool) -> u32 {
 ///
 /// ```rust,ignore
 /// let all_valid = warp::all(my_value > 0.0);
+///
+/// // Every lane in this warp reads the same metadata slot. The vote also
+/// // gives the assembler an explicitly warp-uniform guard for the shuffle.
+/// let warp_enabled = metadata[warp_id] != 0;
+/// if warp::all(warp_enabled) {
+///     let peer_value = warp::shuffle_xor_f32(value, 16);
+/// }
 /// ```
 #[inline(always)]
 pub fn all(predicate: bool) -> bool {

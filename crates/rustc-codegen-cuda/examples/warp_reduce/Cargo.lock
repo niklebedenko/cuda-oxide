@@ -116,9 +116,13 @@ dependencies = [
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
 dependencies = [
+ "libc",
  "libnvvm-sys",
  "nvjitlink-sys",
+ "object",
+ "oxide-artifacts",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -145,6 +149,8 @@ name = "cuda-device"
 version = "0.2.1"
 dependencies = [
  "cuda-macros",
+ "half",
+ "paste",
 ]
 
 [[package]]

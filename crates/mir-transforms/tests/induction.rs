@@ -9,7 +9,9 @@
 
 mod common;
 
-use common::{counted_loop, counted_loop_from, mir_ctx, multi_latch_counted_loop};
+use common::{
+    counted_loop, counted_loop_from, dynamic_counted_loop, mir_ctx, multi_latch_counted_loop,
+};
 use mir_transforms::analyses::induction::{ArgKind, CmpPred, analyze};
 use mir_transforms::analyses::loop_info::LoopInfo;
 use pliron::graph::dominance::DomInfo;
@@ -66,6 +68,28 @@ fn trip_count_tracks_the_bound() {
         assert_eq!(rec.bound, Some(n as i128), "bound for n={n}");
         assert_eq!(rec.trip_count, Some(n as u64), "trip count for n={n}");
     }
+}
+
+#[test]
+fn recognizes_runtime_start_as_a_partial_unroll_counter() {
+    let mut ctx = mir_ctx();
+    let lp = dynamic_counted_loop(&mut ctx);
+
+    let mut dom = DomInfo::default();
+    let info = {
+        let dt = dom.get_dom_tree(&ctx, lp.region);
+        LoopInfo::compute(&ctx, lp.region, dt)
+    };
+    let id = info.innermost_loop(lp.header).unwrap();
+    let ph = info.preheader(&ctx, lp.region, id).unwrap();
+    let rec = analyze(&ctx, &info, id, ph);
+
+    assert_eq!(rec.primary_iv, Some(1));
+    assert!(matches!(rec.args[1], ArgKind::DynamicBasicIv { step: 1 }));
+    assert_eq!(rec.continue_pred, Some(CmpPred::Lt));
+    assert_eq!(rec.bound, None);
+    assert!(rec.bound_value.is_some());
+    assert_eq!(rec.trip_count, None);
 }
 
 /// Unsigned constants must be zero-extended. The high bit of both values is set,
@@ -146,7 +170,10 @@ fn rejects_inconsistent_iv_steps_across_latches() {
 
     assert_eq!(rec.primary_iv, None, "there is no single affine counter");
     assert!(
-        !matches!(rec.args[1], ArgKind::BasicIv { .. }),
+        !matches!(
+            rec.args[1],
+            ArgKind::BasicIv { .. } | ArgKind::DynamicBasicIv { .. }
+        ),
         "different latch steps must not be guessed from an arbitrary latch"
     );
     assert_eq!(rec.trip_count, None);

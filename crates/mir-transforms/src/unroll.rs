@@ -455,7 +455,7 @@ struct LoopShape {
     /// header -> normal_exit operands (the normal-completion live-out values).
     normal_exit_ops: Vec<Value>,
     iv_idx: usize,
-    iv_init: i128,
+    iv_init: Option<i128>,
     iv_step: i128,
     iv_type: TypeHandle,
     /// The boolean type of the header's exit test (for any new comparison).
@@ -542,7 +542,8 @@ fn analyze_shape(
         .primary_iv
         .ok_or("no recognized induction variable (loop counter)")?;
     let (iv_init, iv_step) = match &rec.args[iv_idx] {
-        ArgKind::BasicIv { init, step } => (*init, *step),
+        ArgKind::BasicIv { init, step } => (Some(*init), *step),
+        ArgKind::DynamicBasicIv { step } => (None, *step),
         _ => return Err("the loop counter is not a simple induction variable".into()),
     };
 
@@ -857,16 +858,19 @@ fn integer_value_bounds(ctx: &Context, ty: TypeHandle) -> Option<(i128, i128)> {
 /// reaches the same final value without wrapping; otherwise the original loop
 /// may continue after the trip count this analysis computed.
 fn full_iv_stays_in_range(ctx: &Context, shape: &LoopShape, trip: i128) -> bool {
+    let Some(iv_init) = shape.iv_init else {
+        return false;
+    };
     let Some((min, max)) = integer_value_bounds(ctx, shape.iv_type) else {
         return false;
     };
     let Some(delta) = trip.checked_mul(shape.iv_step) else {
         return false;
     };
-    let Some(final_iv) = shape.iv_init.checked_add(delta) else {
+    let Some(final_iv) = iv_init.checked_add(delta) else {
         return false;
     };
-    (min..=max).contains(&shape.iv_init) && (min..=max).contains(&final_iv)
+    (min..=max).contains(&iv_init) && (min..=max).contains(&final_iv)
 }
 
 /// A grouped positive-IV span must be small enough to cross the type boundary
@@ -955,7 +959,7 @@ fn full_unroll(
                 "the full-unroll counter arithmetic overflows the analysis range".into(),
             ));
         };
-        let Some(value) = s.iv_init.checked_add(delta) else {
+        let Some(value) = s.iv_init.and_then(|iv_init| iv_init.checked_add(delta)) else {
             return Ok(UnrollOutcome::Skipped(
                 "the full-unroll counter arithmetic overflows the analysis range".into(),
             ));
@@ -1207,7 +1211,9 @@ fn partial_unroll(
         .iter()
         .flat_map(|c| c.blocks.iter().copied())
         .collect();
-    fold_constant_index_in_copies(ctx, &copy_blocks, mh_iv, s.iv_init, group_step);
+    if let Some(iv_init) = s.iv_init {
+        fold_constant_index_in_copies(ctx, &copy_blocks, mh_iv, iv_init, group_step);
+    }
 
     // main_h guard: stay in the main loop only while a whole group of `factor`
     // iterations still fits. The last copy in a group uses counter

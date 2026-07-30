@@ -14,8 +14,9 @@
 mod common;
 
 use common::{
-    counted_loop, counted_loop_from_step, early_exit_counted_loop, early_exit_with_direct_liveout,
-    mir_ctx, multi_latch_counted_loop, multiple_exit_counted_loop, nested_counted_loop,
+    counted_loop, counted_loop_from_step, dynamic_counted_loop, early_exit_counted_loop,
+    early_exit_with_direct_liveout, mir_ctx, multi_latch_counted_loop, multiple_exit_counted_loop,
+    nested_counted_loop,
 };
 use dialect_mir::ops::{
     MirBitAndOp, MirCallOp, MirCondBranchOp, MirConstantOp, MirGeOp, MirReturnOp, MirUnrollHintOp,
@@ -317,6 +318,28 @@ fn partial_unroll_handles_multi_latch_continue() {
         2,
         "partial unroll should build a main loop and keep a remainder"
     );
+}
+
+#[test]
+fn partial_unroll_accepts_a_runtime_start_and_bound() {
+    let mut ctx = mir_ctx();
+    let lp = dynamic_counted_loop(&mut ctx);
+
+    MirUnrollHintOp::new(&mut ctx, 4)
+        .get_operation()
+        .insert_at_front(lp.latch, &ctx);
+    let mut analyses = AnalysisManager::default();
+    unroll_annotated_loops(lp.module, &mut ctx, &mut analyses)
+        .expect("partial unroll with runtime start and bound");
+
+    pliron::operation::verify_operation(lp.module, &ctx)
+        .expect("valid IR after runtime-start partial unroll");
+    assert_eq!(
+        loop_count(&ctx, lp.region),
+        2,
+        "partial unroll should build a main loop and keep a remainder"
+    );
+    assert_eq!(hint_count(&ctx, lp.region), 0, "the request was consumed");
 }
 
 #[test]

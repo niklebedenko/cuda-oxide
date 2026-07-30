@@ -188,6 +188,47 @@ mod kernels {
             *out_elem = sum;
         }
     }
+
+    /// Keep the control path containing full-warp collectives visibly uniform
+    /// to the PTX assembler.
+    ///
+    /// Every lane in a warp loads the same `enabled[warp_idx]` element, but a
+    /// backend cannot generally infer that a global-memory load has the same
+    /// value in every lane. The vote makes that runtime fact explicit: its
+    /// result is warp-uniform, so the guarded shuffles need no divergent-control
+    /// fallback.
+    #[kernel]
+    pub fn warp_uniform_guarded_reduce(data: &[f32], enabled: &[u32], mut out: DisjointSlice<f32>) {
+        let gid = thread::index_1d();
+        let lane = warp::lane_id();
+        let warp_idx = gid.get() / 32;
+
+        let mut sum = 0.0;
+        for slot in 0..5 {
+            // The launch contract for this probe gives every lane in the warp
+            // the same predicate. `all` preserves that branch decision while
+            // materializing a warp-uniform predicate in PTX. Keeping the
+            // collective inside a loop is important: after a skipped slot all
+            // lanes continue to the next slot.
+            let enabled_idx = warp_idx * 5 + slot;
+            let enabled_for_warp = unsafe { *enabled.get_unchecked(enabled_idx) } != 0;
+            if warp::all(enabled_for_warp) {
+                let mut val = unsafe { *data.get_unchecked(gid.get()) };
+                val += warp::shuffle_xor_f32(val, 16);
+                val += warp::shuffle_xor_f32(val, 8);
+                val += warp::shuffle_xor_f32(val, 4);
+                val += warp::shuffle_xor_f32(val, 2);
+                val += warp::shuffle_xor_f32(val, 1);
+                sum += val;
+            }
+        }
+
+        if lane == 0 {
+            unsafe {
+                *out.get_unchecked_mut(warp_idx) = sum;
+            }
+        }
+    }
 }
 
 // =============================================================================

@@ -40,7 +40,7 @@ use crate::convert::enum_payload_storage::{coerce_enum_payload_value, enum_paylo
 use crate::convert::types::{
     EnumSlotMap, StructLayoutInfo, StructSlotMap, build_enum_slot_map, build_struct_slot_map,
     build_union_storage_type, convert_type, is_zero_sized_type, llvm_byte_faithful_twin,
-    llvm_type_contains_i1, make_slice_struct, mir_type_abi_align,
+    llvm_type_contains_i1, llvm_type_size_align, make_slice_struct, mir_type_abi_align,
 };
 use dialect_mir::ops::{
     MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp, MirInsertFieldOp,
@@ -1223,6 +1223,133 @@ fn spill_enum_value(
     slot_ptr
 }
 
+fn llvm_struct_fields_at_offsets(
+    ctx: &Context,
+    ty: TypeHandle,
+) -> Option<Vec<(u32, u64, TypeHandle)>> {
+    let ty_ref = ty.deref(ctx);
+    let structure = ty_ref.downcast_ref::<llvm_types::StructType>()?;
+    let mut offset = 0_u64;
+    let mut fields = Vec::new();
+    for (index, field) in structure.fields().enumerate() {
+        let (size, align) = llvm_type_size_align(ctx, field)?;
+        offset = offset.div_ceil(align.max(1)) * align.max(1);
+        fields.push((index as u32, offset, field));
+        offset = offset.checked_add(size)?;
+    }
+    Some(fields)
+}
+
+fn extract_integer_from_byte_array(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    aggregate: Value,
+    storage_slot: u32,
+    storage_ty: TypeHandle,
+    integer_ty: TypeHandle,
+) -> Option<Value> {
+    let (array_size, byte_width) = {
+        let array_ref = storage_ty.deref(ctx);
+        let array = array_ref.downcast_ref::<llvm_types::ArrayType>()?;
+        let element_ty = array.elem_type();
+        let byte_ref = element_ty.deref(ctx);
+        let byte = byte_ref.downcast_ref::<IntegerType>()?;
+        (array.size(), byte.width())
+    };
+    let width = integer_ty.deref(ctx).downcast_ref::<IntegerType>()?.width();
+    if byte_width != 8 || array_size.checked_mul(8)? != u64::from(width) {
+        return None;
+    }
+
+    let storage = llvm::ExtractValueOp::new(ctx, aggregate, vec![storage_slot]).ok()?;
+    rewriter.insert_operation(ctx, storage.get_operation());
+    let storage = storage.get_operation().deref(ctx).get_result(0);
+    let mut packed = None;
+    for index in 0..array_size {
+        let octet = llvm::ExtractValueOp::new(ctx, storage, vec![index as u32]).ok()?;
+        rewriter.insert_operation(ctx, octet.get_operation());
+        let octet = octet.get_operation().deref(ctx).get_result(0);
+        let wide = llvm::ZExtOp::new_with_nneg(ctx, octet, integer_ty, false);
+        rewriter.insert_operation(ctx, wide.get_operation());
+        let wide = wide.get_operation().deref(ctx).get_result(0);
+        let shifted = if index == 0 {
+            wide
+        } else {
+            let amount = integer_constant(ctx, rewriter, width, index * 8);
+            let shift = llvm::ShlOp::new_with_overflow_flag(
+                ctx,
+                wide,
+                amount,
+                IntegerOverflowFlagsAttr::default(),
+            );
+            rewriter.insert_operation(ctx, shift.get_operation());
+            shift.get_operation().deref(ctx).get_result(0)
+        };
+        packed = Some(match packed {
+            None => shifted,
+            Some(previous) => {
+                let or = llvm::OrOp::new(ctx, previous, shifted);
+                rewriter.insert_operation(ctx, or.get_operation());
+                or.get_operation().deref(ctx).get_result(0)
+            }
+        });
+    }
+    packed
+}
+
+/// Reconstruct a slotless enum payload directly from its byte-faithful LLVM
+/// storage when every semantic field has one exact physical carrier.
+///
+/// Niche enums such as `Option<(usize, &mut T)>` store the integer tuple field
+/// as `[8 x i8]` beside the pointer carrier. Going through an alloca solely to
+/// reinterpret those initialized bytes prevents SROA inside iterator loops.
+fn try_extract_byte_faithful_enum_payload(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    enum_value: Value,
+    storage_ty: TypeHandle,
+    payload_ty: TypeHandle,
+    payload_offset: u64,
+) -> Option<Value> {
+    let storage_fields = llvm_struct_fields_at_offsets(ctx, storage_ty)?;
+    let payload_fields = llvm_struct_fields_at_offsets(ctx, payload_ty)?;
+    let undef = llvm::UndefOp::new(ctx, payload_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let mut payload = undef.get_operation().deref(ctx).get_result(0);
+
+    for (payload_slot, relative_offset, field_ty) in payload_fields {
+        let absolute_offset = payload_offset.checked_add(relative_offset)?;
+        let (field_size, _) = llvm_type_size_align(ctx, field_ty)?;
+        let (storage_slot, _, carrier_ty) =
+            storage_fields
+                .iter()
+                .copied()
+                .find(|(_, carrier_offset, carrier_ty)| {
+                    *carrier_offset == absolute_offset
+                        && llvm_type_size_align(ctx, *carrier_ty)
+                            .is_some_and(|(size, _)| size == field_size)
+                })?;
+        let field = if carrier_ty == field_ty {
+            let extract = llvm::ExtractValueOp::new(ctx, enum_value, vec![storage_slot]).ok()?;
+            rewriter.insert_operation(ctx, extract.get_operation());
+            extract.get_operation().deref(ctx).get_result(0)
+        } else {
+            extract_integer_from_byte_array(
+                ctx,
+                rewriter,
+                enum_value,
+                storage_slot,
+                carrier_ty,
+                field_ty,
+            )?
+        };
+        let insert = llvm::InsertValueOp::new(ctx, payload, field, vec![payload_slot]);
+        rewriter.insert_operation(ctx, insert.get_operation());
+        payload = insert.get_operation().deref(ctx).get_result(0);
+    }
+    Some(payload)
+}
+
 /// Pointer to `base + offset` bytes, for reaching a payload field inside
 /// a spilled enum (`getelementptr i8, ptr base, offset`).
 fn enum_byte_gep(
@@ -1895,6 +2022,17 @@ pub(crate) fn convert_enum_payload(
             rewriter.replace_operation(ctx, op, undef_op.get_operation());
         }
         None => {
+            if let Some(payload) = try_extract_byte_faithful_enum_payload(
+                ctx,
+                rewriter,
+                enum_val,
+                slot_map.llvm_struct_ty,
+                slot_map.field_llvm_types[flat],
+                slot_map.field_offsets[flat],
+            ) {
+                rewriter.replace_operation_with_values(ctx, op, vec![payload]);
+                return Ok(());
+            }
             let slot_ptr =
                 spill_enum_value(ctx, rewriter, enum_val, slot_map.llvm_struct_ty, abi_align);
             let field_ptr = enum_byte_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
@@ -3377,13 +3515,13 @@ mod tests {
         );
         assert_eq!(
             count_ops::<llvm::StoreOp>(&ctx, &body),
-            3,
-            "construction and extraction should each spill the enum, plus one tuple payload store"
+            2,
+            "construction spills once and writes the tuple payload; extraction stays in SSA"
         );
         assert_eq!(
             count_ops::<llvm::LoadOp>(&ctx, &body),
-            2,
-            "construction should reload the enum and extraction should load the tuple payload"
+            1,
+            "construction reloads the enum while extraction stays in SSA"
         );
         // What this test is about is that the payload moves as one unit, never
         // field by field. Assert that property directly instead of counting
@@ -3444,9 +3582,10 @@ mod tests {
             store_tys.contains(&lowered_tuple),
             "at least one store must move the complete {{i64, ptr}} payload"
         );
-        assert!(
-            load_tys.contains(&lowered_tuple),
-            "at least one load must read the complete {{i64, ptr}} payload"
+        assert_eq!(
+            load_tys.iter().filter(|ty| **ty == lowered_tuple).count(),
+            0,
+            "payload extraction must reconstruct the complete {{i64, ptr}} tuple in SSA"
         );
     }
 

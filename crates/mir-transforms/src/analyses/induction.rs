@@ -23,8 +23,9 @@
 //! it one of:
 //!
 //!   * **Basic induction variable.** The latch feeds back `arg + c` for a
-//!     constant `c` (the per-iteration step). With a constant starting value we
-//!     describe it by a **recurrence** `{init, step}`, meaning value =
+//!     constant `c` (the per-iteration step). A runtime starting value is
+//!     sufficient for partial unrolling. With a constant starting value we also
+//!     describe the counter by a **recurrence** `{init, step}`, meaning value =
 //!     `init + step * iteration_number`. For example `{0, 4}` is the sequence
 //!     `0, 4, 8, 12, ...`. Such an IV is always a multiple of `step` away from
 //!     `init`; that fact ("`arg` is **congruent** to `init` modulo `step`",
@@ -105,6 +106,11 @@ pub enum ArgKind {
     /// A counter: its value is `init + step * iteration`, so it forms the
     /// sequence `init, init+step, init+2*step, ...`.
     BasicIv { init: i128, step: i128 },
+    /// A counter with a runtime starting value and a compile-time step.
+    ///
+    /// Partial unrolling can still group iterations safely. It simply cannot
+    /// compute a fixed trip count or fold counter-derived modulo indices.
+    DynamicBasicIv { step: i128 },
     /// A value carried across iterations and updated by something other than a
     /// fixed step, e.g. an accumulator `acc = acc + (i & 3)`.
     Reduction,
@@ -259,7 +265,10 @@ pub fn analyze(
     let trip_count = match (primary_iv, bound, continue_pred) {
         (Some(iv), Some(b), Some(p)) => match &args[iv] {
             ArgKind::BasicIv { init, step } => trip_count(*init, *step, b, p),
-            _ => None,
+            ArgKind::DynamicBasicIv { .. }
+            | ArgKind::Reduction
+            | ArgKind::Invariant
+            | ArgKind::Unknown => None,
         },
         _ => None,
     };
@@ -401,9 +410,7 @@ fn classify_arg(
         {
             return ArgKind::BasicIv { init, step };
         }
-        // Steps like a counter, but its starting value isn't a constant, so we
-        // can't give it a numeric formula; treat it as a carried value instead.
-        return ArgKind::Reduction;
+        return ArgKind::DynamicBasicIv { step };
     }
     // Changes each iteration but not by a fixed step: an accumulator.
     ArgKind::Reduction
@@ -509,7 +516,10 @@ fn analyze_guard(
     };
     // The thing being tested must actually be a counter for this to be a
     // counted loop.
-    if !matches!(args[iv_index], ArgKind::BasicIv { .. }) {
+    if !matches!(
+        args[iv_index],
+        ArgKind::BasicIv { .. } | ArgKind::DynamicBasicIv { .. }
+    ) {
         return (None, None, None, None);
     }
     (
