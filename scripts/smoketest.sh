@@ -136,7 +136,7 @@ verify_array_inline_boundary_nvvm_ir() {
     [[ -s "${ll}" ]] || return 1
 
     local outer_callback returned_callback oversized_callback function_item shared_callback
-    local core_defs user_defs
+    local core_root_defs core_erased_defs user_defs
     outer_callback="$(grep -E \
         '^define .*@_RNCNv[[:alnum:]_]+_closure_result_boundary0B[[:alnum:]_]*\(' \
         "${ll}")"
@@ -149,12 +149,19 @@ verify_array_inline_boundary_nvvm_ir() {
     [[ "$(grep -c '^define ' <<<"${returned_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${returned_callback}")" -eq 0 ]] || return 1
 
-    core_defs="$(grep -E \
-        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).*closure_result_boundary' \
+    core_root_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array11try_from_fn.*closure_result_boundary' \
         "${ll}")"
-    [[ "$(grep -c '^define ' <<<"${core_defs}")" -eq 2 ]] || return 1
-    [[ "$(grep -c 'inlinehint' <<<"${core_defs}")" -eq 2 ]] || return 1
-    [[ "$(grep -c 'alwaysinline' <<<"${core_defs}")" -eq 0 ]] || return 1
+    [[ "$(grep -c '^define ' <<<"${core_root_defs}")" -eq 1 ]] || return 1
+    [[ "$(grep -c 'inlinehint' <<<"${core_root_defs}")" -eq 1 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${core_root_defs}")" -eq 0 ]] || return 1
+
+    core_erased_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array18try_from_fn_erased.*closure_result_boundary' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${core_erased_defs}")" -eq 1 ]] || return 1
+    [[ "$(grep -c 'inlinehint' <<<"${core_erased_defs}")" -eq 0 ]] || return 1
+    [[ "$(grep -c 'alwaysinline' <<<"${core_erased_defs}")" -eq 1 ]] || return 1
 
     oversized_callback="$(grep -E \
         '^define .*@_RNCNv[[:alnum:]_]+_probe53cuda_oxide_kernel_[[:alnum:]]+_oversized_capture_boundary0B[[:alnum:]_]*\(' \
@@ -188,18 +195,18 @@ verify_hdiv_array_inline_nvvm_ir() {
     local ll="crates/rustc-codegen-cuda/examples/hdiv_array_inline_probe/hdiv_array_inline_probe.ll"
     [[ -s "${ll}" ]] || return 1
 
-    local callback_count core_scaffold_count core_always_count
+    local callback_count core_root_count core_erased_count
     callback_count="$(grep -Ec '^define .*@_RNC.*element_lib.*alwaysinline' "${ll}")"
-    core_scaffold_count="$(grep -Ec \
-        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).* inlinehint' \
+    core_root_count="$(grep -Ec \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array11try_from_fn.* inlinehint' \
         "${ll}")"
-    core_always_count="$(grep -Ec \
-        '^define .*@_RINvNtC[[:alnum:]]+_4core5array(11try_from_fn|18try_from_fn_erased).* alwaysinline' \
+    core_erased_count="$(grep -Ec \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array18try_from_fn_erased.* alwaysinline' \
         "${ll}" || true)"
 
     [[ "${callback_count}" -eq 14 ]] || return 1
-    [[ "${core_scaffold_count}" -eq 28 ]] || return 1
-    [[ "${core_always_count}" -eq 0 ]] || return 1
+    [[ "${core_root_count}" -eq 14 ]] || return 1
+    [[ "${core_erased_count}" -eq 14 ]] || return 1
 }
 
 verify_array_inline_boundary_direct_ir() {
@@ -1546,6 +1553,13 @@ run_cargo() {
     if [[ ${CARGO_EC} -eq 0 && -f "${shape_check}" ]]; then
         if ! bash "${shape_check}" >>"${log}" 2>&1; then
             printf '%s failed its verify-code-shape.sh assertions\n' "${ex}" >>"${log}"
+            CARGO_EC=1
+        fi
+    fi
+    if [[ ${CARGO_EC} -eq 0 && "${ex}" == "option_axis_index" ]]; then
+        local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
+        if ! "${shape_check}" >>"${log}" 2>&1; then
+            printf 'option_axis_index failed its bounded enum-index or real-bounds-control PTX assertions\n' >>"${log}"
             CARGO_EC=1
         fi
     fi

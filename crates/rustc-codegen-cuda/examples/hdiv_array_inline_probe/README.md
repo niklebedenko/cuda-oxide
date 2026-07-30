@@ -15,12 +15,19 @@ Run the correctness check on a CUDA-capable machine with:
 cargo oxide run hdiv_array_inline_probe
 ```
 
-This deliberately uses the ordinary auto-libdevice path: no
-`--emit-nvvm-ir` flag is needed. It guards the backend's bounded promotion of
-callbacks passed to concrete `core::array::from_fn` builders to
-device-link-only mandatory inline intent. The core construction scaffolds
-retain their ordinary inline hints because forcing those boundaries can
-trigger invalid native stack-frame lowering in the CUDA 12.9 device linker.
+The ordinary command checks runtime correctness. Exercise the NVVM-IR
+attributes and device linker explicitly with:
+
+```console
+cargo oxide run hdiv_array_inline_probe --emit-nvvm-ir --arch=sm_86
+```
+
+The probe guards bounded device-link-only promotion of callbacks and erased
+array helpers. Erased helpers also carry bounded deferred-unroll intent.
+Concrete `core::array::from_fn` roots retain their ordinary inline hints
+because forcing those boundaries can trigger invalid native stack-frame
+lowering in the CUDA 12.9 device linker. Direct PTX compilation ignores the
+linker-only intent.
 
 Inspect a produced cubin with:
 

@@ -153,8 +153,8 @@ struct DeviceInlinePlan<'tcx> {
 }
 
 // These are compile-resource guards rather than semantic limits. Mandatory
-// device-link inlining is restricted to concrete array callbacks; the core
-// array scaffolds retain their ordinary Rust inline hints.
+// device-link inlining is restricted to concrete array callbacks and the
+// erased helpers selected for bounded deferred full unrolling.
 const MAX_DEVICE_LINK_INLINE_BLOCKS: usize = 24;
 const MAX_DEVICE_LINK_INLINE_STATEMENTS: usize = 128;
 // Three-axis tensor operators can have a large optimized callback even though
@@ -174,10 +174,11 @@ const MAX_DEVICE_LINK_ARRAY_OUTPUT_BYTES: u64 = 32 * 1024;
 // Eight copies is the accepted bounded code-growth policy for this targeted
 // array-builder optimization.
 const MAX_DEFERRED_FULL_UNROLL_ARRAY_EXTENT: usize = 8;
-// A fixed array borrowed by an always-inline helper cannot stay in SSA while a
-// loop indexes it dynamically. Preserve full-unroll intent until the helper is
-// inlined and LLVM can see the concrete trip count.
-const MAX_DEFERRED_FIXED_ARRAY_REF_EXTENT: u64 = 16;
+// A fixed array borrowed by or created inside an always-inline helper cannot
+// stay in SSA while a lowered iterator loop indexes it dynamically. Preserve
+// full-unroll intent until the helper is inlined and LLVM can see the concrete
+// trip count.
+const MAX_DEFERRED_FIXED_ARRAY_EXTENT: u64 = 16;
 
 fn build_device_inline_plan<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -275,7 +276,8 @@ fn build_device_inline_plan<'tcx>(
                     rustc_hir::attrs::InlineAttr::Always
                         | rustc_hir::attrs::InlineAttr::Force { .. }
                 ) && is_bounded_inline_body(tcx, def_id)
-                    && has_bounded_fixed_array_reference_argument(tcx, *instance)
+                    && (has_bounded_fixed_array_reference_argument(tcx, *instance)
+                        || has_bounded_fixed_array_local(tcx, def_id))
             }),
     );
     plan.borrowed_kernel_closures = functions
@@ -549,8 +551,26 @@ fn has_bounded_fixed_array_reference_argument<'tcx>(
         };
         extent
             .try_to_target_usize(tcx)
-            .is_some_and(|extent| extent <= MAX_DEFERRED_FIXED_ARRAY_REF_EXTENT)
+            .is_some_and(|extent| extent <= MAX_DEFERRED_FIXED_ARRAY_EXTENT)
     })
+}
+
+fn has_bounded_fixed_array_local(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+) -> bool {
+    let body = tcx.optimized_mir(def_id);
+    body.local_decls
+        .iter()
+        .skip(body.arg_count + 1)
+        .any(|local| {
+            let TyKind::Array(_, extent) = local.ty.kind() else {
+                return false;
+            };
+            extent
+                .try_to_target_usize(tcx)
+                .is_some_and(|extent| extent <= MAX_DEFERRED_FIXED_ARRAY_EXTENT)
+        })
 }
 
 fn array_output_layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<u64> {
@@ -2004,7 +2024,12 @@ pub fn generate_device_code<'tcx>(
         .collect();
     let device_link_always: Vec<bool> = functions
         .iter()
-        .map(|func| inline_plan.array_closures.contains(&func.instance))
+        .map(|func| {
+            inline_plan.array_closures.contains(&func.instance)
+                || inline_plan
+                    .deferred_full_unroll_helpers
+                    .contains(&func.instance)
+        })
         .collect();
     let deferred_full_unroll: Vec<bool> = functions
         .iter()
