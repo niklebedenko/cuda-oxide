@@ -75,9 +75,9 @@ pub(crate) enum MaterializeError {
     ProvenanceMismatch { expected: String, actual: String },
 
     #[error(
-        "build-time cubin materialization does not yet support #[device] extern declarations because their ordered external link inputs are not available to the backend"
+        "build-time cubin materialization cannot resolve #[device] extern `{name}` because its ordered external link input is not available to the backend"
     )]
-    HasDeviceExterns,
+    UnsupportedDeviceExtern { name: String },
 
     #[error(
         "build-time cubin materialization expected compiler IR, but codegen already produced a cubin; refusing to bypass the provenance-checked finalization recipe"
@@ -117,15 +117,31 @@ pub(crate) fn request_from_env() -> Result<Option<MaterializationRequest>, Mater
 /// CUDA compiler library is discovered or loaded.
 pub(crate) fn validate_collection(
     request: Option<MaterializationRequest>,
-    has_device_externs: bool,
+    device_externs: &[&str],
 ) -> Result<(), MaterializeError> {
     if request.is_none() {
         return Ok(());
     }
-    if has_device_externs {
-        return Err(MaterializeError::HasDeviceExterns);
+    if let Some(name) = device_externs
+        .iter()
+        .copied()
+        .find(|name| device_extern_requires_link_input(name))
+    {
+        return Err(MaterializeError::UnsupportedDeviceExtern {
+            name: name.to_string(),
+        });
     }
     Ok(())
+}
+
+/// Whether an external device declaration needs a caller-supplied link input.
+///
+/// CUDA's own PTX assembler resolves a small set of device-runtime builtins.
+/// Keep this list deliberately narrow: arbitrary device externs still require
+/// their defining LTOIR/object to participate in the ordered materialization
+/// recipe before the backend can safely emit a cubin.
+fn device_extern_requires_link_input(name: &str) -> bool {
+    !matches!(name, "cudaGraphSetConditional")
 }
 
 pub(crate) fn nvvm_ir_to_artifacts(
@@ -296,15 +312,16 @@ mod tests {
     }
 
     #[test]
-    fn device_extern_materialization_fails_without_tools() {
+    fn device_extern_materialization_allows_only_assembler_builtins() {
         let request = Some(MaterializationRequest {
             expected_provenance: [0; 32],
         });
+        assert!(validate_collection(request, &["cudaGraphSetConditional"]).is_ok());
         assert!(matches!(
-            validate_collection(request, true),
-            Err(MaterializeError::HasDeviceExterns)
+            validate_collection(request, &["cudaGraphSetConditional", "user_extern"]),
+            Err(MaterializeError::UnsupportedDeviceExtern { name }) if name == "user_extern"
         ));
-        assert!(validate_collection(None, true).is_ok());
+        assert!(validate_collection(None, &["user_extern"]).is_ok());
     }
 
     #[test]

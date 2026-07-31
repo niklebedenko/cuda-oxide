@@ -976,10 +976,12 @@ impl CodegenBackend for CudaCodegenBackend {
                     }
                 }
 
-                materialize::validate_collection(
-                    materialization_request,
-                    !collection_result.device_externs.is_empty(),
-                )
+                let device_extern_names = collection_result
+                    .device_externs
+                    .iter()
+                    .map(|declaration| declaration.export_name.as_str())
+                    .collect::<Vec<_>>();
+                materialize::validate_collection(materialization_request, &device_extern_names)
                 .unwrap_or_else(|error| {
                     tcx.dcx().fatal(format!(
                         "[rustc_codegen_cuda] Cannot materialize this device artifact: {error}"
