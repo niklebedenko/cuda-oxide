@@ -95,22 +95,27 @@ fn contiguous_direct_enum_upper_bound(enum_ty: &MirEnumType, width: u32) -> Opti
     Some(variant_count as u128)
 }
 
-/// Tell LLVM the finite validity range carried by a contiguous direct enum.
+/// Preserve the finite validity range carried by a contiguous direct enum.
 ///
 /// Reading an invalid Rust enum value is already undefined behaviour. Keeping
 /// that language fact explicit after the enum's aggregate carrier is unpacked
 /// lets LLVM discharge bounds checks driven by enums loaded from memory (for
 /// example, `#[repr(usize)] Axis` indexing `[T; 3]`).
-fn emit_contiguous_direct_enum_assume(
+///
+/// For a power-of-two variant count, also canonicalize the valid discriminant
+/// with its exact low-bit mask. The value is unchanged for every valid enum,
+/// while the known bits survive select/phi/cast chains more reliably than an
+/// assume alone and remove impossible exhaustive-match fallback blocks.
+fn preserve_contiguous_direct_enum_range(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     anchor: Ptr<Operation>,
     discriminant: Value,
     enum_ty: &MirEnumType,
     width: u32,
-) -> Result<()> {
+) -> Result<Value> {
     let Some(upper_bound) = contiguous_direct_enum_upper_bound(enum_ty, width) else {
-        return Ok(());
+        return Ok(discriminant);
     };
 
     let upper = emit_integer_constant(ctx, rewriter, width, upper_bound);
@@ -136,7 +141,15 @@ fn emit_contiguous_direct_enum_assume(
         vec![condition],
     );
     rewriter.insert_operation(ctx, call.get_operation());
-    Ok(())
+
+    if upper_bound.is_power_of_two() {
+        let mask = emit_integer_constant(ctx, rewriter, width, upper_bound - 1);
+        let canonical = llvm::AndOp::new(ctx, discriminant, mask).get_operation();
+        rewriter.insert_operation(ctx, canonical);
+        Ok(canonical.deref(ctx).get_result(0))
+    } else {
+        Ok(discriminant)
+    }
 }
 
 /// How the MIR-level field indices of an aggregate operand map onto the
@@ -2093,7 +2106,8 @@ pub(crate) fn convert_get_discriminant(
         }
     };
 
-    emit_contiguous_direct_enum_assume(ctx, rewriter, op, result, &enum_ty, logical_width)?;
+    let result =
+        preserve_contiguous_direct_enum_range(ctx, rewriter, op, result, &enum_ty, logical_width)?;
 
     rewriter.replace_operation_with_values(ctx, op, vec![result]);
 
@@ -2895,6 +2909,94 @@ mod tests {
             .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
             .count();
         assert_eq!(assume_declarations, 1);
+    }
+
+    #[test]
+    fn power_of_two_direct_enum_range_is_carried_by_known_low_bits() {
+        let mut ctx = make_ctx();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let tet_face_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "TetFace".into(),
+            u32_ty,
+            vec![0, 1, 2, 3],
+            vec![
+                EnumVariant::unit("LowX".into()),
+                EnumVariant::unit("LowY".into()),
+                EnumVariant::unit("LowZ".into()),
+                EnumVariant::unit("HighX".into()),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 4,
+                abi_align: 4,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1, 1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let sparse_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "Sparse".into(),
+            u32_ty,
+            vec![0, 3],
+            vec![
+                EnumVariant::unit("First".into()),
+                EnumVariant::unit("Last".into()),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 4,
+                abi_align: 4,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![tet_face_ty, sparse_ty], vec![u32_ty]);
+        let mut results = Vec::new();
+        for index in 0..2 {
+            let value = block.deref(&ctx).get_argument(index);
+            let get = Operation::new(
+                &mut ctx,
+                mir::MirGetDiscriminantOp::get_concrete_op_info(),
+                vec![u32_ty],
+                vec![value],
+                vec![],
+                0,
+            );
+            get.insert_at_back(block, &ctx);
+            results.push(get.deref(&ctx).get_result(0));
+        }
+        append_mir_return(&mut ctx, block, vec![results[0]]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(
+            count_ops::<llvm::AndOp>(&ctx, &body),
+            1,
+            "the four-variant contiguous enum must carry an exact low-bit range, while the sparse control must remain byte-faithful"
+        );
+        let assume_calls = find_all::<llvm::CallOp>(&ctx, &body)
+            .into_iter()
+            .filter(|call| {
+                matches!(
+                    call.callee(&ctx),
+                    CallOpCallable::Direct(callee) if callee.to_string() == "llvm_assume"
+                )
+            })
+            .count();
+        assert_eq!(
+            assume_calls, 1,
+            "only the contiguous enum has a finite validity range"
+        );
     }
 
     fn padded_struct_with_zst_ty(ctx: &mut Context) -> (TypeHandle, TypeHandle) {

@@ -50,31 +50,15 @@ fn propagate_loop_unroll_attr(ctx: &mut Context, source: Ptr<Operation>, target:
     }
 }
 
-/// Preserve a relational branch's true-edge fact across deferred inlining.
-///
-/// A successor with exactly one incoming edge is reached only when this
-/// comparison is true, so an assume at the start of that block is redundant.
-/// Keeping the fact explicit lets a later inliner relate caller-side loop
-/// bounds to checks inside a callback without changing control flow. For a
-/// valid Rust execution the imported relational condition is defined; any
-/// uninitialized or overflowing source that could make it poison is already
-/// undefined before this lowering step.
-fn emit_taken_relational_assume(
-    ctx: &mut Context,
-    source_block: Ptr<BasicBlock>,
-    true_block: Ptr<BasicBlock>,
-    condition: pliron::value::Value,
-) -> Result<()> {
-    if source_block == true_block || true_block.uses(ctx).len() != 1 {
-        return Ok(());
-    }
+/// Whether `condition` is a relational integer comparison worth preserving.
+fn is_relational_integer_condition(ctx: &Context, condition: pliron::value::Value) -> bool {
     let Some(defining_op) = condition.defining_op() else {
-        return Ok(());
+        return false;
     };
     let Some(compare) = Operation::get_op::<llvm::ICmpOp>(defining_op, ctx) else {
-        return Ok(());
+        return false;
     };
-    if !matches!(
+    matches!(
         compare.predicate(ctx),
         ICmpPredicateAttr::SLT
             | ICmpPredicateAttr::SLE
@@ -84,10 +68,15 @@ fn emit_taken_relational_assume(
             | ICmpPredicateAttr::ULE
             | ICmpPredicateAttr::UGT
             | ICmpPredicateAttr::UGE
-    ) {
-        return Ok(());
-    }
+    )
+}
 
+/// Insert `llvm.assume(condition)` at the start of `block`.
+fn insert_assume_at_front(
+    ctx: &mut Context,
+    block: Ptr<BasicBlock>,
+    condition: pliron::value::Value,
+) -> Result<()> {
     let void_ty = llvm_export::types::VoidType::get(ctx);
     let assume_ty = llvm_export::types::FuncType::get(
         ctx,
@@ -95,7 +84,7 @@ fn emit_taken_relational_assume(
         vec![condition.get_type(ctx)],
         false,
     );
-    crate::helpers::ensure_intrinsic_declared(ctx, true_block, "llvm_assume", assume_ty)
+    crate::helpers::ensure_intrinsic_declared(ctx, block, "llvm_assume", assume_ty)
         .map_err(|error| pliron::input_error_noloc!("{error}"))?;
     let assume_sym: pliron::identifier::Identifier = "llvm_assume".try_into().unwrap();
     llvm::CallOp::new(
@@ -105,8 +94,62 @@ fn emit_taken_relational_assume(
         vec![condition],
     )
     .get_operation()
-    .insert_at_front(true_block, ctx);
+    .insert_at_front(block, ctx);
     Ok(())
+}
+
+/// Preserve a relational branch's true-edge fact across deferred inlining.
+///
+/// A unique non-self successor can carry the fact directly at its start. When
+/// the target has another predecessor (including a loop preheader), split the
+/// true edge and put the assume in the forwarding block. The condition is then
+/// true on every path through the assume without incorrectly constraining the
+/// target's other incoming edges.
+///
+/// Keeping the fact explicit lets a later inliner relate caller-side loop
+/// bounds to checks inside a callback without changing observable control flow.
+/// For a valid Rust execution the imported relational condition is defined;
+/// any uninitialized or overflowing source that could make it poison is already
+/// undefined before this lowering step.
+fn preserve_taken_relational_edge(
+    ctx: &mut Context,
+    source_operation: Ptr<Operation>,
+    source_block: Ptr<BasicBlock>,
+    true_block: Ptr<BasicBlock>,
+    condition: pliron::value::Value,
+) -> Result<Ptr<BasicBlock>> {
+    if !is_relational_integer_condition(ctx, condition) {
+        return Ok(true_block);
+    }
+    if source_block != true_block && true_block.uses(ctx).len() == 1 {
+        insert_assume_at_front(ctx, true_block, condition)?;
+        return Ok(true_block);
+    }
+
+    let region = source_block
+        .deref(ctx)
+        .get_parent_region()
+        .ok_or_else(|| pliron::input_error_noloc!("CondBranch source has no parent region"))?;
+    let argument_types = true_block
+        .deref(ctx)
+        .arguments()
+        .map(|argument| argument.get_type(ctx))
+        .collect();
+    let edge_block = BasicBlock::new(ctx, None, argument_types);
+    edge_block.insert_at_back(region, ctx);
+    insert_assume_at_front(ctx, edge_block, condition)?;
+    let forwarded_arguments = edge_block.deref(ctx).arguments().collect();
+    let forwarding_branch = llvm::BrOp::new(ctx, true_block, forwarded_arguments);
+    // A deferred full-unroll marker lives on the original loop latch. After
+    // splitting a taken backedge, this forwarding branch is the new latch, so
+    // it must carry the same intent. The original conditional keeps the marker
+    // as well because lowering does not have dominance information to decide
+    // whether its other successor is a backedge of an enclosing loop.
+    propagate_loop_unroll_attr(ctx, source_operation, forwarding_branch.get_operation());
+    forwarding_branch
+        .get_operation()
+        .insert_at_back(edge_block, ctx);
+    Ok(edge_block)
 }
 
 /// Convert `mir.return` to `llvm.return`.
@@ -207,9 +250,9 @@ pub(crate) fn convert_cond_branch(
         .deref(ctx)
         .get_parent_block()
         .ok_or_else(|| pliron::input_error_noloc!("CondBranch has no parent block"))?;
-    emit_taken_relational_assume(ctx, source_block, true_block, cond)?;
+    let taken_block = preserve_taken_relational_edge(ctx, op, source_block, true_block, cond)?;
 
-    let llvm_br = llvm::CondBrOp::new(ctx, cond, true_block, true_args, false_block, false_args);
+    let llvm_br = llvm::CondBrOp::new(ctx, cond, taken_block, true_args, false_block, false_args);
     propagate_loop_unroll_attr(ctx, op, llvm_br.get_operation());
     rewriter.insert_operation(ctx, llvm_br.get_operation());
     rewriter.erase_operation(ctx, op);
@@ -353,6 +396,7 @@ mod tests {
     use dialect_mir::types::MirTupleType;
     use llvm_export::ops as llvm;
     use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::StringAttr;
     use pliron::builtin::op_interfaces::{
         BranchOpInterface, CallOpCallable, CallOpInterface, OperandSegmentInterface,
         SymbolOpInterface,
@@ -589,7 +633,6 @@ mod tests {
             false_block,
             vec![],
         );
-
         crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
 
         assert!(
@@ -615,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn relational_cond_branch_skips_a_true_block_with_multiple_predecessors() {
+    fn relational_cond_branch_splits_a_true_edge_with_multiple_predecessors() {
         let mut ctx = make_ctx();
         let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
         let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
@@ -644,21 +687,85 @@ mod tests {
             other_predecessor,
             vec![],
         );
+        let loop_key: pliron::identifier::Identifier =
+            dialect_mir::LOOP_UNROLL_FULL_ATTR.try_into().unwrap();
+        entry
+            .deref(&ctx)
+            .get_terminator(&ctx)
+            .expect("expected the source conditional")
+            .deref_mut(&ctx)
+            .attributes
+            .set(
+                loop_key.clone(),
+                StringAttr::new("critical_edge_loop".into()),
+            );
 
         crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
         assert!(!block_has_assume(&ctx, joined));
+        let body = kernel_blocks(&ctx, module_ptr);
+        let assume_blocks: Vec<_> = body
+            .iter()
+            .copied()
+            .filter(|block| block_has_assume(&ctx, *block))
+            .collect();
+        assert_eq!(
+            assume_blocks.len(),
+            1,
+            "the taken critical edge must have one forwarding assume block"
+        );
+        let edge_block = assume_blocks[0];
+        let forwarding_branch = edge_block
+            .deref(&ctx)
+            .iter(&ctx)
+            .find_map(|op| Operation::get_op::<llvm::BrOp>(op, &ctx))
+            .expect("the taken edge block must forward to the original target");
+        assert_eq!(
+            forwarding_branch
+                .get_operation()
+                .deref(&ctx)
+                .successors()
+                .collect::<Vec<_>>(),
+            vec![joined]
+        );
+        assert_eq!(
+            forwarding_branch
+                .get_operation()
+                .deref(&ctx)
+                .attributes
+                .get::<StringAttr>(&loop_key)
+                .map(|attribute| String::from(attribute.clone())),
+            Some("critical_edge_loop".to_string()),
+            "splitting a marked backedge must preserve deferred unroll intent"
+        );
+        let conditional = find_first::<llvm::CondBrOp>(&ctx, &body)
+            .expect("expected the lowered conditional branch");
+        assert_eq!(
+            conditional.get_operation().deref(&ctx).successors().next(),
+            Some(edge_block),
+            "the relational true edge must target the forwarding block"
+        );
     }
 
     #[test]
-    fn relational_cond_branch_skips_a_self_edge_without_entry_dominance() {
+    fn relational_cond_branch_splits_a_self_edge_without_assuming_at_entry() {
         let mut ctx = make_ctx();
         let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
         let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
-        let (module_ptr, entry) = build_kernel(&mut ctx, vec![], vec![]);
-        append_mir_return(&mut ctx, entry, vec![]);
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![u32_ty, u32_ty], vec![]);
         let self_block = append_block(&mut ctx, entry, vec![u32_ty, u32_ty]);
         let exit = append_block(&mut ctx, entry, vec![]);
         append_mir_return(&mut ctx, exit, vec![]);
+        let entry_lhs = entry.deref(&ctx).get_argument(0);
+        let entry_rhs = entry.deref(&ctx).get_argument(1);
+        let entry_branch = Operation::new(
+            &mut ctx,
+            mir::MirGotoOp::get_concrete_op_info(),
+            vec![],
+            vec![entry_lhs, entry_rhs],
+            vec![self_block],
+            0,
+        );
+        entry_branch.insert_at_back(entry, &ctx);
         let lhs = self_block.deref(&ctx).get_argument(0);
         let rhs = self_block.deref(&ctx).get_argument(1);
         let condition = append_mir_lt(&mut ctx, self_block, lhs, rhs, i1_ty);
@@ -673,13 +780,35 @@ mod tests {
         );
 
         crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module_ptr);
+        let loop_block = body
+            .iter()
+            .copied()
+            .find(|block| {
+                block
+                    .deref(&ctx)
+                    .iter(&ctx)
+                    .any(|op| Operation::get_op::<llvm::ICmpOp>(op, &ctx).is_some())
+            })
+            .expect("expected the block containing the loop comparison");
+        assert!(
+            !block_has_assume(&ctx, loop_block),
+            "the edge fact must not constrain the loop entry"
+        );
+        assert_eq!(
+            body.iter()
+                .filter(|block| block_has_assume(&ctx, **block))
+                .count(),
+            1,
+            "the self-edge must carry its fact in a forwarding block"
+        );
         let declarations = module_top_block(&ctx, module_ptr)
             .deref(&ctx)
             .iter(&ctx)
             .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
             .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
             .count();
-        assert_eq!(declarations, 0);
+        assert_eq!(declarations, 1);
     }
 
     #[test]
