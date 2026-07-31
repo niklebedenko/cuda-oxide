@@ -421,12 +421,13 @@ impl Finalizer {
 
     /// Consume ordered owner partitions with bounded compilation and link one cubin.
     ///
-    /// Up to four source/PTX pairs are resident while distinct libNVVM programs
-    /// compile in scoped workers. Each worker writes to a private indexed PTX
-    /// file and returns only bounded metadata. Validation, bundle construction,
-    /// ptxas assembly, and nvJitLink consumption remain deterministic and
-    /// phase-separated. `CUDA_OXIDE_NVVM_WORKERS=1..4` can lower the worker
-    /// ceiling for controlled validation.
+    /// Up to four distinct libNVVM programs compile in scoped workers. During
+    /// deferred-inline selection, one worker may temporarily retain its bounded
+    /// source, baseline PTX, promoted source, and promoted PTX. Each worker then
+    /// writes one private indexed PTX file and returns only bounded metadata.
+    /// Validation, bundle construction, ptxas assembly, and nvJitLink consumption
+    /// remain deterministic and phase-separated. `CUDA_OXIDE_NVVM_WORKERS=1..4`
+    /// can lower the worker ceiling for controlled validation.
     pub fn materialize_partition_files(
         &self,
         inputs: &[PartitionFileInput<'_>],

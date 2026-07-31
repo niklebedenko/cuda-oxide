@@ -220,7 +220,7 @@ impl NvvmCompileSession<'_> {
             maximum_output_bytes,
         ) {
             Ok(promoted) => promoted,
-            Err(error) => {
+            Err(error) if deferred_inline_can_use_baseline(&error) => {
                 if std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some() {
                     eprintln!(
                         "[cuda_artifact_finalizer] deferred inline: module={module_name} \
@@ -231,6 +231,7 @@ impl NvvmCompileSession<'_> {
                 }
                 return Ok(baseline);
             }
+            Err(error) => return Err(error),
         };
         let baseline_score = ptx_local_frame_score(&baseline);
         let promoted_score = ptx_local_frame_score(&promoted);
@@ -283,6 +284,13 @@ impl NvvmCompileSession<'_> {
     }
 }
 
+fn deferred_inline_can_use_baseline(error: &FinalizerError) -> bool {
+    matches!(
+        error,
+        FinalizerError::Nvvm(libnvvm_sys::NvvmError::CompiledResultTooLarge { .. })
+    )
+}
+
 #[derive(Clone, Copy)]
 enum NvvmOutputKind {
     Ltoir,
@@ -307,6 +315,97 @@ impl PtxLocalFrameScore {
             && self.deferred_calls <= baseline.deferred_calls
             && self < baseline
     }
+}
+
+fn ptx_call_operands(line: &str) -> Option<&str> {
+    let mut line = line.trim_start();
+    if line.starts_with('@') {
+        let predicate_end = line.find(char::is_whitespace)?;
+        line = line[predicate_end..].trim_start();
+    }
+    let opcode_end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let opcode = &line[..opcode_end];
+    if opcode != "call" && !opcode.starts_with("call.") {
+        return None;
+    }
+    Some(line[opcode_end..].trim_start())
+}
+
+fn after_parenthesized_prefix(value: &str) -> Option<&str> {
+    if !value.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0_usize;
+    for (offset, character) in value.char_indices() {
+        match character {
+            '(' => depth = depth.checked_add(1)?,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&value[offset + character.len_utf8()..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn ptx_call_target(statement: &str) -> Option<&str> {
+    let mut operands = ptx_call_operands(statement)?;
+    if operands.starts_with('(') {
+        operands = after_parenthesized_prefix(operands)?.trim_start();
+        operands = operands.strip_prefix(',')?.trim_start();
+    }
+    let target_end = operands
+        .find(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ',' | ';' | '(' | ')')
+        })
+        .unwrap_or(operands.len());
+    (target_end != 0).then_some(&operands[..target_end])
+}
+
+fn ptx_call_targets(ptx: &str) -> Option<Vec<String>> {
+    let mut targets = Vec::new();
+    let mut pending = None::<String>;
+    for raw_line in ptx.lines() {
+        let mut remaining = raw_line.split_once("//").map_or(raw_line, |(code, _)| code);
+        loop {
+            if let Some(statement) = pending.as_mut() {
+                if let Some((piece, tail)) = remaining.split_once(';') {
+                    statement.push(' ');
+                    statement.push_str(piece);
+                    targets.push(ptx_call_target(statement)?.to_string());
+                    pending = None;
+                    remaining = tail;
+                    continue;
+                }
+                statement.push(' ');
+                statement.push_str(remaining);
+                break;
+            }
+
+            let trimmed = remaining.trim_start();
+            if trimmed.is_empty() {
+                break;
+            }
+            if ptx_call_operands(trimmed).is_some() {
+                if let Some((statement, tail)) = trimmed.split_once(';') {
+                    targets.push(ptx_call_target(statement)?.to_string());
+                    remaining = tail;
+                    continue;
+                }
+                pending = Some(trimmed.to_string());
+                break;
+            }
+            if let Some((_, tail)) = trimmed.split_once(';') {
+                remaining = tail;
+                continue;
+            }
+            break;
+        }
+    }
+    pending.is_none().then_some(targets)
 }
 
 fn ptx_local_access_width(line: &str) -> Option<usize> {
@@ -367,13 +466,9 @@ fn ptx_local_frame_score(ptx: &[u8]) -> PtxLocalFrameScore {
         total_depot_bytes,
         local_access_bytes,
         local_accesses: local_accesses.len(),
-        deferred_calls: ptx
-            .lines()
-            .filter(|line| {
-                let line = line.trim_start();
-                line.starts_with("call") && line.contains("call.")
-            })
-            .count(),
+        deferred_calls: ptx_call_targets(ptx)
+            .map(|targets| targets.len())
+            .unwrap_or(usize::MAX),
         ptx_bytes: ptx.len(),
     }
 }
@@ -394,27 +489,15 @@ fn promote_surviving_inline_candidates(
         return None;
     }
 
-    let ptx_lines = ptx_text.lines().collect::<Vec<_>>();
     let mut targets = BTreeSet::new();
     let mut call_sites = 0_usize;
-    for (index, line) in ptx_lines.iter().enumerate() {
-        let line = line.trim_start();
-        if !line.starts_with("call") || !line.contains("call.") {
-            continue;
-        }
-        let end = (index + 4).min(ptx_lines.len());
-        let call = ptx_lines[index..end].join("\n");
-        let matching = candidates
-            .iter()
-            .filter(|candidate| call.contains(candidate.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !matching.is_empty() {
+    for target in ptx_call_targets(ptx_text)? {
+        if candidates.contains(&target) {
             call_sites = call_sites.checked_add(1)?;
             if call_sites > MAX_DEFERRED_INLINE_CALL_SITES {
                 return None;
             }
-            targets.extend(matching);
+            targets.insert(target);
         }
     }
     if targets.is_empty() || targets.len() > MAX_DEFERRED_INLINE_TARGETS {
@@ -700,6 +783,45 @@ define internal i32 @unmarked(i32 %value) inlinehint #0 {
     }
 
     #[test]
+    fn ptx_call_parser_handles_exact_multiline_predicated_and_adjacent_calls() {
+        let ptx = r#"
+call first, ();
+@%p1 call.uni (retval0),
+second,
+(
+param0
+);
+// call ignored, ();
+call.uni third, (); call fourth, ();
+"#;
+        assert_eq!(
+            ptx_call_targets(ptx).unwrap(),
+            ["first", "second", "third", "fourth"]
+        );
+    }
+
+    #[test]
+    fn deferred_inline_matches_complete_callee_symbols() {
+        let nvvm_ir = br#"; cuda-oxide-device-link-inline-candidate @foo
+define internal i32 @foo(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+; cuda-oxide-device-link-inline-candidate @foobar
+define internal i32 @foobar(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+"#;
+        let ptx = b"call.uni foobar, ();\n";
+        let (promoted, targets, call_sites) =
+            promote_surviving_inline_candidates(nvvm_ir, ptx).expect("foobar survives");
+        let promoted = std::str::from_utf8(&promoted).unwrap();
+        assert_eq!(targets, BTreeSet::from(["foobar".to_string()]));
+        assert_eq!(call_sites, 1);
+        assert!(promoted.contains("define internal i32 @foo(i32 %value) inlinehint #0"));
+        assert!(promoted.contains("define internal i32 @foobar(i32 %value) alwaysinline #0"));
+    }
+
+    #[test]
     fn local_frame_score_accepts_bounded_depot_reduction_before_call_count() {
         let smaller = br#"
 .local .align 8 .b8 __local_depot0[144];
@@ -784,6 +906,22 @@ define internal i32 @selected(i32 %value) inlinehint #0 {
         let ptx = "call.uni (retval0),\nselected,\n(\nparam0\n);\n"
             .repeat(MAX_DEFERRED_INLINE_CALL_SITES + 1);
         assert!(promote_surviving_inline_candidates(nvvm_ir, ptx.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn only_deterministic_output_caps_can_fall_back_to_baseline() {
+        let output_cap = FinalizerError::Nvvm(libnvvm_sys::NvvmError::CompiledResultTooLarge {
+            actual_bytes: 65,
+            maximum_bytes: 64,
+        });
+        assert!(deferred_inline_can_use_baseline(&output_cap));
+
+        let cancelled = FinalizerError::Nvvm(libnvvm_sys::NvvmError::Call {
+            operation: "nvvmCompileProgram",
+            code: 10,
+            log: None,
+        });
+        assert!(!deferred_inline_can_use_baseline(&cancelled));
     }
 
     #[test]

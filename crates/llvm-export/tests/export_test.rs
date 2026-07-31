@@ -2613,6 +2613,61 @@ fn export_device_link_alwaysinline_only_reaches_device_link_ir() {
 }
 
 #[test]
+fn export_deferred_inline_candidate_marks_only_device_link_ir() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+    let func = FuncOp::new(
+        &mut ctx,
+        "deferred_inline_helper".try_into().unwrap(),
+        func_ty,
+    );
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    for key in ["inlinehint", "device_link_inline_candidate"] {
+        let key: pliron::identifier::Identifier = key.try_into().unwrap();
+        func.get_operation()
+            .deref_mut(&ctx)
+            .attributes
+            .set(key, StringAttr::new("true".to_string()));
+    }
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let direct = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig)
+        .expect("direct PTX IR export succeeds");
+    assert!(
+        !direct.contains("cuda-oxide-device-link-inline-candidate"),
+        "direct PTX IR must ignore the NVVM-only marker:\n{direct}"
+    );
+
+    for linked in [
+        export_module_to_string_with_config(&ctx, &module, &PartitionedConfig(PtxExportConfig))
+            .expect("partitioned owner export succeeds"),
+        export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::default())
+            .expect("NVVM IR export succeeds"),
+    ] {
+        let mut lines = linked.lines();
+        let marker = lines
+            .find(|line| line.starts_with("; cuda-oxide-device-link-inline-candidate @"))
+            .expect("deferred-inline marker");
+        assert_eq!(
+            marker,
+            "; cuda-oxide-device-link-inline-candidate @deferred_inline_helper"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("define internal void @deferred_inline_helper() inlinehint #0 {"),
+            "the marker must identify the immediately following hinted definition:\n{linked}"
+        );
+    }
+}
+
+#[test]
 fn export_inlinehint_function_attribute_reaches_nvvm_ir() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
