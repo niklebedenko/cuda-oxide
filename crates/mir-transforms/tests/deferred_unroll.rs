@@ -22,7 +22,7 @@ fn selected_function_marks_only_its_loop_backedge() {
         .try_into()
         .unwrap();
     function
-        .deref_mut(&mut ctx)
+        .deref_mut(&ctx)
         .attributes
         .set(function_key, StringAttr::new("true".to_string()));
 
@@ -66,7 +66,7 @@ fn multi_latch_loop_reuses_one_stable_marker() {
         .try_into()
         .unwrap();
     function
-        .deref_mut(&mut ctx)
+        .deref_mut(&ctx)
         .attributes
         .set(function_key, StringAttr::new("true".to_string()));
 

@@ -11,7 +11,7 @@
 
 use crate::error::PipelineError;
 use crate::export::{
-    DeviceExternDecl, export_llvm_ir, module_uses_libdevice, render_llvm_ir,
+    DeviceExternDecl, LlvmExportOptions, export_llvm_ir, module_uses_libdevice, render_llvm_ir,
     resolve_nvvm_target_with_generated, unresolved_external_symbols,
     unresolved_libdevice_ptx_declarations, validate_nvvm_debug_support,
 };
@@ -408,10 +408,12 @@ pub fn compile_translated_module(
         module,
         request.device_externs,
         request.files.llvm_ir,
-        emit_nvvm_ir,
-        nvvm_dialect,
-        request.debug_kind,
-        request.partitioned_owner,
+        LlvmExportOptions {
+            emit_nvvm_ir,
+            nvvm_dialect,
+            debug_kind: request.debug_kind,
+            partitioned_owner: request.partitioned_owner,
+        },
     )?;
     if request.trace.verbose {
         request.trace.emit(format!(

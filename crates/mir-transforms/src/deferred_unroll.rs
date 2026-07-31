@@ -14,7 +14,7 @@ use pliron::graph::dominance::DomInfo;
 use pliron::identifier::Identifier;
 use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
-use pliron::pass_manager::AnalysisManager;
+use pliron::pass::AnalysisManager;
 use pliron::result::Result;
 
 /// Mark every back-edge in a function selected for deferred full unrolling.

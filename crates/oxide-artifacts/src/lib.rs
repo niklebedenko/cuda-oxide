@@ -520,8 +520,8 @@ pub fn build_artifact_blob(spec: &ArtifactBundleSpec<'_>) -> Result<Vec<u8>, Art
 
         let record = entry_record_start + index * ENTRY_RECORD_BYTES;
         write_u16(&mut out, record, entry.kind.to_u16());
-        let flags = u16::from(entry.metadata.is_some()) * ENTRY_FLAG_METADATA
-            | u16::from(entry.root_descriptor.is_some()) * ENTRY_FLAG_ROOT_DESCRIPTOR;
+        let flags = (u16::from(entry.metadata.is_some()) * ENTRY_FLAG_METADATA)
+            | (u16::from(entry.root_descriptor.is_some()) * ENTRY_FLAG_ROOT_DESCRIPTOR);
         write_u16(&mut out, record + 2, flags);
         write_u64(&mut out, record + 4, entry.metadata.unwrap_or(0));
         write_u32(&mut out, record + 12, symbol_offset);

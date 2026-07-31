@@ -203,6 +203,15 @@ pub fn validate_nvvm_debug_support(
 /// - Otherwise: Uses default `PtxExportConfig` for standard PTX generation
 ///
 /// Device extern declarations are emitted before the main module content.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct LlvmExportOptions {
+    pub emit_nvvm_ir: bool,
+    pub nvvm_dialect: Option<NvvmIrDialect>,
+    pub debug_kind: DebugKind,
+    pub partitioned_owner: bool,
+}
+
 // mir-importer pipeline plumbing; not part of the frontend contract.
 #[doc(hidden)]
 pub fn export_llvm_ir(
@@ -210,19 +219,16 @@ pub fn export_llvm_ir(
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
     path: &Path,
-    emit_nvvm_ir: bool,
-    nvvm_dialect: Option<NvvmIrDialect>,
-    debug_kind: DebugKind,
-    partitioned_owner: bool,
+    options: LlvmExportOptions,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let exported = render_exported_llvm_ir(
         ctx,
         module_op_ptr,
         device_externs,
-        emit_nvvm_ir,
-        nvvm_dialect,
-        debug_kind,
-        partitioned_owner,
+        options.emit_nvvm_ir,
+        options.nvvm_dialect,
+        options.debug_kind,
+        options.partitioned_owner,
     )?;
 
     std::fs::write(path, &exported.llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;

@@ -8549,6 +8549,7 @@ device-owner = { path = "../device-owner" }
             no_fmad: false,
             unchecked_indexing: false,
             materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
         };
         let fingerprint = |ctx: &Context, inherited_env: &BTreeMap<String, Vec<u8>>| {
             passthrough_codegen_fingerprint_with_env(

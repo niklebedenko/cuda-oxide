@@ -114,35 +114,6 @@ fn add_bound_to_generics(generics: &Generics, import: TokenStream) -> Generics {
     new_generics
 }
 
-#[cfg(test)]
-mod tests {
-    use super::add_bound_to_generics;
-    use quote::{ToTokens, quote};
-    use syn::{DeriveInput, parse_quote};
-
-    #[test]
-    fn device_copy_bounds_preserve_existing_bound_locations() {
-        let input: DeriveInput = parse_quote!(
-            struct Example<T: Copy, U, V>(T, U, V)
-            where
-                U: Send;
-        );
-        let bounded = add_bound_to_generics(&input.generics, quote!(::cuda_core::DeviceCopy));
-        let params = bounded.params.to_token_stream().to_string();
-        let where_clause = bounded
-            .where_clause
-            .expect("DeviceCopy bounds require a where clause")
-            .to_token_stream()
-            .to_string();
-
-        assert_eq!(params, "T : Copy + :: cuda_core :: DeviceCopy , U , V");
-        assert_eq!(
-            where_clause,
-            "where U : Send + :: cuda_core :: DeviceCopy , V : :: cuda_core :: DeviceCopy"
-        );
-    }
-}
-
 fn type_check_struct(s: &DataStruct) -> TokenStream {
     let checks = match s.fields {
         Fields::Named(ref named_fields) => {
@@ -205,4 +176,33 @@ fn check_fields(fields: &[&Field]) -> Vec<TokenStream> {
             quote! {assert_impl::<#field_type>();}
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_bound_to_generics;
+    use quote::{ToTokens, quote};
+    use syn::{DeriveInput, parse_quote};
+
+    #[test]
+    fn device_copy_bounds_preserve_existing_bound_locations() {
+        let input: DeriveInput = parse_quote!(
+            struct Example<T: Copy, U, V>(T, U, V)
+            where
+                U: Send;
+        );
+        let bounded = add_bound_to_generics(&input.generics, quote!(::cuda_core::DeviceCopy));
+        let params = bounded.params.to_token_stream().to_string();
+        let where_clause = bounded
+            .where_clause
+            .expect("DeviceCopy bounds require a where clause")
+            .to_token_stream()
+            .to_string();
+
+        assert_eq!(params, "T : Copy + :: cuda_core :: DeviceCopy , U , V");
+        assert_eq!(
+            where_clause,
+            "where U : Send + :: cuda_core :: DeviceCopy , V : :: cuda_core :: DeviceCopy"
+        );
+    }
 }

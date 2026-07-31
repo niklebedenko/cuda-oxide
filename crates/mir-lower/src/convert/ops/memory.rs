@@ -117,12 +117,12 @@ pub(crate) fn convert_store(
             rewriter,
             ptr,
             val,
-            op,
             &[],
             StorePredicate {
                 enabled: true_value,
                 false_value,
             },
+            value_abi_align(ctx, operands_info, val),
         )?;
         rewriter.erase_operation(ctx, op);
         return Ok(());
@@ -366,8 +366,14 @@ pub(crate) fn convert_load(
     if !mir_load.is_volatile(ctx)
         && matches!(small_array_pointer_candidate_count(ctx, ptr), Some(1..=64))
     {
-        let loaded =
-            load_through_small_array_pointer_selection(ctx, rewriter, ptr, llvm_ty, op, &[])?;
+        let loaded = load_through_small_array_pointer_selection(
+            ctx,
+            rewriter,
+            ptr,
+            llvm_ty,
+            &[],
+            mir_type_abi_align(ctx, result_ty),
+        )?;
         rewriter.replace_operation_with_values(ctx, op, vec![loaded]);
         return Ok(());
     }
@@ -442,8 +448,8 @@ fn load_through_small_array_pointer_selection(
     rewriter: &mut DialectConversionRewriter,
     ptr: pliron::value::Value,
     result_ty: TypeHandle,
-    mir_load: Ptr<Operation>,
     deferred_geps: &[DeferredGep],
+    abi_align: Option<u64>,
 ) -> Result<pliron::value::Value> {
     if let Some(defining_op) = ptr.defining_op() {
         if crate::convert::ops::aggregate::is_small_array_address_select(ctx, defining_op) {
@@ -455,16 +461,16 @@ fn load_through_small_array_pointer_selection(
                 rewriter,
                 true_ptr,
                 result_ty,
-                mir_load,
                 deferred_geps,
+                abi_align,
             )?;
             let false_value = load_through_small_array_pointer_selection(
                 ctx,
                 rewriter,
                 false_ptr,
                 result_ty,
-                mir_load,
                 deferred_geps,
+                abi_align,
             )?;
             let select = llvm::SelectOp::new(ctx, condition, true_value, false_value);
             rewriter.insert_operation(ctx, select.get_operation());
@@ -483,8 +489,8 @@ fn load_through_small_array_pointer_selection(
                     rewriter,
                     base,
                     result_ty,
-                    mir_load,
                     &nested_geps,
+                    abi_align,
                 );
             }
         }
@@ -502,7 +508,9 @@ fn load_through_small_array_pointer_selection(
         candidate_ptr = cloned.get_operation().deref(ctx).get_result(0);
     }
     let load = llvm::LoadOp::new(ctx, candidate_ptr, result_ty);
-    copy_alignment(ctx, mir_load, load.get_operation());
+    if let Some(align) = abi_align {
+        llvm_export::ops::set_op_alignment(ctx, load.get_operation(), align as u32);
+    }
     rewriter.insert_operation(ctx, load.get_operation());
     Ok(load.get_operation().deref(ctx).get_result(0))
 }
@@ -518,9 +526,9 @@ fn store_through_small_array_pointer_selection(
     rewriter: &mut DialectConversionRewriter,
     ptr: pliron::value::Value,
     value: pliron::value::Value,
-    mir_store: Ptr<Operation>,
     deferred_geps: &[DeferredGep],
     predicate: StorePredicate,
+    abi_align: Option<u64>,
 ) -> Result<()> {
     if let Some(defining_op) = ptr.defining_op() {
         if crate::convert::ops::aggregate::is_small_array_address_select(ctx, defining_op) {
@@ -543,24 +551,24 @@ fn store_through_small_array_pointer_selection(
                 rewriter,
                 true_ptr,
                 value,
-                mir_store,
                 deferred_geps,
                 StorePredicate {
                     enabled: true_enabled,
                     ..predicate
                 },
+                abi_align,
             )?;
             store_through_small_array_pointer_selection(
                 ctx,
                 rewriter,
                 false_ptr,
                 value,
-                mir_store,
                 deferred_geps,
                 StorePredicate {
                     enabled: false_enabled,
                     ..predicate
                 },
+                abi_align,
             )?;
             return Ok(());
         }
@@ -577,9 +585,9 @@ fn store_through_small_array_pointer_selection(
                     rewriter,
                     base,
                     value,
-                    mir_store,
                     &nested_geps,
                     predicate,
+                    abi_align,
                 );
             }
         }
@@ -599,7 +607,9 @@ fn store_through_small_array_pointer_selection(
 
     let value_ty = value.get_type(ctx);
     let old_value = llvm::LoadOp::new(ctx, candidate_ptr, value_ty);
-    copy_alignment(ctx, mir_store, old_value.get_operation());
+    if let Some(align) = abi_align {
+        llvm_export::ops::set_op_alignment(ctx, old_value.get_operation(), align as u32);
+    }
     rewriter.insert_operation(ctx, old_value.get_operation());
     let old_value = old_value.get_operation().deref(ctx).get_result(0);
 
@@ -608,7 +618,9 @@ fn store_through_small_array_pointer_selection(
     let selected = selected.get_operation().deref(ctx).get_result(0);
 
     let store = llvm::StoreOp::new(ctx, selected, candidate_ptr);
-    copy_alignment(ctx, mir_store, store.get_operation());
+    if let Some(align) = abi_align {
+        llvm_export::ops::set_op_alignment(ctx, store.get_operation(), align as u32);
+    }
     rewriter.insert_operation(ctx, store.get_operation());
     Ok(())
 }

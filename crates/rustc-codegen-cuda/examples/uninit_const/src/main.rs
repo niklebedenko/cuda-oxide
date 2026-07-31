@@ -17,6 +17,22 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct Scalar(f32);
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -36,6 +52,28 @@ mod kernels {
             // SAFETY: written just above.
             let v = unsafe { slot.assume_init() };
             *out_elem = v.0[0] + v.0[1] + v.0[2];
+        }
+    }
+
+    /// Exercises the dynamically dead uninhabited residual arms retained by
+    /// `core::array::from_fn` through its infallible `try_from_fn` machinery.
+    #[kernel]
+    pub fn from_fn_scalar(mut out: DisjointSlice<f32>) {
+        let tid = thread::index_1d();
+        let base = tid.get() as f32;
+        let values: [Scalar; 4] = core::array::from_fn(|lane| Scalar(base + lane as f32));
+        if let Some(out_elem) = out.get_mut(tid) {
+            *out_elem = values[0].0 + values[1].0 + values[2].0 + values[3].0;
+        }
+    }
+
+    /// Exercises bare array constants whose elements are fieldless enums.
+    #[kernel]
+    pub fn enum_array(mut out: DisjointSlice<f32>) {
+        let tid = thread::index_1d();
+        let raw_index = tid.get();
+        if let Some(out_elem) = out.get_mut(tid) {
+            *out_elem = Axis::ALL[raw_index % Axis::ALL.len()] as usize as f32;
         }
     }
 }
@@ -64,6 +102,28 @@ fn main() {
             failures += 1;
         }
     }
+
+    // SAFETY: the launch shape matches the output allocation.
+    unsafe { module.from_fn_scalar(stream.as_ref(), cfg, &mut out) }
+        .expect("launch from_fn_scalar");
+    for (tid, &value) in out.to_host_vec(&stream).unwrap().iter().enumerate() {
+        let expected = 4.0 * tid as f32 + 6.0;
+        if value != expected {
+            println!("FAIL from_fn tid={tid}: got {value} want {expected}");
+            failures += 1;
+        }
+    }
+
+    // SAFETY: the launch shape matches the output allocation.
+    unsafe { module.enum_array(stream.as_ref(), cfg, &mut out) }.expect("launch enum_array");
+    for (tid, &value) in out.to_host_vec(&stream).unwrap().iter().enumerate() {
+        let expected = (tid % Axis::ALL.len()) as f32;
+        if value != expected {
+            println!("FAIL enum_array tid={tid}: got {value} want {expected}");
+            failures += 1;
+        }
+    }
+
     if failures == 0 {
         println!("uninit_const: PASS ({N} threads)");
     } else {

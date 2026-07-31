@@ -520,8 +520,10 @@ mod tests {
     #[test]
     fn record_count_and_size_limits_are_enforced_before_payload_visit() {
         let bytes = bundle(&[("a.ptx", b"abcd"), ("b.ptx", b"efgh")]);
-        let mut count_limits = PtxBundleLimits::default();
-        count_limits.max_records = 1;
+        let count_limits = PtxBundleLimits {
+            max_records: 1,
+            ..PtxBundleLimits::default()
+        };
         assert_eq!(
             visit_ptx_bundle(Cursor::new(&bytes), count_limits, |_, _| Ok(())),
             Err(PtxBundleError::TooManyRecords {
@@ -530,8 +532,10 @@ mod tests {
             })
         );
 
-        let mut size_limits = PtxBundleLimits::default();
-        size_limits.max_record_ptx_bytes = 3;
+        let size_limits = PtxBundleLimits {
+            max_record_ptx_bytes: 3,
+            ..PtxBundleLimits::default()
+        };
         assert_eq!(
             visit_ptx_bundle(Cursor::new(bytes), size_limits, |_, _| Ok(())),
             Err(PtxBundleError::RecordTooLarge {

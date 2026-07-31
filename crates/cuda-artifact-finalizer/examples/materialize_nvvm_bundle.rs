@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let artifact = finalizer.materialize_nvvm_ir_with_ptx(
         module_name,
-        &nvvm_ir,
+        nvvm_ir,
         &FinalizationOptions::new(target),
     )?;
     let elapsed = started.elapsed();

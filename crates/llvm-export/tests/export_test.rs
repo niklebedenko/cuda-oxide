@@ -488,7 +488,7 @@ fn loop_latches_reuse_self_referential_full_unroll_metadata() {
     let first_latch = BrOp::new(&mut ctx, second_loop_block, vec![]);
     first_latch
         .get_operation()
-        .deref_mut(&mut ctx)
+        .deref_mut(&ctx)
         .attributes
         .set(key.clone(), StringAttr::new("loop_0".into()));
     first_latch
@@ -497,7 +497,7 @@ fn loop_latches_reuse_self_referential_full_unroll_metadata() {
     let second_latch = BrOp::new(&mut ctx, first_loop_block, vec![]);
     second_latch
         .get_operation()
-        .deref_mut(&mut ctx)
+        .deref_mut(&ctx)
         .attributes
         .set(key, StringAttr::new("loop_0".into()));
     second_latch

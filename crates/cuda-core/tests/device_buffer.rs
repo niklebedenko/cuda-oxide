@@ -421,3 +421,41 @@ fn uninitialized_async_cast_elem_implicit_drop_is_stream_ordered() {
     }
     stream.synchronize().expect("stream sync failed");
 }
+
+#[test]
+fn uninitialized_async_cast_chunks_implicit_drop_is_stream_ordered() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let n = 1 << 20; // 4 MiB of u32, exactly divisible into u64 chunks
+    let src = DeviceBuffer::<u32>::zeroed(&stream, n).expect("failed to allocate source buffer");
+    for _ in 0..64 {
+        let mut dst = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, n) }
+            .expect("failed to allocate uninitialized device buffer");
+        dst.copy_from_device_async(&src, &stream)
+            .expect("failed to enqueue device-to-device copy");
+        let dst = match dst.cast_chunks::<u64>() {
+            Ok(dst) => dst,
+            Err(_) => panic!("CUDA allocation should satisfy u64 chunk layout"),
+        };
+        drop(dst);
+    }
+    stream.synchronize().expect("stream sync failed");
+}
+
+#[test]
+fn device_buffer_safe_host_copy_synchronizes_before_returning() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let mut dev = DeviceBuffer::<u32>::zeroed(&stream, 4).expect("failed to allocate buffer");
+    let mut data = vec![1_u32, 2, 3, 4];
+    dev.copy_from_host(&stream, &data)
+        .expect("safe host copy should synchronize");
+
+    data.fill(0);
+    assert_eq!(
+        dev.to_host_vec(&stream).expect("failed to copy back"),
+        [1, 2, 3, 4]
+    );
+}

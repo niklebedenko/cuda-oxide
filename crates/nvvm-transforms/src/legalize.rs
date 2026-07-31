@@ -2017,9 +2017,9 @@ mod tests {
         address_space: u32,
         value_ty: TypeHandle,
         kind: AtomicRmwKindAttr,
-        ordering: AtomicOrderingAttr,
-        scope: Option<String>,
+        semantics: (AtomicOrderingAttr, Option<String>),
     ) -> llvm::FuncOp {
+        let (ordering, scope) = semantics;
         let ptr_ty: TypeHandle = PointerType::get(ctx, address_space).into();
         let (func, entry) = function(ctx, module, name, value_ty, vec![ptr_ty, value_ty]);
         let ptr = entry.deref(ctx).get_argument(0);
@@ -2441,8 +2441,7 @@ mod tests {
                 0,
                 value_ty,
                 kind,
-                AtomicOrderingAttr::Monotonic,
-                Some("device".to_string()),
+                (AtomicOrderingAttr::Monotonic, Some("device".to_string())),
             );
         }
 
@@ -2510,8 +2509,7 @@ mod tests {
                 address_space,
                 value_ty,
                 AtomicRmwKindAttr::Add,
-                ordering,
-                scope,
+                (ordering, scope),
             );
 
             let error = legalize_for_legacy_nvvm(&mut ctx, module.get_operation(), 86).unwrap_err();
@@ -2539,8 +2537,7 @@ mod tests {
             0,
             i32_ty,
             AtomicRmwKindAttr::Nand,
-            AtomicOrderingAttr::Monotonic,
-            Some("device".to_string()),
+            (AtomicOrderingAttr::Monotonic, Some("device".to_string())),
         );
 
         let error = legalize_for_legacy_nvvm(&mut ctx, module.get_operation(), 90).unwrap_err();
