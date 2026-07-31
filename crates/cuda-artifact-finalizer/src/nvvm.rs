@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::options::FinalizationOptions;
+use crate::options::{DebugPolicy, FinalizationOptions};
 use crate::provenance::{
     StableDigest, compiler_provenance_digest, digest_bytes, digest_file_handle, recipe_digest,
     with_revalidated_tool_identity,
@@ -202,12 +202,15 @@ impl NvvmCompileSession<'_> {
         // pass changes only marked inline-hint roots which remain real PTX
         // calls, then keeps that pass only when conservative frame, access,
         // call, and code-size measures do not regress.
-        let baseline = self.compile_nvvm_ir(
-            module_name,
-            nvvm_ir,
-            NvvmOutputKind::Ptx,
-            maximum_output_bytes,
-        )?;
+        let baseline = cleanup_compiled_ptx(
+            self.compile_nvvm_ir(
+                module_name,
+                nvvm_ir,
+                NvvmOutputKind::Ptx,
+                maximum_output_bytes,
+            )?,
+            self.options,
+        );
         let Some((promoted_ir, targets, call_sites)) =
             promote_surviving_inline_candidates(nvvm_ir, &baseline)
         else {
@@ -219,7 +222,7 @@ impl NvvmCompileSession<'_> {
             NvvmOutputKind::Ptx,
             maximum_output_bytes,
         ) {
-            Ok(promoted) => promoted,
+            Ok(promoted) => cleanup_compiled_ptx(promoted, self.options),
             Err(error) if deferred_inline_can_use_baseline(&error) => {
                 if std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some() {
                     eprintln!(
@@ -471,6 +474,294 @@ fn ptx_local_frame_score(ptx: &[u8]) -> PtxLocalFrameScore {
             .unwrap_or(usize::MAX),
         ptx_bytes: ptx.len(),
     }
+}
+
+/// Remove libNVVM local depots which are written but can never be read.
+///
+/// libNVVM occasionally materializes an aggregate return in a local depot even
+/// after every consumer has been scalarized. The resulting PTX contains a depot
+/// declaration, an address derived from `%SPL`, and only non-volatile
+/// `st.local` operations through that address. ptxas preserves those stores and
+/// charges the complete depot to the kernel stack.
+///
+/// This cleanup is deliberately narrower than general PTX dead-store
+/// elimination. It removes a depot only when its symbol and every derived
+/// address have no other uses in the enclosing function. Any load, volatile
+/// store, address escape, unfamiliar instruction, or ambiguous PTX shape keeps
+/// the original bytes unchanged.
+fn cleanup_compiled_ptx(ptx: Vec<u8>, options: &FinalizationOptions) -> Vec<u8> {
+    if options.debug_policy() != DebugPolicy::None {
+        return ptx;
+    }
+    eliminate_write_only_local_depots(ptx)
+}
+
+fn eliminate_write_only_local_depots(ptx: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&ptx) else {
+        return ptx;
+    };
+    if text.contains("/*") || text.contains("*/") {
+        return ptx;
+    }
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let mut remove = BTreeSet::new();
+    let mut function_start = None;
+    let mut brace_depth = 0_usize;
+
+    for (index, line) in lines.iter().enumerate() {
+        let code = code_before_comment(line);
+        let opens = code.bytes().filter(|&byte| byte == b'{').count();
+        let closes = code.bytes().filter(|&byte| byte == b'}').count();
+        if brace_depth == 0 && opens > closes {
+            function_start = Some(index);
+        }
+        let Some(next_depth) = brace_depth
+            .checked_add(opens)
+            .and_then(|depth| depth.checked_sub(closes))
+        else {
+            return ptx;
+        };
+        brace_depth = next_depth;
+        if brace_depth == 0
+            && let Some(start) = function_start.take()
+        {
+            mark_write_only_local_depots(&lines, start, index, &mut remove);
+        }
+    }
+    if brace_depth != 0 || function_start.is_some() {
+        return ptx;
+    }
+    if remove.is_empty() {
+        return ptx;
+    }
+
+    let mut cleaned = Vec::with_capacity(ptx.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if !remove.contains(&index) {
+            cleaned.extend_from_slice(line.as_bytes());
+        }
+    }
+    cleaned
+}
+
+fn mark_write_only_local_depots(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    remove: &mut BTreeSet<usize>,
+) {
+    if (start..=end).any(|index| {
+        let code = code_before_comment(lines[index]);
+        code.contains("/*")
+            || code.contains("*/")
+            || code.contains("ld.local")
+            || code.contains("atom.local")
+            || code.contains("red.local")
+    }) {
+        return;
+    }
+    let depot_declarations = (start..=end)
+        .filter_map(|index| {
+            local_depot_symbol(code_before_comment(lines[index])).map(|s| (index, s))
+        })
+        .collect::<Vec<_>>();
+    for (declaration, depot) in depot_declarations {
+        let depot_uses = token_use_lines(lines, start, end, depot);
+        if depot_uses.len() != 2 || !depot_uses.contains(&declaration) {
+            continue;
+        }
+        let Some(&initializer) = depot_uses.iter().find(|&&index| index != declaration) else {
+            continue;
+        };
+        let Some(stack_pointer) =
+            initialized_register_from_symbol(code_before_comment(lines[initializer]), depot)
+        else {
+            continue;
+        };
+
+        let stack_uses = token_use_lines(lines, start, end, stack_pointer);
+        let stack_declaration = stack_uses.iter().copied().find(|&index| {
+            is_scalar_register_declaration(code_before_comment(lines[index]), stack_pointer)
+        });
+        let Some(stack_declaration) = stack_declaration else {
+            continue;
+        };
+        let mut aliases = Vec::new();
+        let mut candidate_lines = BTreeSet::from([declaration, initializer, stack_declaration]);
+        let mut recognized_stack_uses = true;
+        for index in stack_uses {
+            if candidate_lines.contains(&index) {
+                continue;
+            }
+            let Some(alias) = local_address_alias(code_before_comment(lines[index]), stack_pointer)
+            else {
+                recognized_stack_uses = false;
+                break;
+            };
+            aliases.push(alias);
+            candidate_lines.insert(index);
+        }
+        if !recognized_stack_uses || aliases.is_empty() {
+            continue;
+        }
+
+        let mut stores = 0_usize;
+        for alias in aliases {
+            let uses = token_use_lines(lines, start, end, alias);
+            let mut alias_has_store = false;
+            for index in uses {
+                if candidate_lines.contains(&index) {
+                    continue;
+                }
+                let code = code_before_comment(lines[index]);
+                if is_nonvolatile_local_store_through(code, alias) {
+                    candidate_lines.insert(index);
+                    alias_has_store = true;
+                    stores = stores.saturating_add(1);
+                } else {
+                    recognized_stack_uses = false;
+                    break;
+                }
+            }
+            if !recognized_stack_uses || !alias_has_store {
+                recognized_stack_uses = false;
+                break;
+            }
+        }
+        if !recognized_stack_uses || stores == 0 {
+            continue;
+        }
+
+        // libNVVM emits `%SP` alongside `%SPL` even when it has no uses. Drop
+        // that declaration too, but only when the token appears nowhere else.
+        if let Some(sp_declaration) = (start..=end).find(|&index| {
+            is_scalar_register_declaration(code_before_comment(lines[index]), "%SP")
+                && token_use_lines(lines, start, end, "%SP") == [index]
+        }) {
+            candidate_lines.insert(sp_declaration);
+        }
+        remove.extend(candidate_lines);
+    }
+}
+
+fn code_before_comment(line: &str) -> &str {
+    line.split_once("//").map_or(line, |(code, _)| code)
+}
+
+fn local_depot_symbol(line: &str) -> Option<&str> {
+    if !line.contains(".local") {
+        return None;
+    }
+    let start = line.find("__local_depot")?;
+    let tail = &line[start..];
+    let end = tail.find('[')?;
+    let symbol = &tail[..end];
+    (!symbol.is_empty() && symbol.bytes().all(is_ptx_identifier_byte)).then_some(symbol)
+}
+
+fn initialized_register_from_symbol<'a>(line: &'a str, symbol: &str) -> Option<&'a str> {
+    let line = line.trim();
+    let operands = line
+        .strip_prefix("mov.u64")
+        .or_else(|| line.strip_prefix("mov.b64"))?
+        .trim();
+    let (destination, source) = operands.split_once(',')?;
+    (source.trim().trim_end_matches(';') == symbol)
+        .then_some(destination.trim())
+        .filter(|register| register.starts_with('%'))
+}
+
+fn local_address_alias<'a>(line: &'a str, stack_pointer: &str) -> Option<&'a str> {
+    let line = line.trim();
+    let operands = line
+        .strip_prefix("add.u64")
+        .or_else(|| line.strip_prefix("add.s64"))?
+        .trim();
+    let mut operands = operands.split(',').map(str::trim);
+    let destination = operands.next()?;
+    let base = operands.next()?;
+    let offset = operands.next()?.trim_end_matches(';');
+    (operands.next().is_none()
+        && destination.starts_with('%')
+        && base == stack_pointer
+        && offset.parse::<i64>().is_ok())
+    .then_some(destination)
+}
+
+fn is_nonvolatile_local_store_through(line: &str, address: &str) -> bool {
+    let line = line.trim_start();
+    let instruction = if line.starts_with('@') {
+        let Some((_, instruction)) = line.split_once(char::is_whitespace) else {
+            return false;
+        };
+        instruction.trim_start()
+    } else {
+        line
+    };
+    let opcode = instruction
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default();
+    let Some((statement, tail)) = instruction.split_once(';') else {
+        return false;
+    };
+    opcode.starts_with("st.local")
+        && !opcode.split('.').any(|part| part == "volatile")
+        && tail.trim().is_empty()
+        && statement
+            .split_once('[')
+            .and_then(|(_, address_operand)| address_operand.split_once(']'))
+            .is_some_and(|(address_operand, _)| is_register_plus_constant(address_operand, address))
+}
+
+fn is_register_plus_constant(operand: &str, register: &str) -> bool {
+    let operand = operand
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let Ok(operand) = std::str::from_utf8(&operand) else {
+        return false;
+    };
+    let Some(offset) = operand.strip_prefix(register) else {
+        return false;
+    };
+    offset.is_empty()
+        || offset
+            .strip_prefix('+')
+            .or_else(|| offset.strip_prefix('-'))
+            .is_some_and(|magnitude| {
+                !magnitude.is_empty() && magnitude.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
+fn is_scalar_register_declaration(line: &str, register: &str) -> bool {
+    let line = line.trim();
+    line.starts_with(".reg ")
+        && line.ends_with(';')
+        && token_present(line, register)
+        && line
+            .split_ascii_whitespace()
+            .last()
+            .is_some_and(|declared| declared.trim_end_matches(';') == register)
+}
+
+fn token_use_lines(lines: &[&str], start: usize, end: usize, token: &str) -> Vec<usize> {
+    (start..=end)
+        .filter(|&index| token_present(code_before_comment(lines[index]), token))
+        .collect()
+}
+
+fn token_present(line: &str, token: &str) -> bool {
+    line.match_indices(token).any(|(start, _)| {
+        let before = line.as_bytes().get(start.wrapping_sub(1)).copied();
+        let after = line.as_bytes().get(start + token.len()).copied();
+        before.is_none_or(|byte| !is_ptx_identifier_byte(byte))
+            && after.is_none_or(|byte| !is_ptx_identifier_byte(byte))
+    })
+}
+
+fn is_ptx_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'%')
 }
 
 fn promote_surviving_inline_candidates(
@@ -894,6 +1185,166 @@ selected,
             ptx_local_access_width("@%p1 ld.local.volatile.v2.f64 {%fd1, %fd2}, [%rd1];"),
             Some(16)
         );
+    }
+
+    #[test]
+    fn write_only_local_depot_is_eliminated_without_touching_other_stack_ops() {
+        let ptx = br#".visible .entry kernel()
+{
+    .local .align 8 .b8 __local_depot0[144];
+    .reg .b64 %SP;
+    .reg .b64 %SPL;
+    .reg .b64 %rd<4>;
+    mov.u64 %SPL, __local_depot0;
+    stacksave.u32 %r1;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    st.local.f64 [%rd1+8], %fd2;
+    stackrestore.u32 %r1;
+    ret;
+}
+"#
+        .to_vec();
+        let cleaned = String::from_utf8(eliminate_write_only_local_depots(ptx)).unwrap();
+        assert!(!cleaned.contains("__local_depot0"));
+        assert!(!token_present(&cleaned, "%SP"));
+        assert!(!token_present(&cleaned, "%SPL"));
+        assert!(!cleaned.contains("st.local"));
+        assert!(cleaned.contains(".reg .b64 %rd<4>;"));
+        assert!(cleaned.contains("stacksave.u32 %r1;"));
+        assert!(cleaned.contains("stackrestore.u32 %r1;"));
+    }
+
+    #[test]
+    fn local_depot_with_load_escape_or_volatile_store_is_preserved() {
+        for extra_use in [
+            "ld.local.f64 %fd2, [%rd1];",
+            "mov.u64 %rd2, %rd1;",
+            "st.local.volatile.f64 [%rd1], %fd2;",
+            "st.local.f64 [%rd1+%rd2], %fd2;",
+            "st.local.f64 [%rd1], %fd2; mov.u64 %rd2, %rd1;",
+            "/* an unparsed PTX block comment */",
+        ] {
+            let ptx = format!(
+                ".visible .entry kernel()\\n{{\\n\
+                 .local .align 8 .b8 __local_depot0[8];\\n\
+                 .reg .b64 %SPL;\\n\
+                 mov.u64 %SPL, __local_depot0;\\n\
+                 add.u64 %rd1, %SPL, 0;\\n\
+                 st.local.f64 [%rd1], %fd1;\\n\
+                 {extra_use}\\n\
+                 ret;\\n}}\\n"
+            )
+            .into_bytes();
+            assert_eq!(
+                eliminate_write_only_local_depots(ptx.clone()),
+                ptx,
+                "must preserve depot with use `{extra_use}`"
+            );
+        }
+    }
+
+    #[test]
+    fn full_debug_preserves_write_only_local_depot() {
+        let ptx = br#".visible .entry kernel()
+{
+    .local .align 8 .b8 __local_depot0[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot0;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    ret;
+}
+"#
+        .to_vec();
+        let target = "sm_86".parse().unwrap();
+        let options =
+            FinalizationOptions::new(target).with_debug_policy(crate::options::DebugPolicy::Full);
+        assert_eq!(cleanup_compiled_ptx(ptx.clone(), &options), ptx);
+    }
+
+    #[test]
+    fn local_depot_cleanup_is_scoped_per_ptx_function() {
+        let ptx = br#".visible .entry write_only()
+{
+    .local .align 8 .b8 __local_depot0[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot0;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    ret;
+}
+.visible .entry read_back()
+{
+    .local .align 8 .b8 __local_depot1[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot1;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    ld.local.f64 %fd2, [%rd1];
+    ret;
+}
+"#
+        .to_vec();
+        let cleaned = String::from_utf8(eliminate_write_only_local_depots(ptx)).unwrap();
+        assert!(!cleaned.contains("__local_depot0"));
+        assert!(cleaned.contains("__local_depot1"));
+        assert_eq!(cleaned.matches("st.local.f64").count(), 1);
+        assert_eq!(cleaned.matches("ld.local.f64").count(), 1);
+    }
+
+    #[test]
+    fn nested_ptx_scope_cannot_hide_a_later_local_load() {
+        let ptx = br#".visible .entry nested_scope()
+{
+    .local .align 8 .b8 __local_depot0[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot0;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    {
+        mov.f64 %fd1, 0d0000000000000000;
+    }
+    ld.local.f64 %fd2, [%rd1];
+    ret;
+}
+"#
+        .to_vec();
+        assert_eq!(eliminate_write_only_local_depots(ptx.clone()), ptx);
+    }
+
+    #[test]
+    fn predicated_ptx_scope_cannot_hide_a_later_local_load() {
+        let ptx = br#".visible .entry predicated_scope()
+{
+    .local .align 8 .b8 __local_depot0[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot0;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+    @%p1 {
+        mov.f64 %fd1, 0d0000000000000000;
+    }
+    ld.local.f64 %fd2, [%rd1];
+    ret;
+}
+"#
+        .to_vec();
+        assert_eq!(eliminate_write_only_local_depots(ptx.clone()), ptx);
+    }
+
+    #[test]
+    fn unterminated_ptx_function_is_preserved() {
+        let ptx = br#".visible .entry unterminated()
+{
+    .local .align 8 .b8 __local_depot0[8];
+    .reg .b64 %SPL;
+    mov.u64 %SPL, __local_depot0;
+    add.u64 %rd1, %SPL, 0;
+    st.local.f64 [%rd1], %fd1;
+"#
+        .to_vec();
+        assert_eq!(eliminate_write_only_local_depots(ptx.clone()), ptx);
     }
 
     #[test]
