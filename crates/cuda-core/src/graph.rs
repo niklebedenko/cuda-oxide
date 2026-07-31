@@ -347,9 +347,7 @@ impl CudaGraph {
         .result()?;
         let conditional_handle = unsafe { conditional_handle.assume_init() };
 
-        let mut body_graph = std::ptr::null_mut();
-        let mut params =
-            conditional_while_node_params(conditional_handle, self.ctx.cu_ctx(), &mut body_graph);
+        let mut params = conditional_while_node_params(conditional_handle, self.ctx.cu_ctx());
         let mut cu_node = MaybeUninit::uninit();
         let dependency_ptr = if dependencies.is_empty() {
             std::ptr::null()
@@ -366,6 +364,9 @@ impl CudaGraph {
             )
         }
         .result()?;
+        // SAFETY: successful node creation populates `phGraph_out` with a
+        // CUDA-owned array containing exactly `size` graph handles.
+        let body_graph = unsafe { conditional_body_graph(&params)? };
 
         Ok(CudaGraphWhileNode {
             cu_node: unsafe { cu_node.assume_init() },
@@ -397,7 +398,6 @@ impl CudaGraph {
 fn conditional_while_node_params(
     handle: cuda_bindings::CUgraphConditionalHandle,
     ctx: cuda_bindings::CUcontext,
-    body_graph: &mut cuda_bindings::CUgraph,
 ) -> cuda_bindings::CUgraphNodeParams {
     // CUDA requires every reserved byte and every byte after the selected
     // union member to be zero. Initialize the complete tagged union before
@@ -409,10 +409,31 @@ fn conditional_while_node_params(
         handle,
         type_: cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_WHILE,
         size: 1,
-        phGraph_out: body_graph,
+        phGraph_out: std::ptr::null_mut(),
         ctx,
     };
     params
+}
+
+unsafe fn conditional_body_graph(
+    params: &cuda_bindings::CUgraphNodeParams,
+) -> Result<cuda_bindings::CUgraph, DriverError> {
+    // SAFETY: callers only inspect the active conditional union member.
+    let bodies = unsafe { params.__bindgen_anon_1.conditional.phGraph_out };
+    if bodies.is_null() {
+        return Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+        ));
+    }
+    // SAFETY: a successful WHILE-node creation returns one CUDA-owned entry.
+    let body = unsafe { *bodies };
+    if body.is_null() {
+        Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+        ))
+    } else {
+        Ok(body)
+    }
 }
 
 fn validate_captured_body_graph(
@@ -497,9 +518,7 @@ mod tests {
     fn while_node_params_select_one_body_and_zero_reserved_storage() {
         let handle = 0x0123_4567_89ab_cdef;
         let ctx = 0x1357usize as cuda_bindings::CUcontext;
-        let mut body_graph = std::ptr::null_mut();
-        let body_graph_out = std::ptr::addr_of_mut!(body_graph);
-        let params = conditional_while_node_params(handle, ctx, &mut body_graph);
+        let mut params = conditional_while_node_params(handle, ctx);
 
         assert_eq!(
             params.type_,
@@ -515,8 +534,15 @@ mod tests {
             cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_WHILE
         );
         assert_eq!(conditional.size, 1);
-        assert_eq!(conditional.phGraph_out, body_graph_out);
+        assert!(conditional.phGraph_out.is_null());
         assert_eq!(conditional.ctx, ctx);
+
+        let body_graph = 0x2468usize as cuda_bindings::CUgraph;
+        let mut bodies = [body_graph];
+        params.__bindgen_anon_1.conditional.phGraph_out = bodies.as_mut_ptr();
+        // SAFETY: this test models the one-entry array CUDA returns after
+        // successful WHILE-node creation.
+        assert_eq!(unsafe { conditional_body_graph(&params) }, Ok(body_graph));
 
         let storage = unsafe { params.__bindgen_anon_1.reserved1 };
         let used_words = std::mem::size_of::<cuda_bindings::CUDA_CONDITIONAL_NODE_PARAMS>()
