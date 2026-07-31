@@ -1616,6 +1616,13 @@ run_cargo() {
             CARGO_EC=1
         fi
     fi
+    if [[ ${CARGO_EC} -eq 0 && "${ex}" == "unchecked_add_array_index" ]]; then
+        local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
+        if ! "${shape_check}" >>"${log}" 2>&1; then
+            printf 'unchecked_add_array_index failed its no-wrap or bounds-control PTX assertions\n' >>"${log}"
+            CARGO_EC=1
+        fi
+    fi
     if [[ ${CARGO_EC} -eq 0 && ${COMPILE_ONLY} -eq 1 && "${ex}" == "warp_reduce" ]]; then
         local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
         if ! "${shape_check}" >>"${log}" 2>&1; then

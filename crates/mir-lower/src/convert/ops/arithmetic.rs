@@ -113,6 +113,16 @@ fn is_signed_int_op(
     }
 }
 
+fn integer_overflow_flags(signed: bool, no_wrap: bool) -> IntegerOverflowFlagsAttr {
+    if !no_wrap {
+        return IntegerOverflowFlagsAttr::default();
+    }
+    IntegerOverflowFlagsAttr {
+        nsw: signed,
+        nuw: !signed,
+    }
+}
+
 /// Add the configured fast-math flags to a floating-point operation.
 ///
 /// By default this sets ONLY `contract`, which lets the NVPTX backend fuse an
@@ -140,13 +150,14 @@ fn add_fastmath_flags(ctx: &mut Context, op: Ptr<Operation>) {
 
 /// Convert `mir.add` to `llvm.add` (integer) or `llvm.fadd` (float).
 ///
-/// Integer additions use default overflow flags (no wrapping behavior).
+/// Ordinary integer additions use empty overflow flags. Additions translated
+/// from Rust MIR `AddUnchecked` carry the type-appropriate no-wrap flag.
 /// Float additions include fastmath flags for potential optimizations.
 pub(crate) fn convert_add(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
 
@@ -155,7 +166,10 @@ pub(crate) fn convert_add(
         add_fastmath_flags(ctx, fadd.get_operation());
         fadd.get_operation()
     } else {
-        let flags = IntegerOverflowFlagsAttr::default();
+        let flags = integer_overflow_flags(
+            is_signed_int_op(ctx, op, operands_info)?,
+            dialect_mir::ops::MirAddOp::from_operation(op).no_wrap(ctx),
+        );
         llvm::AddOp::new_with_overflow_flag(ctx, lhs, rhs, flags).get_operation()
     };
 
@@ -821,9 +835,61 @@ mod tests {
     use crate::convert::ops::test_util::*;
     use dialect_mir::ops as mir;
     use llvm_export::attributes::FastmathFlags;
-    use llvm_export::op_interfaces::FastMathFlags as FastMathFlagsTrait;
+    use llvm_export::op_interfaces::{
+        FastMathFlags as FastMathFlagsTrait, IntBinArithOpWithOverflowFlag,
+    };
     use llvm_export::ops as llvm;
+    use pliron::builtin::types::{IntegerType, Signedness};
     use pliron::r#type::TypeHandle;
+
+    fn lower_integer_add_flags(signedness: Signedness, no_wrap: bool) -> IntegerOverflowFlagsAttr {
+        let mut ctx = make_ctx();
+        let int_ty: TypeHandle = IntegerType::get(&ctx, 64, signedness).into();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![int_ty, int_ty], vec![]);
+        let lhs = block.deref(&ctx).get_argument(0);
+        let rhs = block.deref(&ctx).get_argument(1);
+        let add_op = Operation::new(
+            &mut ctx,
+            mir::MirAddOp::get_concrete_op_info(),
+            vec![int_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        mir::MirAddOp::from_operation(add_op).set_no_wrap(&mut ctx, no_wrap);
+        add_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        find_first::<llvm::AddOp>(&ctx, &body)
+            .expect("expected one llvm.add")
+            .integer_overflow_flag(&ctx)
+    }
+
+    #[test]
+    fn unchecked_integer_add_preserves_type_appropriate_no_wrap_flag() {
+        assert_eq!(
+            lower_integer_add_flags(Signedness::Unsigned, true),
+            IntegerOverflowFlagsAttr {
+                nsw: false,
+                nuw: true,
+            }
+        );
+        assert_eq!(
+            lower_integer_add_flags(Signedness::Signed, true),
+            IntegerOverflowFlagsAttr {
+                nsw: true,
+                nuw: false,
+            }
+        );
+        assert_eq!(
+            lower_integer_add_flags(Signedness::Unsigned, false),
+            IntegerOverflowFlagsAttr::default(),
+            "ordinary Rust integer addition must retain wrapping semantics"
+        );
+    }
 
     /// A float `mir.mul` lowers to `llvm.fmul` carrying exactly the `contract`
     /// fast-math flag: enough for the NVPTX backend to fuse a feeding multiply

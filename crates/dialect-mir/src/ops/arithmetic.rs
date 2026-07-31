@@ -9,11 +9,13 @@
 
 use pliron::{
     builtin::{
+        attributes::BoolAttr,
         op_interfaces::{NOpdsInterface, NResultsInterface, OneOpdInterface, OneResultInterface},
         types::IntegerType,
     },
     common_traits::Verify,
     context::{Context, Ptr},
+    identifier::Identifier,
     location::Located,
     op::Op,
     operation::Operation,
@@ -24,6 +26,26 @@ use pliron::{
 use pliron_derive::pliron_op;
 
 use crate::types::MirTupleType;
+
+const INTEGER_NO_WRAP_KEY: &str = "mir_integer_no_wrap";
+
+fn set_integer_no_wrap(ctx: &mut Context, op: Ptr<Operation>, no_wrap: bool) {
+    let key = Identifier::try_new(INTEGER_NO_WRAP_KEY.to_string())
+        .expect("valid integer no-wrap attribute key");
+    op.deref_mut(ctx)
+        .attributes
+        .set(key, BoolAttr::new(no_wrap));
+}
+
+fn integer_no_wrap(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let key = Identifier::try_new(INTEGER_NO_WRAP_KEY.to_string())
+        .expect("valid integer no-wrap attribute key");
+    op.deref(ctx)
+        .attributes
+        .get::<BoolAttr>(&key)
+        .map(|attr| bool::from(attr.clone()))
+        .unwrap_or(false)
+}
 
 // ============================================================================
 // Binary Arithmetic Operations
@@ -43,6 +65,24 @@ use crate::types::MirTupleType;
     interfaces = [NOpdsInterface<2>, NResultsInterface<1>, OneResultInterface]
 )]
 pub struct MirAddOp;
+
+impl MirAddOp {
+    /// Wrap an existing `mir.add` operation.
+    pub fn from_operation(op: Ptr<Operation>) -> Self {
+        Self { op }
+    }
+
+    /// Preserve the no-overflow precondition carried by Rust MIR's
+    /// `AddUnchecked` operation.
+    pub fn set_no_wrap(&self, ctx: &mut Context, no_wrap: bool) {
+        set_integer_no_wrap(ctx, self.get_operation(), no_wrap);
+    }
+
+    /// Return whether this integer addition is undefined on overflow.
+    pub fn no_wrap(&self, ctx: &Context) -> bool {
+        integer_no_wrap(ctx, self.get_operation())
+    }
+}
 
 impl Verify for MirAddOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {

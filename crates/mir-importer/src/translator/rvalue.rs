@@ -411,8 +411,9 @@ pub fn translate_rvalue(
             // Determine result type and operation
             // Comparison operations return bool (i1), arithmetic ops return operand type
             let (op_id, result_type) = match bin_op {
-                // Arithmetic operations - return same type as operands
-                // Unchecked variants are identical - overflow check is elided at MIR level
+                // Arithmetic operations return the same type as their operands.
+                // `AddUnchecked` additionally promises that overflow cannot
+                // occur; that fact is attached below for LLVM range analysis.
                 mir::BinOp::Add | mir::BinOp::AddUnchecked => {
                     (MirAddOp::get_concrete_op_info(), left_val.get_type(ctx))
                 }
@@ -512,6 +513,10 @@ pub fn translate_rvalue(
                 0,
             );
             op.deref_mut(ctx).set_loc(loc);
+            match bin_op {
+                mir::BinOp::AddUnchecked => MirAddOp::from_operation(op).set_no_wrap(ctx, true),
+                _ => {}
+            }
 
             let result = op.deref(ctx).get_result(0);
 

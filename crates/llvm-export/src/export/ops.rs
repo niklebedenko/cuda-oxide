@@ -27,9 +27,9 @@ use pliron::{
 use crate::{
     attributes::{
         AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, FastmathFlags,
-        FastmathFlagsAttr, GepIndexAttr, ICmpPredicateAttr,
+        FastmathFlagsAttr, GepIndexAttr, ICmpPredicateAttr, IntegerOverflowFlagsAttr,
     },
-    op_interfaces::{ATTR_KEY_FAST_MATH_FLAGS, PointerTypeResult},
+    op_interfaces::{ATTR_KEY_FAST_MATH_FLAGS, ATTR_KEY_INTEGER_OVERFLOW_FLAGS, PointerTypeResult},
     ops,
     types::{ArrayType, FuncType, HalfType, PointerType, VoidType},
 };
@@ -1809,11 +1809,13 @@ impl<'a> ModuleExportState<'a> {
         let rhs = op_ref.get_operand(1);
         let res_name = value_names.get(&res).unwrap();
 
-        // Float binops (fadd/fsub/fmul/fdiv/frem) may carry fast-math flags;
-        // they are emitted right after the opcode (e.g. `fadd fast float ...`).
-        // Integer binops never carry the attribute, and float ops lowered from
-        // ordinary Rust arithmetic carry empty flags, so this is a no-op for
-        // every existing op and only fires for the `f*_fast` intrinsics.
+        // Integer no-wrap and floating-point fast-math flags appear directly
+        // after the opcode in textual LLVM IR.
+        let integer_overflow = op_ref
+            .attributes
+            .get::<IntegerOverflowFlagsAttr>(&ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
+            .cloned()
+            .unwrap_or_default();
         let fast_math = op_ref
             .attributes
             .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
@@ -1821,6 +1823,12 @@ impl<'a> ModuleExportState<'a> {
             .unwrap_or_else(FastmathFlags::empty);
 
         write!(output, "  {res_name} = {op_name} ").unwrap();
+        if integer_overflow.nuw {
+            write!(output, "nuw ").unwrap();
+        }
+        if integer_overflow.nsw {
+            write!(output, "nsw ").unwrap();
+        }
         if !fast_math.is_empty() {
             write!(output, "{} ", fastmath_keywords(fast_math)).unwrap();
         }

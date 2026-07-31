@@ -5,19 +5,20 @@
 
 use combine::stream::position::SourcePosition;
 use llvm_export::{
+    attributes::IntegerOverflowFlagsAttr,
     export::{
         DebugKind, DeviceExternAttrs, DeviceExternDecl, DeviceExternType, ExportBackendConfig,
         NvvmExportConfig, NvvmIrDialect, PtxExportConfig, export_module_to_string,
         export_module_to_string_with_config, export_module_with_externs,
         export_module_with_externs_and_roots,
     },
-    op_interfaces::CastOpInterface,
+    op_interfaces::{CastOpInterface, IntBinArithOpWithOverflowFlag},
     ops::{
-        AddrSpaceCastOp, AddressOfOp, AllocaOp, BitcastOp, BrOp, CallOp, CondBrOp, ConstantOp,
-        DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourcePosition, DebugSourceScope,
-        DebugSourceScopeLocation, DebugSourceScopeMap, DebugValueOp, FuncOp, GepIndex,
-        GetElementPtrOp, GlobalInitializerRelocation, GlobalOp, GlobalOpExt, InlineAsmOp, LoadOp,
-        ReturnOp, SelectOp, StoreOp, UndefOp, encode_global_initializer_relocations,
+        AddOp, AddrSpaceCastOp, AddressOfOp, AllocaOp, BitcastOp, BrOp, CallOp, CondBrOp,
+        ConstantOp, DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourcePosition,
+        DebugSourceScope, DebugSourceScopeLocation, DebugSourceScopeMap, DebugValueOp, FuncOp,
+        GepIndex, GetElementPtrOp, GlobalInitializerRelocation, GlobalOp, GlobalOpExt, InlineAsmOp,
+        LoadOp, ReturnOp, SelectOp, StoreOp, UndefOp, encode_global_initializer_relocations,
     },
     types::{ArrayType, FuncType, HalfType, PointerType, StructType, VoidType},
 };
@@ -137,6 +138,46 @@ fn module_top_block(ctx: &mut Context, module: &ModuleOp) -> Ptr<BasicBlock> {
     let block = BasicBlock::new(ctx, None, vec![]);
     block.insert_at_back(module_region, ctx);
     block
+}
+
+#[test]
+fn export_integer_add_preserves_no_wrap_flags() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(
+        &ctx,
+        void_ty.to_handle(),
+        vec![i32_ty.to_handle(), i32_ty.to_handle()],
+        false,
+    );
+    let func = FuncOp::new(&mut ctx, "no_wrap_add".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let lhs = entry.deref(&ctx).get_argument(0);
+    let rhs = entry.deref(&ctx).get_argument(1);
+    AddOp::new_with_overflow_flag(
+        &mut ctx,
+        lhs,
+        rhs,
+        IntegerOverflowFlagsAttr {
+            nsw: false,
+            nuw: true,
+        },
+    )
+    .get_operation()
+    .insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+    assert!(
+        ir.lines().any(|line| line.contains(" = add nuw i32 ")),
+        "integer no-wrap flag must survive textual export:\n{ir}"
+    );
 }
 
 #[test]
