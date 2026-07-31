@@ -56,8 +56,10 @@ use llvm_export::op_interfaces::{
 };
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
+use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
+use pliron::identifier::Identifier;
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
 use pliron::irbuild::rewriter::Rewriter;
@@ -71,6 +73,70 @@ use std::num::NonZeroUsize;
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::input_error_noloc!("{e}")
+}
+
+fn contiguous_direct_enum_upper_bound(enum_ty: &MirEnumType, width: u32) -> Option<u128> {
+    let variant_count = enum_ty.variant_discriminants.len();
+    if enum_ty.layout_kind != EnumLayoutKind::Direct
+        || variant_count < 2
+        || enum_ty.variant_count() != variant_count
+        || (width < 128 && (variant_count as u128) >= (1_u128 << width))
+        || enum_ty.variant_inhabited.len() != variant_count
+        || enum_ty.variant_inhabited.contains(&0)
+        || !enum_ty
+            .variant_discriminants
+            .iter()
+            .enumerate()
+            .all(|(index, &value)| value == index as u64)
+    {
+        return None;
+    }
+
+    Some(variant_count as u128)
+}
+
+/// Tell LLVM the finite validity range carried by a contiguous direct enum.
+///
+/// Reading an invalid Rust enum value is already undefined behaviour. Keeping
+/// that language fact explicit after the enum's aggregate carrier is unpacked
+/// lets LLVM discharge bounds checks driven by enums loaded from memory (for
+/// example, `#[repr(usize)] Axis` indexing `[T; 3]`).
+fn emit_contiguous_direct_enum_assume(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    anchor: Ptr<Operation>,
+    discriminant: Value,
+    enum_ty: &MirEnumType,
+    width: u32,
+) -> Result<()> {
+    let Some(upper_bound) = contiguous_direct_enum_upper_bound(enum_ty, width) else {
+        return Ok(());
+    };
+
+    let upper = emit_integer_constant(ctx, rewriter, width, upper_bound);
+    let in_range =
+        llvm::ICmpOp::new(ctx, ICmpPredicateAttr::ULT, discriminant, upper).get_operation();
+    rewriter.insert_operation(ctx, in_range);
+    let condition = in_range.deref(ctx).get_result(0);
+
+    let parent_block = anchor
+        .deref(ctx)
+        .get_parent_block()
+        .ok_or_else(|| pliron::input_error_noloc!("enum discriminant op has no parent block"))?;
+    let i1_ty: TypeHandle = IntegerType::get(ctx, 1, Signedness::Signless).into();
+    let void_ty = llvm_types::VoidType::get(ctx);
+    let assume_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![i1_ty], false);
+    crate::helpers::ensure_intrinsic_declared(ctx, parent_block, "llvm_assume", assume_ty)
+        .map_err(anyhow_to_pliron)?;
+    let assume: Identifier = "llvm_assume".try_into().unwrap();
+    let call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(assume),
+        assume_ty,
+        vec![condition],
+    );
+    rewriter.insert_operation(ctx, call.get_operation());
+    Ok(())
 }
 
 /// How the MIR-level field indices of an aggregate operand map onto the
@@ -2027,6 +2093,8 @@ pub(crate) fn convert_get_discriminant(
         }
     };
 
+    emit_contiguous_direct_enum_assume(ctx, rewriter, op, result, &enum_ty, logical_width)?;
+
     rewriter.replace_operation_with_values(ctx, op, vec![result]);
 
     Ok(())
@@ -2488,7 +2556,9 @@ mod tests {
     };
     use llvm_export::types as llvm_types;
     use pliron::builtin::attributes::IntegerAttr;
+    use pliron::builtin::op_interfaces::{CallOpInterface, SymbolOpInterface};
     use pliron::common_traits::Verify;
+    use pliron::linked_list::ContainsLinkedList;
 
     fn insert_indices(ctx: &Context, inserts: &[llvm::InsertValueOp]) -> Vec<Vec<u32>> {
         inserts.iter().map(|op| op.indices(ctx)).collect()
@@ -2548,6 +2618,283 @@ mod tests {
         )
         .into();
         (usize_ty, axis_ty, option_ty)
+    }
+
+    fn enum_upper_bound_for_test(
+        ctx: &mut Context,
+        name: &str,
+        width: u32,
+        discriminants: Vec<u64>,
+        variants: Vec<EnumVariant>,
+        encoding: EnumEncoding,
+    ) -> Option<u128> {
+        let logical: TypeHandle = IntegerType::get(ctx, width, Signedness::Unsigned).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            ctx,
+            name.into(),
+            logical,
+            discriminants,
+            variants,
+            encoding,
+        )
+        .into();
+        let enum_ref = enum_ty.deref(ctx);
+        let enum_ty = enum_ref.downcast_ref::<MirEnumType>().unwrap();
+        enum_ty.verify(ctx).expect("test enum must be well formed");
+        contiguous_direct_enum_upper_bound(enum_ty, width)
+    }
+
+    #[test]
+    fn direct_enum_range_accepts_contiguous_fieldless_and_data_bearing_enums() {
+        let mut ctx = make_ctx();
+        assert_eq!(
+            enum_upper_bound_for_test(
+                &mut ctx,
+                "Axis",
+                32,
+                vec![0, 1, 2],
+                vec![
+                    EnumVariant::unit("X".into()),
+                    EnumVariant::unit("Y".into()),
+                    EnumVariant::unit("Z".into()),
+                ],
+                EnumEncoding {
+                    tag_offset: 0,
+                    total_size: 4,
+                    abi_align: 4,
+                    layout_kind: EnumLayoutKind::Direct,
+                    carrier_kind: EnumCarrierKind::Integer,
+                    carrier_width: 32,
+                    variant_inhabited: vec![1, 1, 1],
+                    ..EnumEncoding::default()
+                },
+            ),
+            Some(3)
+        );
+
+        let payload: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        assert_eq!(
+            enum_upper_bound_for_test(
+                &mut ctx,
+                "Payload",
+                32,
+                vec![0, 1],
+                vec![
+                    EnumVariant::new_with_layout("First".into(), vec![payload], vec![4], vec![4],),
+                    EnumVariant::new_with_layout("Second".into(), vec![payload], vec![4], vec![4],),
+                ],
+                EnumEncoding {
+                    tag_offset: 0,
+                    total_size: 8,
+                    abi_align: 4,
+                    layout_kind: EnumLayoutKind::Direct,
+                    carrier_kind: EnumCarrierKind::Integer,
+                    carrier_width: 32,
+                    variant_inhabited: vec![1, 1],
+                    ..EnumEncoding::default()
+                },
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn direct_enum_range_rejects_non_contiguous_or_partial_validity_sets() {
+        let mut ctx = make_ctx();
+        for (name, discriminants, inhabited) in [
+            ("Sparse", vec![0, 7], vec![1, 1]),
+            ("NonZero", vec![1, 2], vec![1, 1]),
+            ("Negative", vec![255, 0], vec![1, 1]),
+            ("Uninhabited", vec![0, 1], vec![1, 0]),
+        ] {
+            assert_eq!(
+                enum_upper_bound_for_test(
+                    &mut ctx,
+                    name,
+                    8,
+                    discriminants,
+                    vec![EnumVariant::unit("A".into()), EnumVariant::unit("B".into()),],
+                    EnumEncoding {
+                        tag_offset: 0,
+                        total_size: 1,
+                        abi_align: 1,
+                        layout_kind: EnumLayoutKind::Direct,
+                        carrier_kind: EnumCarrierKind::Integer,
+                        carrier_width: 8,
+                        variant_inhabited: inhabited,
+                        ..EnumEncoding::default()
+                    },
+                ),
+                None,
+                "{name} must not produce a contiguous range fact"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_enum_range_rejects_other_layouts_and_full_width_ranges() {
+        let mut ctx = make_ctx();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        assert_eq!(
+            enum_upper_bound_for_test(
+                &mut ctx,
+                "Niche",
+                8,
+                vec![0, 1],
+                vec![
+                    EnumVariant::unit("None".into()),
+                    EnumVariant::new_with_layout("Some".into(), vec![u8_ty], vec![0], vec![1],),
+                ],
+                EnumEncoding {
+                    tag_offset: 0,
+                    total_size: 1,
+                    abi_align: 1,
+                    layout_kind: EnumLayoutKind::Niche,
+                    carrier_kind: EnumCarrierKind::Integer,
+                    carrier_width: 8,
+                    niche_start: 2,
+                    niche_variant_start: 0,
+                    niche_variant_end: 0,
+                    untagged_variant: 1,
+                    variant_inhabited: vec![1, 1],
+                    ..EnumEncoding::default()
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            enum_upper_bound_for_test(
+                &mut ctx,
+                "Single",
+                8,
+                vec![0],
+                vec![EnumVariant::unit("Only".into())],
+                EnumEncoding {
+                    total_size: 0,
+                    abi_align: 1,
+                    layout_kind: EnumLayoutKind::Single,
+                    carrier_kind: EnumCarrierKind::None,
+                    carrier_width: 0,
+                    single_variant: 0,
+                    variant_inhabited: vec![1],
+                    ..EnumEncoding::default()
+                },
+            ),
+            None
+        );
+
+        let variants = (0..=u8::MAX)
+            .map(|value| EnumVariant::unit(format!("V{value}")))
+            .collect();
+        assert_eq!(
+            enum_upper_bound_for_test(
+                &mut ctx,
+                "FullU8",
+                8,
+                (0..=u8::MAX).map(u64::from).collect(),
+                variants,
+                EnumEncoding {
+                    tag_offset: 0,
+                    total_size: 1,
+                    abi_align: 1,
+                    layout_kind: EnumLayoutKind::Direct,
+                    carrier_kind: EnumCarrierKind::Integer,
+                    carrier_width: 8,
+                    variant_inhabited: vec![1; usize::from(u8::MAX) + 1],
+                    ..EnumEncoding::default()
+                },
+            ),
+            None,
+            "a full-width validity set has no representable exclusive upper bound"
+        );
+    }
+
+    #[test]
+    fn contiguous_direct_discriminant_reads_share_one_assume_declaration() {
+        let mut ctx = make_ctx();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let axis_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "Axis".into(),
+            u32_ty,
+            vec![0, 1, 2],
+            vec![
+                EnumVariant::unit("X".into()),
+                EnumVariant::unit("Y".into()),
+                EnumVariant::unit("Z".into()),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 4,
+                abi_align: 4,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let payload_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "Payload".into(),
+            u32_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("First".into(), vec![u32_ty], vec![4], vec![4]),
+                EnumVariant::new_with_layout("Second".into(), vec![u32_ty], vec![4], vec![4]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 8,
+                abi_align: 4,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![axis_ty, payload_ty], vec![u32_ty]);
+        let mut results = Vec::new();
+        for index in 0..2 {
+            let value = block.deref(&ctx).get_argument(index);
+            let get = Operation::new(
+                &mut ctx,
+                mir::MirGetDiscriminantOp::get_concrete_op_info(),
+                vec![u32_ty],
+                vec![value],
+                vec![],
+                0,
+            );
+            get.insert_at_back(block, &ctx);
+            results.push(get.deref(&ctx).get_result(0));
+        }
+        append_mir_return(&mut ctx, block, vec![results[0]]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module);
+        let assume_calls = find_all::<llvm::CallOp>(&ctx, &body)
+            .into_iter()
+            .filter(|call| {
+                matches!(
+                    call.callee(&ctx),
+                    CallOpCallable::Direct(callee) if callee.to_string() == "llvm_assume"
+                )
+            })
+            .count();
+        assert_eq!(assume_calls, 2);
+        assert_eq!(count_ops::<llvm::ICmpOp>(&ctx, &body), 2);
+
+        let assume_declarations = module_top_block(&ctx, module)
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
+            .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
+            .count();
+        assert_eq!(assume_declarations, 1);
     }
 
     fn padded_struct_with_zst_ty(ctx: &mut Context) -> (TypeHandle, TypeHandle) {
