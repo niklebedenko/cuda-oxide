@@ -23,6 +23,7 @@
 //! With `DialectConversion` + `inline_region`, blocks are the ORIGINALS (moved,
 //! not copied). Successor pointers are already valid — no block map lookup needed.
 
+use llvm_export::attributes::ICmpPredicateAttr;
 use llvm_export::ops as llvm;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::attributes::StringAttr;
@@ -47,6 +48,65 @@ fn propagate_loop_unroll_attr(ctx: &mut Context, source: Ptr<Operation>, target:
     if let Some(attribute) = attribute {
         target.deref_mut(ctx).attributes.set(key, attribute);
     }
+}
+
+/// Preserve a relational branch's true-edge fact across deferred inlining.
+///
+/// A successor with exactly one incoming edge is reached only when this
+/// comparison is true, so an assume at the start of that block is redundant.
+/// Keeping the fact explicit lets a later inliner relate caller-side loop
+/// bounds to checks inside a callback without changing control flow. For a
+/// valid Rust execution the imported relational condition is defined; any
+/// uninitialized or overflowing source that could make it poison is already
+/// undefined before this lowering step.
+fn emit_taken_relational_assume(
+    ctx: &mut Context,
+    source_block: Ptr<BasicBlock>,
+    true_block: Ptr<BasicBlock>,
+    condition: pliron::value::Value,
+) -> Result<()> {
+    if source_block == true_block || true_block.uses(ctx).len() != 1 {
+        return Ok(());
+    }
+    let Some(defining_op) = condition.defining_op() else {
+        return Ok(());
+    };
+    let Some(compare) = Operation::get_op::<llvm::ICmpOp>(defining_op, ctx) else {
+        return Ok(());
+    };
+    if !matches!(
+        compare.predicate(ctx),
+        ICmpPredicateAttr::SLT
+            | ICmpPredicateAttr::SLE
+            | ICmpPredicateAttr::SGT
+            | ICmpPredicateAttr::SGE
+            | ICmpPredicateAttr::ULT
+            | ICmpPredicateAttr::ULE
+            | ICmpPredicateAttr::UGT
+            | ICmpPredicateAttr::UGE
+    ) {
+        return Ok(());
+    }
+
+    let void_ty = llvm_export::types::VoidType::get(ctx);
+    let assume_ty = llvm_export::types::FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![condition.get_type(ctx)],
+        false,
+    );
+    crate::helpers::ensure_intrinsic_declared(ctx, true_block, "llvm_assume", assume_ty)
+        .map_err(|error| pliron::input_error_noloc!("{error}"))?;
+    let assume_sym: pliron::identifier::Identifier = "llvm_assume".try_into().unwrap();
+    llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(assume_sym),
+        assume_ty,
+        vec![condition],
+    )
+    .get_operation()
+    .insert_at_front(true_block, ctx);
+    Ok(())
 }
 
 /// Convert `mir.return` to `llvm.return`.
@@ -142,6 +202,12 @@ pub(crate) fn convert_cond_branch(
 
     let true_args = operands[1..1 + num_true_args].to_vec();
     let false_args = operands[1 + num_true_args..].to_vec();
+
+    let source_block = op
+        .deref(ctx)
+        .get_parent_block()
+        .ok_or_else(|| pliron::input_error_noloc!("CondBranch has no parent block"))?;
+    emit_taken_relational_assume(ctx, source_block, true_block, cond)?;
 
     let llvm_br = llvm::CondBrOp::new(ctx, cond, true_block, true_args, false_block, false_args);
     propagate_loop_unroll_attr(ctx, op, llvm_br.get_operation());
@@ -286,15 +352,93 @@ mod tests {
     use dialect_mir::ops as mir;
     use dialect_mir::types::MirTupleType;
     use llvm_export::ops as llvm;
+    use pliron::basic_block::BasicBlock;
     use pliron::builtin::op_interfaces::{
         BranchOpInterface, CallOpCallable, CallOpInterface, OperandSegmentInterface,
         SymbolOpInterface,
     };
     use pliron::builtin::types::{IntegerType, Signedness};
+    use pliron::context::{Context, Ptr};
     use pliron::linked_list::ContainsLinkedList;
     use pliron::op::Op;
     use pliron::operation::Operation;
     use pliron::r#type::TypeHandle;
+
+    fn append_mir_lt(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        lhs: pliron::value::Value,
+        rhs: pliron::value::Value,
+        i1_ty: TypeHandle,
+    ) -> pliron::value::Value {
+        let compare = Operation::new(
+            ctx,
+            mir::MirLtOp::get_concrete_op_info(),
+            vec![i1_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        compare.insert_at_back(block, ctx);
+        compare.deref(ctx).get_result(0)
+    }
+
+    fn append_mir_eq(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        lhs: pliron::value::Value,
+        rhs: pliron::value::Value,
+        i1_ty: TypeHandle,
+    ) -> pliron::value::Value {
+        let compare = Operation::new(
+            ctx,
+            mir::MirEqOp::get_concrete_op_info(),
+            vec![i1_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        compare.insert_at_back(block, ctx);
+        compare.deref(ctx).get_result(0)
+    }
+
+    fn append_mir_cond_branch(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        condition: pliron::value::Value,
+        true_block: Ptr<BasicBlock>,
+        true_args: Vec<pliron::value::Value>,
+        false_block: Ptr<BasicBlock>,
+        false_args: Vec<pliron::value::Value>,
+    ) {
+        let (operands, segment_sizes) = mir::MirCondBranchOp::compute_segment_sizes(vec![
+            vec![condition],
+            true_args,
+            false_args,
+        ]);
+        let branch = Operation::new(
+            ctx,
+            mir::MirCondBranchOp::get_concrete_op_info(),
+            vec![],
+            operands,
+            vec![true_block, false_block],
+            0,
+        );
+        mir::MirCondBranchOp::new(branch).set_operand_segment_sizes(ctx, segment_sizes);
+        branch.insert_at_back(block, ctx);
+    }
+
+    fn block_has_assume(ctx: &Context, block: Ptr<BasicBlock>) -> bool {
+        block.deref(ctx).iter(ctx).any(|op| {
+            let Some(call) = Operation::get_op::<llvm::CallOp>(op, ctx) else {
+                return false;
+            };
+            matches!(
+                call.callee(ctx),
+                CallOpCallable::Direct(callee) if callee.to_string() == "llvm_assume"
+            )
+        })
+    }
 
     #[test]
     fn convert_return_void_lowers_to_llvm_return_without_value() {
@@ -421,6 +565,181 @@ mod tests {
         assert_eq!(llvm_br.successor_operands(&ctx, 0).len(), 1);
         assert_eq!(llvm_br.successor_operands(&ctx, 1).len(), 0);
         assert_eq!(count_ops::<mir::MirCondBranchOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn relational_cond_branch_materializes_only_its_unique_true_edge_fact() {
+        let mut ctx = make_ctx();
+        let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![u32_ty, u32_ty], vec![]);
+        let lhs = entry.deref(&ctx).get_argument(0);
+        let rhs = entry.deref(&ctx).get_argument(1);
+        let true_block = append_block(&mut ctx, entry, vec![]);
+        let false_block = append_block(&mut ctx, entry, vec![]);
+        append_mir_return(&mut ctx, true_block, vec![]);
+        append_mir_return(&mut ctx, false_block, vec![]);
+        let condition = append_mir_lt(&mut ctx, entry, lhs, rhs, i1_ty);
+        append_mir_cond_branch(
+            &mut ctx,
+            entry,
+            condition,
+            true_block,
+            vec![],
+            false_block,
+            vec![],
+        );
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        assert!(
+            block_has_assume(&ctx, true_block),
+            "the uniquely reached true block must retain its comparison fact"
+        );
+        assert!(
+            !block_has_assume(&ctx, false_block),
+            "the false block must not receive the true condition"
+        );
+        let true_ops: Vec<_> = true_block.deref(&ctx).iter(&ctx).collect();
+        assert!(
+            Operation::get_op::<llvm::CallOp>(true_ops[0], &ctx).is_some(),
+            "the assume must dominate every operation in the true block"
+        );
+        let declarations = module_top_block(&ctx, module_ptr)
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
+            .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
+            .count();
+        assert_eq!(declarations, 1);
+    }
+
+    #[test]
+    fn relational_cond_branch_skips_a_true_block_with_multiple_predecessors() {
+        let mut ctx = make_ctx();
+        let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![u32_ty, u32_ty], vec![]);
+        let lhs = entry.deref(&ctx).get_argument(0);
+        let rhs = entry.deref(&ctx).get_argument(1);
+        let joined = append_block(&mut ctx, entry, vec![]);
+        let other_predecessor = append_block(&mut ctx, entry, vec![]);
+        append_mir_return(&mut ctx, joined, vec![]);
+        let goto = Operation::new(
+            &mut ctx,
+            mir::MirGotoOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![joined],
+            0,
+        );
+        goto.insert_at_back(other_predecessor, &ctx);
+        let condition = append_mir_lt(&mut ctx, entry, lhs, rhs, i1_ty);
+        append_mir_cond_branch(
+            &mut ctx,
+            entry,
+            condition,
+            joined,
+            vec![],
+            other_predecessor,
+            vec![],
+        );
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        assert!(!block_has_assume(&ctx, joined));
+    }
+
+    #[test]
+    fn relational_cond_branch_skips_a_self_edge_without_entry_dominance() {
+        let mut ctx = make_ctx();
+        let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![], vec![]);
+        append_mir_return(&mut ctx, entry, vec![]);
+        let self_block = append_block(&mut ctx, entry, vec![u32_ty, u32_ty]);
+        let exit = append_block(&mut ctx, entry, vec![]);
+        append_mir_return(&mut ctx, exit, vec![]);
+        let lhs = self_block.deref(&ctx).get_argument(0);
+        let rhs = self_block.deref(&ctx).get_argument(1);
+        let condition = append_mir_lt(&mut ctx, self_block, lhs, rhs, i1_ty);
+        append_mir_cond_branch(
+            &mut ctx,
+            self_block,
+            condition,
+            self_block,
+            vec![lhs, rhs],
+            exit,
+            vec![],
+        );
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        let declarations = module_top_block(&ctx, module_ptr)
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
+            .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
+            .count();
+        assert_eq!(declarations, 0);
+    }
+
+    #[test]
+    fn non_comparison_cond_branch_does_not_materialize_an_assume() {
+        let mut ctx = make_ctx();
+        let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![i1_ty], vec![]);
+        let condition = entry.deref(&ctx).get_argument(0);
+        let true_block = append_block(&mut ctx, entry, vec![]);
+        let false_block = append_block(&mut ctx, entry, vec![]);
+        append_mir_return(&mut ctx, true_block, vec![]);
+        append_mir_return(&mut ctx, false_block, vec![]);
+        append_mir_cond_branch(
+            &mut ctx,
+            entry,
+            condition,
+            true_block,
+            vec![],
+            false_block,
+            vec![],
+        );
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        assert!(!block_has_assume(&ctx, true_block));
+        assert_eq!(
+            module_top_block(&ctx, module_ptr)
+                .deref(&ctx)
+                .iter(&ctx)
+                .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
+                .filter(|func| func.get_symbol_name(&ctx).to_string() == "llvm_assume")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn equality_cond_branch_does_not_materialize_a_relational_assume() {
+        let mut ctx = make_ctx();
+        let i1_ty: TypeHandle = IntegerType::get(&ctx, 1, Signedness::Signless).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let (module_ptr, entry) = build_kernel(&mut ctx, vec![u32_ty, u32_ty], vec![]);
+        let lhs = entry.deref(&ctx).get_argument(0);
+        let rhs = entry.deref(&ctx).get_argument(1);
+        let true_block = append_block(&mut ctx, entry, vec![]);
+        let false_block = append_block(&mut ctx, entry, vec![]);
+        append_mir_return(&mut ctx, true_block, vec![]);
+        append_mir_return(&mut ctx, false_block, vec![]);
+        let condition = append_mir_eq(&mut ctx, entry, lhs, rhs, i1_ty);
+        append_mir_cond_branch(
+            &mut ctx,
+            entry,
+            condition,
+            true_block,
+            vec![],
+            false_block,
+            vec![],
+        );
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+        assert!(!block_has_assume(&ctx, true_block));
     }
 
     #[test]
