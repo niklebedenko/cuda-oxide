@@ -150,6 +150,7 @@ pub fn translate_function(
         crate::pipeline::InlineAttr::None,
         false,
         false,
+        false,
         None,
         None,
         legaliser,

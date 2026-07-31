@@ -142,6 +142,7 @@ fn inline_attr_for_device_function(
 
 #[derive(Default)]
 struct DeviceInlinePlan<'tcx> {
+    array_builders: HashSet<Instance<'tcx>>,
     array_closures: HashSet<Instance<'tcx>>,
     borrowed_kernel_closures: HashSet<Instance<'tcx>>,
     borrowed_always_inline_helper_closures: HashSet<Instance<'tcx>>,
@@ -186,6 +187,7 @@ fn build_device_inline_plan<'tcx>(
 ) -> DeviceInlinePlan<'tcx> {
     let trace_plan = std::env::var_os("CUDA_OXIDE_INLINE_TRACE").is_some();
     let mut plan = DeviceInlinePlan::default();
+    let mut accepted_builders = Vec::new();
     let mut accepted_closures = HashSet::new();
     let mut rejected_closures = HashSet::new();
     let mut accepted_deferred_unroll_closures = HashSet::new();
@@ -225,6 +227,7 @@ fn build_device_inline_plan<'tcx>(
             trace_array_inline_seed(tcx, instance, &path, &closures, accepted);
         }
         if accepted {
+            accepted_builders.push((instance, closure));
             accepted_closures.insert(closure);
         } else {
             rejected_closures.insert(closure);
@@ -246,6 +249,10 @@ fn build_device_inline_plan<'tcx>(
         &mut accepted_deferred_unroll_closures,
         &rejected_deferred_unroll_closures,
     );
+    plan.array_builders = accepted_builders
+        .into_iter()
+        .filter_map(|(builder, closure)| accepted_closures.contains(&closure).then_some(builder))
+        .collect();
     plan.array_closures = accepted_closures;
     plan.deferred_full_unroll_helpers = functions
         .iter()
@@ -284,7 +291,9 @@ fn build_device_inline_plan<'tcx>(
         .iter()
         .map(|function| function.instance)
         .filter(|instance| {
-            is_direct_kernel_closure(tcx, *instance) && closure_has_borrowed_capture(*instance)
+            is_direct_kernel_closure(tcx, *instance)
+                && closure_has_borrowed_capture(*instance)
+                && !rejected_closures.contains(instance)
         })
         .collect();
     plan.borrowed_always_inline_helper_closures = functions
@@ -437,7 +446,7 @@ fn closure_instances_in_args<'tcx>(
     let Some(root) = array_callable_type(&path, &generic_types) else {
         return HashSet::new();
     };
-    closure_instances_in_type(tcx, *root)
+    outermost_closure_instances(tcx, closure_instances_in_type(tcx, *root))
 }
 
 fn array_callable_type<'a, T>(path: &str, generic_types: &'a [T]) -> Option<&'a T> {
@@ -507,7 +516,38 @@ fn closure_instances_anywhere_in_args<'tcx>(
     {
         collect_closure_instances_in_type(tcx, ty, &mut closures);
     }
+    outermost_closure_instances(tcx, closures)
+}
+
+fn outermost_closure_instances<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    closures: HashSet<Instance<'tcx>>,
+) -> HashSet<Instance<'tcx>> {
+    let all = closures.iter().copied().collect::<Vec<_>>();
     closures
+        .into_iter()
+        .filter(|candidate| {
+            !all.iter().any(|ancestor| {
+                ancestor != candidate
+                    && closure_is_nested_under(tcx, *candidate, ancestor.def_id())
+            })
+        })
+        .collect()
+}
+
+fn closure_is_nested_under(
+    tcx: TyCtxt<'_>,
+    closure: Instance<'_>,
+    ancestor: rustc_hir::def_id::DefId,
+) -> bool {
+    let mut parent = tcx.opt_parent(closure.def_id());
+    while let Some(def_id) = parent {
+        if def_id == ancestor {
+            return true;
+        }
+        parent = tcx.opt_parent(def_id);
+    }
+    false
 }
 
 fn is_core_def(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
@@ -1956,6 +1996,10 @@ pub fn generate_device_code<'tcx>(
             .iter()
             .filter(|function| inline_plan.array_closures.contains(&function.instance))
             .count();
+        let matched_array_builders = functions
+            .iter()
+            .filter(|function| inline_plan.array_builders.contains(&function.instance))
+            .count();
         let matched_borrowed_kernel_closures = functions
             .iter()
             .filter(|function| {
@@ -1984,7 +2028,8 @@ pub fn generate_device_code<'tcx>(
             "[rustc_codegen_cuda] inline plan: elapsed={inline_plan_elapsed:?} \
              existing_device_always={existing_device_always} \
              considered_array_builders={} rejected_array_builders={} \
-             conflicting_array_closures={} array_closures={} \
+             conflicting_array_closures={} array_builders={} \
+             matched_array_builders={matched_array_builders} array_closures={} \
              matched_array_closures={matched_array_closures} \
              conflicting_deferred_unroll_closures={} \
              deferred_full_unroll_helpers={} \
@@ -1997,6 +2042,7 @@ pub fn generate_device_code<'tcx>(
             inline_plan.considered_array_builders,
             inline_plan.rejected_array_builders,
             inline_plan.conflicting_array_closures,
+            inline_plan.array_builders.len(),
             inline_plan.array_closures.len(),
             inline_plan.conflicting_deferred_unroll_closures,
             inline_plan.deferred_full_unroll_helpers.len(),
@@ -2030,6 +2076,10 @@ pub fn generate_device_code<'tcx>(
                     .deferred_full_unroll_helpers
                     .contains(&func.instance)
         })
+        .collect();
+    let device_link_inline_candidate: Vec<bool> = functions
+        .iter()
+        .map(|func| inline_plan.array_builders.contains(&func.instance))
         .collect();
     let deferred_full_unroll: Vec<bool> = functions
         .iter()
@@ -2087,6 +2137,7 @@ pub fn generate_device_code<'tcx>(
                     debug_source_scopes: Some(debug_scope_maps[index].clone()),
                     inline_attr: inline_attrs[index],
                     device_link_always: device_link_always[index],
+                    device_link_inline_candidate: device_link_inline_candidate[index],
                     deferred_full_unroll: deferred_full_unroll[index],
                     core_index_trait: stable_core_index_trait,
                 },

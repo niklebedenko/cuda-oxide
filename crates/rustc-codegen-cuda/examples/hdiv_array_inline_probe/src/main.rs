@@ -6,7 +6,9 @@
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
-use element_lib::{apply_operator, checksum, make_volume};
+use element_lib::{
+    apply_operator, checksum, make_pressure_volume, make_volume, pressure_operator,
+};
 
 // Multiple kernels exercise the generated module-set loading path used by Impulse.
 #[cuda_module]
@@ -95,6 +97,19 @@ mod kernels {
             *slot = first * 0.5 + second * 0.25 - third * 0.125;
         }
     }
+
+    #[kernel]
+    pub fn face_frame_pressure(input: &[f64], mut output: DisjointSlice<f64>) {
+        let index = thread::index_1d();
+        let raw_index = index.get();
+        if raw_index < input.len()
+            && let Some(slot) = output.get_mut(index)
+        {
+            let base = input[raw_index];
+            let lane = ((raw_index & 31) as f64) * 0.03125;
+            *slot = pressure_operator(make_pressure_volume(base, lane), base.abs() + 0.5);
+        }
+    }
 }
 
 fn expected_hdiv(input: f32, index: usize) -> f32 {
@@ -146,6 +161,14 @@ fn expected_flux(input: f32, index: usize) -> f32 {
         coefficient + 0.3125,
     ));
     first * 0.5 + second * 0.25 - third * 0.125
+}
+
+fn expected_face_frame_pressure(input: f64, index: usize) -> f64 {
+    let lane = ((index & 31) as f64) * 0.03125;
+    pressure_operator(
+        make_pressure_volume(input, lane),
+        input.abs() + 0.5,
+    )
 }
 
 fn validate_output(label: &str, output: &[f32], input: &[f32], expected: fn(f32, usize) -> f32) {
@@ -235,6 +258,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         expected_flux,
     );
 
-    println!("SUCCESS: four H(div)-shaped kernels agree for {COUNT} aggregate-helper results each");
+    let pressure_input: Vec<f64> = input.iter().copied().map(f64::from).collect();
+    let pressure_input_device = DeviceBuffer::from_host(&stream, &pressure_input)?;
+    let mut pressure_output_device = DeviceBuffer::<f64>::zeroed(&stream, COUNT)?;
+    // SAFETY: the 1-D launch covers both matching COUNT-element f64 buffers.
+    unsafe {
+        module.face_frame_pressure(
+            &stream,
+            LaunchConfig::for_num_elems(COUNT as u32),
+            &pressure_input_device,
+            &mut pressure_output_device,
+        )
+    }?;
+    let pressure_output = pressure_output_device.to_host_vec(&stream)?;
+    for (index, (&got, &input)) in pressure_output.iter().zip(&pressure_input).enumerate() {
+        let want = expected_face_frame_pressure(input, index);
+        assert!(
+            (got - want).abs() <= 2.0e-11 * want.abs().max(1.0),
+            "face_frame_pressure index {index}: GPU {got}, host {want}"
+        );
+    }
+
+    println!("SUCCESS: five H(div)-shaped kernels agree for {COUNT} aggregate-helper results each");
     Ok(())
 }

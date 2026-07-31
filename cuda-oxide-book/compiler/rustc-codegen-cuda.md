@@ -426,7 +426,7 @@ quiet, production-oriented build.
 | `CUDA_OXIDE_PTX_DIR`        | Override the output directory for `.ptx` files (default: next to the host binary)      |
 | `CUDA_OXIDE_TARGET`         | Override the GPU target architecture (e.g., `sm_90a` for Hopper)                       |
 | `CUDA_OXIDE_SHOW_RUSTC_MIR` | Dump the raw rustc MIR before translation to pliron (useful for debugging import bugs) |
-| `CUDA_OXIDE_INLINE_STATS`   | Report device inline-plan counts and classification time                              |
+| `CUDA_OXIDE_INLINE_STATS`   | Report inline-plan counts, PTX scores, and the selected finalizer variant              |
 | `CUDA_OXIDE_INLINE_TRACE`   | Print each array callback candidate and its resource-bound decision                   |
 
 These are intentionally environment variables rather than command-line flags.

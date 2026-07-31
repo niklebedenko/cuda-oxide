@@ -993,6 +993,7 @@ fn emit_entry_allocas(
 /// * `is_kernel` - Add `gpu_kernel` attribute for kernel entry points
 /// * `inline_attr` - Preserve Rust inline intent on non-kernel functions
 /// * `device_link_always` - Add orthogonal NVVM-link mandatory-inline intent
+/// * `device_link_inline_candidate` - Mark a bounded deferred-inline candidate
 /// * `deferred_full_unroll` - Preserve bounded deferred loop-unroll intent
 /// * `core_index_trait` - Exact compiler identity of core's `Index` lang item
 /// * `override_name` - Custom export name (defaults to instance name)
@@ -1005,6 +1006,7 @@ pub fn translate_body(
     is_kernel: bool,
     inline_attr: crate::pipeline::InlineAttr,
     device_link_always: bool,
+    device_link_inline_candidate: bool,
     deferred_full_unroll: bool,
     core_index_trait: Option<rustc_public::DefId>,
     override_name: Option<&str>,
@@ -1351,6 +1353,7 @@ pub fn translate_body(
         is_kernel,
         inline_attr,
         device_link_always,
+        device_link_inline_candidate,
     );
     if deferred_full_unroll {
         let key: Identifier = dialect_mir::DEFERRED_FULL_UNROLL_FUNC_ATTR
@@ -1471,6 +1474,7 @@ fn set_inline_attrs(
     is_kernel: bool,
     inline_attr: crate::pipeline::InlineAttr,
     device_link_always: bool,
+    device_link_inline_candidate: bool,
 ) {
     if is_kernel {
         return;
@@ -1484,6 +1488,7 @@ fn set_inline_attrs(
     for key in source_key
         .into_iter()
         .chain(device_link_always.then_some("device_link_alwaysinline"))
+        .chain(device_link_inline_candidate.then_some("device_link_inline_candidate"))
     {
         let attr = pliron::builtin::attributes::StringAttr::new("true".to_string());
         let key: Identifier = key.try_into().unwrap();
@@ -1551,26 +1556,36 @@ mod tests {
 
     #[test]
     fn inline_attributes_reach_llvm_func_before_export() {
-        for (inline_attr, device_link_always, attr_names) in [
+        for (inline_attr, device_link_always, device_link_inline_candidate, attr_names) in [
             (
                 crate::pipeline::InlineAttr::Hint,
+                false,
                 false,
                 &["inlinehint"][..],
             ),
             (
                 crate::pipeline::InlineAttr::Always,
                 false,
+                false,
                 &["alwaysinline"][..],
             ),
             (
                 crate::pipeline::InlineAttr::DeviceAlways,
+                false,
                 false,
                 &["device_alwaysinline"][..],
             ),
             (
                 crate::pipeline::InlineAttr::Hint,
                 true,
+                false,
                 &["inlinehint", "device_link_alwaysinline"][..],
+            ),
+            (
+                crate::pipeline::InlineAttr::Hint,
+                false,
+                true,
+                &["inlinehint", "device_link_inline_candidate"][..],
             ),
         ] {
             let mut ctx = Context::new();
@@ -1609,7 +1624,14 @@ mod tests {
                 func
             };
 
-            set_inline_attrs(&mut ctx, &mir_func, false, inline_attr, device_link_always);
+            set_inline_attrs(
+                &mut ctx,
+                &mir_func,
+                false,
+                inline_attr,
+                device_link_always,
+                device_link_inline_candidate,
+            );
             mir_func.get_operation().insert_at_back(module_block, &ctx);
 
             mir_lower::register(&mut ctx);
@@ -1633,7 +1655,8 @@ mod tests {
                         .attributes
                         .0
                         .contains_key(&key),
-                    "{inline_attr:?} plus device_link_always={device_link_always} must become an \
+                    "{inline_attr:?} plus device_link_always={device_link_always} and \
+                     device_link_inline_candidate={device_link_inline_candidate} must become an \
                      LLVM dialect {attr_name} attribute before export",
                 );
             }

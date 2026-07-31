@@ -10,7 +10,12 @@ use crate::provenance::{
 };
 use crate::{FinalizerError, validate_name};
 use libnvvm_sys::{LibNvvm, Program, find_libdevice};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
+
+const DEFERRED_INLINE_CANDIDATE_PREFIX: &str = "; cuda-oxide-device-link-inline-candidate @";
+const MAX_DEFERRED_INLINE_TARGETS: usize = 16;
+const MAX_DEFERRED_INLINE_CALL_SITES: usize = 64;
 
 struct LoadedNvvmTool {
     library: Arc<LibNvvm>,
@@ -92,7 +97,7 @@ impl NvvmCompiler {
         options: &FinalizationOptions,
     ) -> Result<Vec<u8>, FinalizerError> {
         self.with_revalidated_session(options, |session| {
-            session.compile_nvvm_ir(module_name, nvvm_ir, NvvmOutputKind::Ptx, None)
+            session.compile_nvvm_ir_to_ptx_deferred(module_name, nvvm_ir, None)
         })
     }
 
@@ -174,12 +179,7 @@ impl NvvmCompileSession<'_> {
         nvvm_ir: &[u8],
         maximum_bytes: u64,
     ) -> Result<Vec<u8>, FinalizerError> {
-        match self.compile_nvvm_ir(
-            module_name,
-            nvvm_ir,
-            NvvmOutputKind::Ptx,
-            Some(maximum_bytes),
-        ) {
+        match self.compile_nvvm_ir_to_ptx_deferred(module_name, nvvm_ir, Some(maximum_bytes)) {
             Err(FinalizerError::Nvvm(libnvvm_sys::NvvmError::CompiledResultTooLarge {
                 actual_bytes,
                 maximum_bytes,
@@ -190,6 +190,61 @@ impl NvvmCompileSession<'_> {
             }),
             result => result,
         }
+    }
+
+    fn compile_nvvm_ir_to_ptx_deferred(
+        self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        maximum_output_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        // Give ordinary libNVVM optimization first refusal. A bounded second
+        // pass changes only marked inline-hint roots which remain real PTX
+        // calls, then keeps that pass only when conservative frame, access,
+        // call, and code-size measures do not regress.
+        let baseline = self.compile_nvvm_ir(
+            module_name,
+            nvvm_ir,
+            NvvmOutputKind::Ptx,
+            maximum_output_bytes,
+        )?;
+        let Some((promoted_ir, targets, call_sites)) =
+            promote_surviving_inline_candidates(nvvm_ir, &baseline)
+        else {
+            return Ok(baseline);
+        };
+        let promoted = match self.compile_nvvm_ir(
+            module_name,
+            &promoted_ir,
+            NvvmOutputKind::Ptx,
+            maximum_output_bytes,
+        ) {
+            Ok(promoted) => promoted,
+            Err(error) => {
+                if std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some() {
+                    eprintln!(
+                        "[cuda_artifact_finalizer] deferred inline: module={module_name} \
+                         targets={} call_sites={call_sites} selected=baseline \
+                         promoted_error={error}",
+                        targets.len(),
+                    );
+                }
+                return Ok(baseline);
+            }
+        };
+        let baseline_score = ptx_local_frame_score(&baseline);
+        let promoted_score = ptx_local_frame_score(&promoted);
+        let use_promoted = promoted_score.improves_on(baseline_score);
+        if std::env::var_os("CUDA_OXIDE_INLINE_STATS").is_some() {
+            eprintln!(
+                "[cuda_artifact_finalizer] deferred inline: module={module_name} \
+                 targets={} call_sites={call_sites} baseline={baseline_score:?} \
+                 promoted={promoted_score:?} selected={}",
+                targets.len(),
+                if use_promoted { "promoted" } else { "baseline" },
+            );
+        }
+        Ok(if use_promoted { promoted } else { baseline })
     }
 
     fn compile_nvvm_ir(
@@ -232,6 +287,159 @@ impl NvvmCompileSession<'_> {
 enum NvvmOutputKind {
     Ltoir,
     Ptx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PtxLocalFrameScore {
+    maximum_depot_bytes: usize,
+    total_depot_bytes: usize,
+    local_access_bytes: usize,
+    local_accesses: usize,
+    deferred_calls: usize,
+    ptx_bytes: usize,
+}
+
+impl PtxLocalFrameScore {
+    fn improves_on(self, baseline: Self) -> bool {
+        self.ptx_bytes <= baseline.ptx_bytes
+            && self.total_depot_bytes <= baseline.total_depot_bytes
+            && self.local_access_bytes <= baseline.local_access_bytes
+            && self.deferred_calls <= baseline.deferred_calls
+            && self < baseline
+    }
+}
+
+fn ptx_local_access_width(line: &str) -> Option<usize> {
+    let start = ["ld.local", "st.local"]
+        .into_iter()
+        .filter_map(|opcode| line.find(opcode))
+        .min()?;
+    let opcode = line[start..].split_ascii_whitespace().next()?;
+    let mut lanes = 1_usize;
+    let mut bits = None;
+    for part in opcode.split('.') {
+        if let Some(width) = part.strip_prefix('v').and_then(|width| width.parse().ok()) {
+            lanes = width;
+        } else if matches!(part.as_bytes().first(), Some(b'b' | b'u' | b's' | b'f'))
+            && let Ok(width) = part[1..].parse::<usize>()
+        {
+            bits = Some(width);
+        }
+    }
+    bits.map(|bits| lanes.saturating_mul(bits.div_ceil(8)))
+}
+
+fn ptx_local_frame_score(ptx: &[u8]) -> PtxLocalFrameScore {
+    let Ok(ptx) = std::str::from_utf8(ptx) else {
+        return PtxLocalFrameScore {
+            maximum_depot_bytes: usize::MAX,
+            total_depot_bytes: usize::MAX,
+            local_access_bytes: usize::MAX,
+            local_accesses: usize::MAX,
+            deferred_calls: usize::MAX,
+            ptx_bytes: ptx.len(),
+        };
+    };
+    let depot_sizes = ptx.lines().filter_map(|line| {
+        line.contains(".local")
+            .then_some(line)
+            .filter(|line| line.contains("__local_depot"))
+            .and_then(|line| line.rsplit_once('['))
+            .and_then(|(_, extent)| extent.split_once(']'))
+            .and_then(|(extent, _)| extent.parse::<usize>().ok())
+    });
+    let (maximum_depot_bytes, total_depot_bytes) = depot_sizes
+        .fold((0, 0_usize), |(maximum, total), bytes| {
+            (maximum.max(bytes), total.saturating_add(bytes))
+        });
+    let local_accesses = ptx
+        .lines()
+        .filter(|line| line.contains("ld.local") || line.contains("st.local"))
+        .collect::<Vec<_>>();
+    let local_access_bytes = local_accesses
+        .iter()
+        .try_fold(0_usize, |total, line| {
+            ptx_local_access_width(line).map(|bytes| total.saturating_add(bytes))
+        })
+        .unwrap_or(usize::MAX);
+    PtxLocalFrameScore {
+        maximum_depot_bytes,
+        total_depot_bytes,
+        local_access_bytes,
+        local_accesses: local_accesses.len(),
+        deferred_calls: ptx
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                line.starts_with("call") && line.contains("call.")
+            })
+            .count(),
+        ptx_bytes: ptx.len(),
+    }
+}
+
+fn promote_surviving_inline_candidates(
+    nvvm_ir: &[u8],
+    ptx: &[u8],
+) -> Option<(Vec<u8>, BTreeSet<String>, usize)> {
+    let nvvm_ir_text = std::str::from_utf8(nvvm_ir).ok()?;
+    let ptx_text = std::str::from_utf8(ptx).ok()?;
+    let candidates = nvvm_ir_text
+        .lines()
+        .filter_map(|line| line.strip_prefix(DEFERRED_INLINE_CANDIDATE_PREFIX))
+        .filter(|symbol| !symbol.is_empty() && !symbol.chars().any(char::is_whitespace))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let ptx_lines = ptx_text.lines().collect::<Vec<_>>();
+    let mut targets = BTreeSet::new();
+    let mut call_sites = 0_usize;
+    for (index, line) in ptx_lines.iter().enumerate() {
+        let line = line.trim_start();
+        if !line.starts_with("call") || !line.contains("call.") {
+            continue;
+        }
+        let end = (index + 4).min(ptx_lines.len());
+        let call = ptx_lines[index..end].join("\n");
+        let matching = candidates
+            .iter()
+            .filter(|candidate| call.contains(candidate.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            call_sites = call_sites.checked_add(1)?;
+            if call_sites > MAX_DEFERRED_INLINE_CALL_SITES {
+                return None;
+            }
+            targets.extend(matching);
+        }
+    }
+    if targets.is_empty() || targets.len() > MAX_DEFERRED_INLINE_TARGETS {
+        return None;
+    }
+
+    let mut promoted = String::with_capacity(nvvm_ir_text.len());
+    let mut promoted_targets = BTreeSet::new();
+    for line in nvvm_ir_text.split_inclusive('\n') {
+        let target = line
+            .strip_prefix("define ")
+            .and_then(|_| {
+                targets
+                    .iter()
+                    .find(|target| line.contains(&format!("@{target}(")))
+            })
+            .filter(|_| line.contains(" inlinehint #"));
+        if let Some(target) = target {
+            promoted.push_str(&line.replacen(" inlinehint #", " alwaysinline #", 1));
+            promoted_targets.insert(target.clone());
+        } else {
+            promoted.push_str(line);
+        }
+    }
+    (promoted_targets == targets).then(|| (promoted.into_bytes(), targets, call_sites))
 }
 
 fn current_nvvm_tool_digest(tool: &LoadedNvvmTool) -> Option<[u8; 32]> {
@@ -457,6 +665,125 @@ mod tests {
             nvvm_ir_ptx_artifact_digest_parts("kernel.ll", b"ir", &options, &[1; 32], &[2; 32]),
             "LTOIR and PTX compiler routes must never share a cache identity"
         );
+    }
+
+    #[test]
+    fn promotes_only_marked_candidates_that_survive_as_ptx_calls() {
+        let nvvm_ir = br#"; cuda-oxide-device-link-inline-candidate @selected
+define internal i32 @selected(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+; cuda-oxide-device-link-inline-candidate @eliminated
+define internal i32 @eliminated(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+define internal i32 @unmarked(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+"#;
+        let ptx = br#"{
+  call.uni (retval0),
+  selected,
+  (
+  param0
+  );
+}
+"#;
+        let (promoted, targets, call_sites) =
+            promote_surviving_inline_candidates(nvvm_ir, ptx).expect("one target survives");
+        let promoted = std::str::from_utf8(&promoted).unwrap();
+        assert_eq!(targets, BTreeSet::from(["selected".to_string()]));
+        assert_eq!(call_sites, 1);
+        assert!(promoted.contains("define internal i32 @selected(i32 %value) alwaysinline #0"));
+        assert!(promoted.contains("define internal i32 @eliminated(i32 %value) inlinehint #0"));
+        assert!(promoted.contains("define internal i32 @unmarked(i32 %value) inlinehint #0"));
+    }
+
+    #[test]
+    fn local_frame_score_accepts_bounded_depot_reduction_before_call_count() {
+        let smaller = br#"
+.local .align 8 .b8 __local_depot0[144];
+"#;
+        let larger_frame = br#"
+.local .align 8 .b8 __local_depot0[512];
+st.local.f64 [%rd1], %fd1;
+call.uni (retval0),
+selected,
+(
+);
+"#;
+        let smaller = ptx_local_frame_score(smaller);
+        let larger_frame = ptx_local_frame_score(larger_frame);
+        assert!(smaller.improves_on(larger_frame));
+    }
+
+    #[test]
+    fn local_frame_score_rejects_total_depot_or_code_growth() {
+        let baseline = PtxLocalFrameScore {
+            maximum_depot_bytes: 512,
+            total_depot_bytes: 512,
+            local_access_bytes: 160,
+            local_accesses: 20,
+            deferred_calls: 1,
+            ptx_bytes: 1_000,
+        };
+        assert!(
+            !PtxLocalFrameScore {
+                maximum_depot_bytes: 511,
+                total_depot_bytes: 768,
+                local_access_bytes: 80,
+                local_accesses: 10,
+                deferred_calls: 0,
+                ptx_bytes: 900,
+            }
+            .improves_on(baseline)
+        );
+        assert!(
+            !PtxLocalFrameScore {
+                maximum_depot_bytes: 511,
+                total_depot_bytes: 511,
+                local_access_bytes: 80,
+                local_accesses: 10,
+                deferred_calls: 0,
+                ptx_bytes: 1_001,
+            }
+            .improves_on(baseline)
+        );
+        assert!(
+            !PtxLocalFrameScore {
+                maximum_depot_bytes: 511,
+                total_depot_bytes: 511,
+                local_access_bytes: 161,
+                local_accesses: 41,
+                deferred_calls: 0,
+                ptx_bytes: 900,
+            }
+            .improves_on(baseline)
+        );
+    }
+
+    #[test]
+    fn local_access_width_accounts_for_vector_lanes() {
+        assert_eq!(
+            ptx_local_access_width("st.local.v4.u32 [%rd1], {%r1, %r2, %r3, %r4};"),
+            Some(16)
+        );
+        assert_eq!(
+            ptx_local_access_width("@%p1 ld.local.volatile.v2.f64 {%fd1, %fd2}, [%rd1];"),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn deferred_inline_rejects_excessive_surviving_call_sites() {
+        let nvvm_ir = br#"; cuda-oxide-device-link-inline-candidate @selected
+define internal i32 @selected(i32 %value) inlinehint #0 {
+  ret i32 %value
+}
+"#;
+        let ptx = "call.uni (retval0),\nselected,\n(\nparam0\n);\n"
+            .repeat(MAX_DEFERRED_INLINE_CALL_SITES + 1);
+        assert!(promote_surviving_inline_candidates(nvvm_ir, ptx.as_bytes()).is_none());
     }
 
     #[test]

@@ -3,11 +3,13 @@
 This cross-crate example approximates the device-code shape that stresses
 Impulse's tetrahedral H(div) operators:
 
-- four executed kernels in one embedded NVVM IR module;
+- five executed kernels in one embedded NVVM IR module;
 - aligned, nested volume and face aggregates passed and returned by value;
 - nested `core::array::from_fn` closures;
+- an f64 pressure-face path large enough to retain a concrete array-builder
+  call after ordinary libNVVM optimization;
 - large helpers carrying explicit `#[inline(always)]` intent; and
-- enough scalar work to produce roughly 4.3 MB of legacy NVVM IR.
+- enough scalar work to produce roughly 11 MB of legacy NVVM IR.
 
 Run the correctness check on a CUDA-capable machine with:
 
@@ -24,10 +26,12 @@ cargo oxide run hdiv_array_inline_probe --emit-nvvm-ir --arch=sm_86
 
 The probe guards bounded device-link-only promotion of callbacks and erased
 array helpers. Erased helpers also carry bounded deferred-unroll intent.
-Concrete `core::array::from_fn` roots retain their ordinary inline hints
-because forcing those boundaries can trigger invalid native stack-frame
-lowering in the CUDA 12.9 device linker. Direct PTX compilation ignores the
-linker-only intent.
+Concrete `core::array::from_fn` roots retain ordinary inline hints and carry a
+deferred-inline marker in NVVM IR. PTX finalization compiles the ordinary form
+first, promotes only marked roots which survive as calls, and retains the
+promotion only when its PTX local-frame score improves. Direct PTX compilation
+does not carry the NVVM-only marker. `emit-ltoir` stops before PTX finalization
+and therefore does not apply the deferred promotion.
 
 Inspect a produced cubin with:
 

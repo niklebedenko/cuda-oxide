@@ -686,6 +686,11 @@ impl<'a> ModuleExportState<'a> {
             "device_alwaysinline".try_into().unwrap();
         let device_link_alwaysinline_key: pliron::identifier::Identifier =
             "device_link_alwaysinline".try_into().unwrap();
+        let device_link_inline_candidate_key: pliron::identifier::Identifier =
+            "device_link_inline_candidate".try_into().unwrap();
+        let is_device_link_inline_candidate = attrs
+            .get::<pliron::builtin::attributes::StringAttr>(&device_link_inline_candidate_key)
+            .is_some();
         let is_alwaysinline = attrs
             .get::<pliron::builtin::attributes::StringAttr>(&alwaysinline_key)
             .is_some()
@@ -704,6 +709,15 @@ impl<'a> ModuleExportState<'a> {
                 self.register_debug_source_scopes_for_function(scope_id, func.get_operation());
             }
 
+            if (self.nvvm_ir_dialect.is_some() || self.partitioned_owner)
+                && is_device_link_inline_candidate
+            {
+                writeln!(
+                    output,
+                    "; cuda-oxide-device-link-inline-candidate @{fixed_func_name}"
+                )
+                .unwrap();
+            }
             write!(output, "define ").unwrap();
             // Kernel entries and explicit `#[device]` exports are consumed
             // outside this module. Ordinary Rust definitions are module-local

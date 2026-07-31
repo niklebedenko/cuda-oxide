@@ -96,6 +96,12 @@ pub struct CollectedFunction {
     /// the original Rust hint, while NVVM IR additionally receives the
     /// device-link requirement.
     pub device_link_always: bool,
+    /// Backend-selected candidate for deferred device-link inlining.
+    ///
+    /// NVVM IR records this independently from mandatory inline intent so the
+    /// finalizer can promote only candidates which remain calls after the
+    /// ordinary optimizer has run.
+    pub device_link_inline_candidate: bool,
     /// Request LLVM full-unroll metadata after helper inlining exposes a
     /// constant array extent.
     pub deferred_full_unroll: bool,
@@ -320,6 +326,7 @@ pub fn run_pipeline(
             func.is_kernel,
             func.inline_attr,
             func.device_link_always,
+            func.device_link_inline_candidate,
             func.deferred_full_unroll,
             func.core_index_trait,
             Some(&func.export_name),

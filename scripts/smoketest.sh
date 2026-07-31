@@ -50,9 +50,9 @@ set -uo pipefail
 
 TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
-LTOIR_EXAMPLES=(addressof_sharedarray array_inline_boundary_probe cpp_consumes_rust_device device_ffi_test legacy_atomic_fadd legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
+LTOIR_EXAMPLES=(addressof_sharedarray array_inline_boundary_probe cpp_consumes_rust_device device_ffi_test hdiv_array_inline_probe legacy_atomic_fadd legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 LTOIR_MODERN_EXAMPLES=(small_type_ffi_test)
-AUTO_NVVM_EXAMPLES=(hdiv_array_inline_probe libdevice_math)
+AUTO_NVVM_EXAMPLES=(libdevice_math)
 BLACKWELL_COMPILE_EXAMPLES=(generated_intrinsics_blackwell)
 NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix hdiv_array_inline_probe legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress scoped_atomic_load_store shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
 ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
@@ -136,15 +136,16 @@ verify_array_inline_boundary_nvvm_ir() {
     [[ -s "${ll}" ]] || return 1
 
     local outer_callback returned_callback oversized_callback function_item shared_callback
-    local core_root_defs core_erased_defs user_defs
+    local core_root_defs core_erased_defs deferred_root_markers deferred_root_symbol
+    local deferred_root_def deferred_erased_defs user_defs marker
     outer_callback="$(grep -E \
-        '^define .*@_RNCNv[[:alnum:]_]+_closure_result_boundary0B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNv.*_closure_result_boundary0.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${outer_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -c 'alwaysinline' <<<"${outer_callback}")" -eq 1 ]] || return 1
 
     returned_callback="$(grep -E \
-        '^define .*@_RNCNCNv[[:alnum:]_]+_closure_result_boundary00B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNCNv.*_closure_result_boundary00.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${returned_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${returned_callback}")" -eq 0 ]] || return 1
@@ -164,7 +165,7 @@ verify_array_inline_boundary_nvvm_ir() {
     [[ "$(grep -c 'alwaysinline' <<<"${core_erased_defs}")" -eq 1 ]] || return 1
 
     oversized_callback="$(grep -E \
-        '^define .*@_RNCNv[[:alnum:]_]+_probe53cuda_oxide_kernel_[[:alnum:]]+_oversized_capture_boundary0B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNv.*_oversized_capture_boundary0.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${oversized_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${oversized_callback}")" -eq 0 ]] || return 1
@@ -176,7 +177,7 @@ verify_array_inline_boundary_nvvm_ir() {
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${function_item}")" -eq 0 ]] || return 1
 
     shared_callback="$(grep -E \
-        '^define .*@_RNCNv[[:alnum:]_]+_probe[0-9]+cuda_oxide_kernel_[[:alnum:]_]+_shared_callback_boundary0B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNv.*_shared_callback_boundary0.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${shared_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${shared_callback}")" -eq 0 ]] || return 1
@@ -189,13 +190,35 @@ verify_array_inline_boundary_nvvm_ir() {
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${user_defs}")" -eq 1 ]] || return 1
     [[ "$(grep -c 'alwaysinline' <<<"${user_defs}")" -eq 0 ]] || return 1
+
+    deferred_root_markers="$(grep -E \
+        '^; cuda-oxide-device-link-inline-candidate @_RINvNtC.*_4core5array11try_from_fn' \
+        "${ll}" || true)"
+    [[ "$(grep -c '^; cuda-oxide-device-link-inline-candidate @' \
+        <<<"${deferred_root_markers}")" -eq 2 ]] || return 1
+    [[ "$(grep -c '^; cuda-oxide-device-link-inline-candidate @' "${ll}")" -eq 2 ]] \
+        || return 1
+    while IFS= read -r marker; do
+        deferred_root_symbol="${marker#*@}"
+        deferred_root_def="$(grep -F "@${deferred_root_symbol}(" "${ll}" \
+            | grep '^define ' || true)"
+        [[ "$(grep -c '^define ' <<<"${deferred_root_def}")" -eq 1 ]] || return 1
+        [[ "$(grep -c 'inlinehint' <<<"${deferred_root_def}")" -eq 1 ]] || return 1
+        [[ "$(grep -c 'alwaysinline' <<<"${deferred_root_def}")" -eq 0 ]] || return 1
+    done <<<"${deferred_root_markers}"
+
+    deferred_erased_defs="$(grep -E \
+        '^define .*@_RINvNtC[[:alnum:]]+_4core5array18try_from_fn_erased.*user_suffix_boundary.* alwaysinline' \
+        "${ll}")"
+    [[ "$(grep -c '^define ' <<<"${deferred_erased_defs}")" -eq 1 ]] || return 1
 }
 
 verify_hdiv_array_inline_nvvm_ir() {
     local ll="crates/rustc-codegen-cuda/examples/hdiv_array_inline_probe/hdiv_array_inline_probe.ll"
     [[ -s "${ll}" ]] || return 1
 
-    local callback_count core_root_count core_erased_count
+    local callback_count core_root_count core_erased_count deferred_root_count
+    local deferred_root_markers deferred_root_symbol deferred_root_def marker
     callback_count="$(grep -Ec '^define .*@_RNC.*element_lib.*alwaysinline' "${ll}")"
     core_root_count="$(grep -Ec \
         '^define .*@_RINvNtC[[:alnum:]]+_4core5array11try_from_fn.* inlinehint' \
@@ -203,10 +226,26 @@ verify_hdiv_array_inline_nvvm_ir() {
     core_erased_count="$(grep -Ec \
         '^define .*@_RINvNtC[[:alnum:]]+_4core5array18try_from_fn_erased.* alwaysinline' \
         "${ll}" || true)"
+    deferred_root_count="$(grep -Ec \
+        '^; cuda-oxide-device-link-inline-candidate @_RINvNtC[[:alnum:]]+_4core5array11try_from_fn' \
+        "${ll}" || true)"
 
-    [[ "${callback_count}" -eq 14 ]] || return 1
-    [[ "${core_root_count}" -eq 14 ]] || return 1
-    [[ "${core_erased_count}" -eq 14 ]] || return 1
+    [[ "${callback_count}" -eq 18 ]] || return 1
+    [[ "${core_root_count}" -eq 18 ]] || return 1
+    [[ "${core_erased_count}" -eq 18 ]] || return 1
+    [[ "${deferred_root_count}" -eq 18 ]] || return 1
+
+    deferred_root_markers="$(grep -E \
+        '^; cuda-oxide-device-link-inline-candidate @_RINvNtC[[:alnum:]]+_4core5array11try_from_fn' \
+        "${ll}")"
+    while IFS= read -r marker; do
+        deferred_root_symbol="${marker#*@}"
+        deferred_root_def="$(grep -F "@${deferred_root_symbol}(" "${ll}" \
+            | grep '^define ' || true)"
+        [[ "$(grep -c '^define ' <<<"${deferred_root_def}")" -eq 1 ]] || return 1
+        [[ "$(grep -c 'inlinehint' <<<"${deferred_root_def}")" -eq 1 ]] || return 1
+        [[ "$(grep -c 'alwaysinline' <<<"${deferred_root_def}")" -eq 0 ]] || return 1
+    done <<<"${deferred_root_markers}"
 }
 
 verify_array_inline_boundary_direct_ir() {
@@ -217,20 +256,21 @@ verify_array_inline_boundary_direct_ir() {
 
     local ll="crates/rustc-codegen-cuda/examples/array_inline_boundary_probe/array_inline_boundary_probe.ll"
     local outer_callback returned_callback shared_callback core_defs user_defs
+    ! grep -q '^; cuda-oxide-device-link-inline-candidate @' "${ll}" || return 1
     outer_callback="$(grep -E \
-        '^define .*@_RNCNv[[:alnum:]_]+_closure_result_boundary0B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNv.*_closure_result_boundary0.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${outer_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${outer_callback}")" -eq 0 ]] || return 1
 
     returned_callback="$(grep -E \
-        '^define .*@_RNCNCNv[[:alnum:]_]+_closure_result_boundary00B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNCNv.*_closure_result_boundary00.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${returned_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${returned_callback}")" -eq 0 ]] || return 1
 
     shared_callback="$(grep -E \
-        '^define .*@_RNCNv[[:alnum:]_]+_probe[0-9]+cuda_oxide_kernel_[[:alnum:]_]+_shared_callback_boundary0B[[:alnum:]_]*\(' \
+        '^define .*@_RNCNv.*_shared_callback_boundary0.*\(' \
         "${ll}")"
     [[ "$(grep -c '^define ' <<<"${shared_callback}")" -eq 1 ]] || return 1
     [[ "$(grep -Ec 'alwaysinline|inlinehint' <<<"${shared_callback}")" -eq 0 ]] || return 1
@@ -677,10 +717,14 @@ verdict_ltoir() {
             echo "FAIL (array inline boundary attributes; direct log: ${log}.direct)"
             return 1
         fi
-    elif [[ "${ex}" == "hdiv_array_inline_probe" ]] \
-        && ! verify_hdiv_array_inline_nvvm_ir; then
-        echo "FAIL (H(div) auto-NVVM callback attributes)"
-        return 1
+    elif [[ "${ex}" == "hdiv_array_inline_probe" ]]; then
+        if ! verify_hdiv_array_inline_nvvm_ir \
+            || ! grep -qE \
+                'deferred inline: module=hdiv_array_inline_probe targets=1 call_sites=1 .*selected=promoted' \
+                "${log}"; then
+            echo "FAIL (H(div) deferred array-root promotion)"
+            return 1
+        fi
     fi
     if grep -qE 'SUCCESS|PASS|Complete|NVVM IR is ready' "${log}"; then
         echo "PASS (LTOIR)"
@@ -809,6 +853,10 @@ verdict_compile() {
 # RUSTFLAGS when both are present.
 EXTRA_RUSTFLAGS=""
 invoke_cargo_oxide() {
+    local -a diagnostic_env=()
+    if [[ ${DEFERRED_INLINE_STATS:-0} -eq 1 ]]; then
+        diagnostic_env=(env CUDA_OXIDE_INLINE_STATS=1)
+    fi
     if [[ -n "${EXTRA_RUSTFLAGS}" ]]; then
         if [[ -v CARGO_ENCODED_RUSTFLAGS ]]; then
             local encoded_flags="${CARGO_ENCODED_RUSTFLAGS}"
@@ -816,12 +864,13 @@ invoke_cargo_oxide() {
                 encoded_flags+=$'\x1f'
             fi
             CARGO_ENCODED_RUSTFLAGS="${encoded_flags}${EXTRA_RUSTFLAGS}" \
-                cargo oxide "$@"
+                "${diagnostic_env[@]}" cargo oxide "$@"
         else
-            RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${EXTRA_RUSTFLAGS}" cargo oxide "$@"
+            RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${EXTRA_RUSTFLAGS}" \
+                "${diagnostic_env[@]}" cargo oxide "$@"
         fi
     else
-        cargo oxide "$@"
+        "${diagnostic_env[@]}" cargo oxide "$@"
     fi
 }
 
@@ -830,7 +879,11 @@ invoke_cargo_oxide() {
 run_cargo() {
     local ex="$1" log="$2" cat="$3"
     local noinline
+    local DEFERRED_INLINE_STATS=0
     EXTRA_RUSTFLAGS=""
+    if [[ "${ex}" == "hdiv_array_inline_probe" && ${COMPILE_ONLY} -eq 0 ]]; then
+        DEFERRED_INLINE_STATS=1
+    fi
     for noinline in "${NOINLINE_MIR_EXAMPLES[@]}"; do
         [[ "${ex}" == "${noinline}" ]] && EXTRA_RUSTFLAGS="-Zinline-mir=no"
     done

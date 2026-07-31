@@ -373,6 +373,7 @@ fn propagate_inline_attrs(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_func: 
         "alwaysinline",
         "device_alwaysinline",
         "device_link_alwaysinline",
+        "device_link_inline_candidate",
     ] {
         let key: pliron::identifier::Identifier = name.try_into().unwrap();
         let attr_opt = mir_op
