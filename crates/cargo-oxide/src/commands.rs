@@ -6289,6 +6289,7 @@ fn find_cuda_toolkit_executable_with_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::ffi::OsStr;
 
     fn command_env(cmd: &Command, key: &str) -> Option<String> {
@@ -6333,11 +6334,17 @@ mod tests {
         cargo_passthrough_command_with_env(ctx, cargo_subcommand, opts, cargo_args, None)
     }
 
-    fn cargo_artifact_freshness(
+    #[derive(Debug)]
+    struct CargoArtifactObservation {
+        fresh: bool,
+        outputs: BTreeSet<PathBuf>,
+    }
+
+    fn cargo_artifact_observations(
         ctx: &Context,
         opts: &CargoPassthroughOptions<'_>,
         materializer_provenance: Option<&str>,
-    ) -> BTreeMap<String, bool> {
+    ) -> BTreeMap<String, CargoArtifactObservation> {
         let mut cmd = passthrough_command_for_test(
             ctx,
             CargoPassthroughSubcommand::Build,
@@ -6365,11 +6372,33 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|message| message["reason"] == "compiler-artifact")
             .filter_map(|message| {
+                let mut outputs = message["filenames"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|path| path.as_str().map(PathBuf::from))
+                    .collect::<BTreeSet<_>>();
+                if let Some(executable) = message["executable"].as_str() {
+                    outputs.insert(PathBuf::from(executable));
+                }
                 Some((
                     message["target"]["name"].as_str()?.to_string(),
-                    message["fresh"].as_bool()?,
+                    CargoArtifactObservation {
+                        fresh: message["fresh"].as_bool()?,
+                        outputs,
+                    },
                 ))
             })
+            .collect()
+    }
+
+    fn cargo_artifact_freshness(
+        ctx: &Context,
+        opts: &CargoPassthroughOptions<'_>,
+        materializer_provenance: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        cargo_artifact_observations(ctx, opts, materializer_provenance)
+            .into_iter()
+            .map(|(target, observation)| (target, observation.fresh))
             .collect()
     }
 
@@ -8328,6 +8357,118 @@ device-owner = { path = "../device-owner" }
         assert_eq!(changed_provenance.get("tracked_macro"), Some(&true));
         assert_eq!(changed_provenance.get("device_owner"), Some(&false));
         assert_eq!(changed_provenance.get("device-consumer"), Some(&false));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_owner_publication_recovers_after_exact_output_invalidation() {
+        let root = unique_temp_dir("cargo_oxide_interrupted_owner_publication");
+        let target = root.join("target");
+        for path in [root.join("device-owner/src"), root.join("consumer/src")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+resolver = "3"
+members = ["device-owner", "consumer"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-owner/Cargo.toml"),
+            r#"[package]
+name = "device-owner"
+version = "0.0.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-owner/src/lib.rs"),
+            "pub fn device_value() -> u32 { 41 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("consumer/Cargo.toml"),
+            r#"[package]
+name = "consumer"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+device-owner = { path = "../device-owner" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("consumer/src/main.rs"),
+            "fn main() { assert_eq!(device_owner::device_value(), 42); }\n",
+        )
+        .unwrap();
+
+        let ctx = Context {
+            workspace_root: root.clone(),
+            codegen_crate: root.join("unused-codegen-source"),
+            examples_dir: root.join("unused-examples"),
+            backend_so: PathBuf::from("llvm"),
+            is_workspace: false,
+            config: OxideConfig::default(),
+        };
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: Some(&target),
+            device_codegen_crate: Some("device-owner"),
+            device_cfgs: &[],
+            no_fmad: false,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+
+        let cold = cargo_artifact_observations(&ctx, &opts, None);
+        assert!(!cold["device_owner"].fresh);
+
+        // Model a newer owner/cubin build completing before its external PTX
+        // audit generation can be published.
+        std::fs::write(
+            root.join("device-owner/src/lib.rs"),
+            "pub fn device_value() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        let interrupted = cargo_artifact_observations(&ctx, &opts, None);
+        assert!(!interrupted["device_owner"].fresh);
+        assert!(!interrupted["device_owner"].outputs.is_empty());
+
+        // A plain retry is warm and therefore cannot reproduce an invocation-
+        // scoped sidecar that was lost with the interrupted publication.
+        let stranded = cargo_artifact_observations(&ctx, &opts, None);
+        assert!(stranded["device_owner"].fresh);
+
+        // The audit wrapper's recovery contract removes only Cargo-reported
+        // outputs for the affected owner. Cargo must then regenerate that
+        // owner on the clean retry, even though its sources are unchanged.
+        let mut invalidated = 0_usize;
+        for output in &stranded["device_owner"].outputs {
+            match std::fs::remove_file(output) {
+                Ok(()) => invalidated += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to invalidate {}: {error}", output.display()),
+            }
+        }
+        assert!(invalidated > 0, "Cargo reported no live owner output");
+
+        let recovered = cargo_artifact_observations(&ctx, &opts, None);
+        assert!(
+            !recovered["device_owner"].fresh,
+            "exact owner-output invalidation must force sidecar-producing codegen"
+        );
+        let clean_warm = cargo_artifact_observations(&ctx, &opts, None);
+        assert!(clean_warm["device_owner"].fresh);
 
         std::fs::remove_dir_all(root).unwrap();
     }
