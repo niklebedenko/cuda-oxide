@@ -398,6 +398,7 @@ pub(crate) fn convert_load(
 struct DeferredGep {
     indices: Vec<llvm::GepIndex>,
     source_element_type: TypeHandle,
+    inbounds: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -483,6 +484,7 @@ fn load_through_small_array_pointer_selection(
                 nested_geps.push(DeferredGep {
                     indices: gep.indices(ctx),
                     source_element_type: gep.src_elem_type(ctx),
+                    inbounds: llvm::gep_inbounds(ctx, gep.get_operation()),
                 });
                 return load_through_small_array_pointer_selection(
                     ctx,
@@ -504,6 +506,7 @@ fn load_through_small_array_pointer_selection(
             gep.indices.clone(),
             gep.source_element_type,
         );
+        llvm::set_gep_inbounds(ctx, cloned.get_operation(), gep.inbounds);
         rewriter.insert_operation(ctx, cloned.get_operation());
         candidate_ptr = cloned.get_operation().deref(ctx).get_result(0);
     }
@@ -579,6 +582,7 @@ fn store_through_small_array_pointer_selection(
                 nested_geps.push(DeferredGep {
                     indices: gep.indices(ctx),
                     source_element_type: gep.src_elem_type(ctx),
+                    inbounds: llvm::gep_inbounds(ctx, gep.get_operation()),
                 });
                 return store_through_small_array_pointer_selection(
                     ctx,
@@ -601,6 +605,7 @@ fn store_through_small_array_pointer_selection(
             gep.indices.clone(),
             gep.source_element_type,
         );
+        llvm::set_gep_inbounds(ctx, cloned.get_operation(), gep.inbounds);
         rewriter.insert_operation(ctx, cloned.get_operation());
         candidate_ptr = cloned.get_operation().deref(ctx).get_result(0);
     }
