@@ -35,7 +35,7 @@ use crate::convert::types::{
 
 use dialect_mir::ops::MirFuncOp;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
-use llvm_export::ops as llvm;
+use llvm_export::{op_interfaces::CastOpInterface, ops as llvm, types as llvm_types};
 use pliron::{
     basic_block::BasicBlock,
     builtin::op_interfaces::SymbolOpInterface,
@@ -49,7 +49,7 @@ use pliron::{
     op::Op,
     operation::Operation,
     result::Result,
-    r#type::TypeHandle,
+    r#type::{TypeHandle, Typed},
     value::Value,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -476,13 +476,166 @@ fn build_entry_prologue(
                         "Entry block arg mismatch: no more LLVM args available"
                     ));
                 }
-                result_args.push(llvm_args[llvm_arg_idx]);
+                let incoming = llvm_args[llvm_arg_idx];
                 llvm_arg_idx += 1;
+                let target_ty = convert_type(ctx, mir_ty)?;
+                let (incoming, new_last) =
+                    coerce_kernel_entry_value(ctx, llvm_entry, last_op, incoming, target_ty)?;
+                last_op = new_last;
+                result_args.push(incoming);
             }
         }
     }
 
     Ok(result_args)
+}
+
+/// Restore a kernel parameter's ordinary Rust/MIR representation while
+/// retaining the physical address-space provenance introduced by
+/// [`crate::convert::types::specialize_kernel_parameter_pointers`].
+///
+/// Pointer leaves are bridged with `addrspacecast`; structs and arrays are
+/// rebuilt recursively because LLVM cannot cast an aggregate as a whole.
+/// Numeric fields and padding pass through unchanged.
+fn coerce_kernel_entry_value(
+    ctx: &mut Context,
+    llvm_block: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value: Value,
+    target_ty: TypeHandle,
+) -> std::result::Result<(Value, Option<Ptr<Operation>>), anyhow::Error> {
+    let source_ty = value.get_type(ctx);
+    if source_ty == target_ty {
+        return Ok((value, prev_op));
+    }
+
+    enum Shape {
+        Pointer,
+        Struct {
+            source_fields: Vec<TypeHandle>,
+            target_fields: Vec<TypeHandle>,
+        },
+        Array {
+            source_element: TypeHandle,
+            target_element: TypeHandle,
+            size: u64,
+        },
+        Incompatible,
+    }
+
+    let shape = {
+        let source_ref = source_ty.deref(ctx);
+        let target_ref = target_ty.deref(ctx);
+        if source_ref.is::<llvm_types::PointerType>() && target_ref.is::<llvm_types::PointerType>()
+        {
+            Shape::Pointer
+        } else if let (Some(source), Some(target)) = (
+            source_ref.downcast_ref::<llvm_types::StructType>(),
+            target_ref.downcast_ref::<llvm_types::StructType>(),
+        ) {
+            Shape::Struct {
+                source_fields: source.fields().collect(),
+                target_fields: target.fields().collect(),
+            }
+        } else if let (Some(source), Some(target)) = (
+            source_ref.downcast_ref::<llvm_types::ArrayType>(),
+            target_ref.downcast_ref::<llvm_types::ArrayType>(),
+        ) {
+            if source.size() == target.size() {
+                Shape::Array {
+                    source_element: source.elem_type(),
+                    target_element: target.elem_type(),
+                    size: source.size(),
+                }
+            } else {
+                Shape::Incompatible
+            }
+        } else {
+            Shape::Incompatible
+        }
+    };
+
+    match shape {
+        Shape::Pointer => {
+            let cast = llvm::AddrSpaceCastOp::new(ctx, value, target_ty);
+            let cast_op = cast.get_operation();
+            insert_op_sequentially(cast_op, llvm_block, prev_op, ctx);
+            Ok((cast_op.deref(ctx).get_result(0), Some(cast_op)))
+        }
+        Shape::Struct {
+            source_fields,
+            target_fields,
+        } => {
+            if source_fields.len() != target_fields.len() {
+                return Err(anyhow::anyhow!(
+                    "kernel parameter struct field count changed during address-space specialization"
+                ));
+            }
+            coerce_kernel_entry_aggregate(
+                ctx,
+                llvm_block,
+                prev_op,
+                value,
+                target_ty,
+                &target_fields,
+            )
+        }
+        Shape::Array {
+            source_element,
+            target_element,
+            size,
+        } => {
+            debug_assert_ne!(source_element, target_element);
+            let target_fields = vec![target_element; size as usize];
+            coerce_kernel_entry_aggregate(
+                ctx,
+                llvm_block,
+                prev_op,
+                value,
+                target_ty,
+                &target_fields,
+            )
+        }
+        Shape::Incompatible => Err(anyhow::anyhow!(
+            "kernel parameter address-space specialization cannot adapt {} to {}",
+            source_ty.deref(ctx).disp(ctx),
+            target_ty.deref(ctx).disp(ctx)
+        )),
+    }
+}
+
+/// Rebuild one LLVM struct/array, recursively adapting pointer-bearing fields.
+fn coerce_kernel_entry_aggregate(
+    ctx: &mut Context,
+    llvm_block: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    source: Value,
+    target_ty: TypeHandle,
+    target_fields: &[TypeHandle],
+) -> std::result::Result<(Value, Option<Ptr<Operation>>), anyhow::Error> {
+    let undef = llvm::UndefOp::new(ctx, target_ty).get_operation();
+    insert_op_sequentially(undef, llvm_block, prev_op, ctx);
+    let mut current = undef.deref(ctx).get_result(0);
+    let mut last_op = undef;
+
+    for (index, &target_field) in target_fields.iter().enumerate() {
+        let extract = llvm::ExtractValueOp::new(ctx, source, vec![index as u32])?;
+        let extract_op = extract.get_operation();
+        extract_op.insert_after(ctx, last_op);
+        let extracted = extract_op.deref(ctx).get_result(0);
+
+        let (field, field_last) =
+            coerce_kernel_entry_value(ctx, llvm_block, Some(extract_op), extracted, target_field)?;
+        last_op = field_last.unwrap_or(extract_op);
+
+        let insert = llvm::InsertValueOp::new(ctx, current, field, vec![index as u32]);
+        let insert_op = insert.get_operation();
+        insert_op.insert_after(ctx, last_op);
+        current = insert_op.deref(ctx).get_result(0);
+        last_op = insert_op;
+    }
+
+    Ok((current, Some(last_op)))
 }
 
 // ============================================================================

@@ -217,6 +217,65 @@ pub fn convert_type(ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle, any
     ))
 }
 
+/// Give pointer leaves in a by-value kernel parameter their physical global
+/// address space while preserving the parameter's byte-for-byte host ABI.
+///
+/// CUDA launch arguments are populated by the host, so a pointer value inside
+/// a scalar payload names global/device-visible storage. Keeping such leaves
+/// generic prevents LLVM's address-space inference from seeing through the
+/// aggregate extraction and forces generic memory dispatch in the generated
+/// PTX. Address-space-qualified pointers have the same size and alignment, so
+/// recursively rebuilding structs and arrays does not change the launch ABI.
+/// The entry prologue casts the qualified leaves back to their Rust/MIR types;
+/// optimization retains the physical provenance through those casts.
+pub(crate) fn specialize_kernel_parameter_pointers(
+    ctx: &mut Context,
+    ty: TypeHandle,
+) -> TypeHandle {
+    enum Shape {
+        GenericPointer,
+        Struct(Vec<TypeHandle>),
+        Array { element: TypeHandle, size: u64 },
+        Other,
+    }
+
+    let shape = {
+        let ty_ref = ty.deref(ctx);
+        if let Some(pointer) = ty_ref.downcast_ref::<llvm_types::PointerType>() {
+            if pointer.address_space() == llvm_types::address_space::GENERIC {
+                Shape::GenericPointer
+            } else {
+                Shape::Other
+            }
+        } else if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+            Shape::Struct(struct_ty.fields().collect())
+        } else if let Some(array_ty) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+            Shape::Array {
+                element: array_ty.elem_type(),
+                size: array_ty.size(),
+            }
+        } else {
+            Shape::Other
+        }
+    };
+
+    match shape {
+        Shape::GenericPointer => llvm_types::PointerType::get_global(ctx).into(),
+        Shape::Struct(fields) => {
+            let specialized: Vec<_> = fields
+                .into_iter()
+                .map(|field| specialize_kernel_parameter_pointers(ctx, field))
+                .collect();
+            llvm_types::StructType::get_unnamed(ctx, specialized).into()
+        }
+        Shape::Array { element, size } => {
+            let element = specialize_kernel_parameter_pointers(ctx, element);
+            llvm_types::ArrayType::get(ctx, element, size).into()
+        }
+        Shape::Other => ty,
+    }
+}
+
 /// Convert a MIR function type to an LLVM function type.
 ///
 /// This handles the ABI-level transformations required for GPU kernels.
@@ -377,7 +436,10 @@ pub fn convert_function_type(
                 }
             }
             FlattenKind::None => {
-                let converted = convert_type(ctx, t)?;
+                let mut converted = convert_type(ctx, t)?;
+                if is_kernel_entry {
+                    converted = specialize_kernel_parameter_pointers(ctx, converted);
+                }
                 // Skip ZST args - NVPTX can't handle empty params
                 if !is_zero_sized_type(ctx, converted) {
                     inputs.push(converted);
@@ -2283,6 +2345,55 @@ mod tests {
             .expect("expected an LLVM struct type")
             .fields()
             .collect()
+    }
+
+    #[test]
+    fn kernel_parameter_specialization_reaches_nested_generic_pointer_leaves() {
+        let mut ctx = make_ctx();
+        let generic: TypeHandle = llvm_types::PointerType::get_generic(&mut ctx).into();
+        let shared: TypeHandle = llvm_types::PointerType::get_shared(&mut ctx).into();
+        let byte: TypeHandle = llvm_int(&mut ctx, 8);
+        let inner: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![generic, shared, byte]).into();
+        let array: TypeHandle = llvm_types::ArrayType::get(&ctx, inner, 2).into();
+        let outer: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![array, generic]).into();
+
+        let specialized = specialize_kernel_parameter_pointers(&mut ctx, outer);
+        let outer_fields = struct_fields(&ctx, specialized);
+        let specialized_element = {
+            let field = outer_fields[0].deref(&ctx);
+            field
+                .downcast_ref::<llvm_types::ArrayType>()
+                .expect("field 0 must remain an array")
+                .elem_type()
+        };
+        let inner_fields = struct_fields(&ctx, specialized_element);
+
+        assert_eq!(
+            inner_fields[0]
+                .deref(&ctx)
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("generic pointer leaf")
+                .address_space(),
+            llvm_types::address_space::GLOBAL
+        );
+        assert_eq!(
+            inner_fields[1]
+                .deref(&ctx)
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("shared pointer leaf")
+                .address_space(),
+            llvm_types::address_space::SHARED
+        );
+        assert_eq!(
+            outer_fields[1]
+                .deref(&ctx)
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("outer pointer leaf")
+                .address_space(),
+            llvm_types::address_space::GLOBAL
+        );
     }
 
     #[test]
