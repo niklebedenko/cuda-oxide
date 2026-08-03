@@ -9,8 +9,8 @@
 //! executing it. Finishing the returned [`CudaStreamCapture`] yields a
 //! [`CudaGraph`], which can be instantiated once and launched repeatedly
 //! through [`CudaGraphExec`]. Empty graphs created with [`CudaGraph::new`] can
-//! also contain conditional WHILE nodes built with
-//! [`CudaGraph::add_while_node`].
+//! also contain conditional IF and WHILE nodes built with
+//! [`CudaGraph::add_if_node`] and [`CudaGraph::add_while_node`].
 
 use crate::context::CudaContext;
 use crate::error::{DriverError, IntoResult};
@@ -72,6 +72,51 @@ impl CudaGraphConditionalOptions {
     }
 }
 
+/// A graph-owned conditional IF node and its CUDA-owned body graph.
+///
+/// The body graph executes once when its device-visible condition is nonzero.
+/// CUDA owns the body graph; it must not be destroyed separately.
+#[derive(Debug)]
+pub struct CudaGraphIfNode<'graph> {
+    cu_node: cuda_bindings::CUgraphNode,
+    body_graph: cuda_bindings::CUgraph,
+    conditional_handle: CudaGraphConditionalHandle,
+    ctx: Arc<CudaContext>,
+    _graph: PhantomData<&'graph mut ()>,
+}
+
+impl<'graph> CudaGraphIfNode<'graph> {
+    /// Return the raw conditional-node handle.
+    pub fn cu_node(&self) -> cuda_bindings::CUgraphNode {
+        self.cu_node
+    }
+
+    /// Return the CUDA-owned graph executed when the condition is nonzero.
+    pub fn body_graph(&self) -> cuda_bindings::CUgraph {
+        self.body_graph
+    }
+
+    /// Return the token that an upstream kernel uses to set the IF condition.
+    pub fn conditional_handle(&self) -> CudaGraphConditionalHandle {
+        self.conditional_handle
+    }
+
+    /// Begin thread-local stream capture directly into this node's body graph.
+    pub fn begin_body_capture<'capture>(
+        &'capture mut self,
+        stream: &'capture CudaStream,
+    ) -> Result<CudaGraphIfBodyCapture<'capture, 'graph>, DriverError> {
+        validate_capture_context(&self.ctx, stream)?;
+        begin_capture_to_graph(stream, self.body_graph, &[])?;
+        Ok(CudaGraphIfBodyCapture {
+            stream,
+            node: self,
+            active: true,
+            _same_thread: PhantomData,
+        })
+    }
+}
+
 /// A graph-owned conditional WHILE node and its CUDA-owned body graph.
 ///
 /// The body graph may be populated with raw graph node APIs through
@@ -82,6 +127,7 @@ impl CudaGraphConditionalOptions {
 #[derive(Debug)]
 pub struct CudaGraphWhileNode<'graph> {
     cu_node: cuda_bindings::CUgraphNode,
+    owner_graph: cuda_bindings::CUgraph,
     body_graph: cuda_bindings::CUgraph,
     conditional_handle: CudaGraphConditionalHandle,
     ctx: Arc<CudaContext>,
@@ -118,29 +164,80 @@ impl<'graph> CudaGraphWhileNode<'graph> {
         &'capture mut self,
         stream: &'capture CudaStream,
     ) -> Result<CudaGraphBodyCapture<'capture, 'graph>, DriverError> {
-        if self.ctx.as_ref() != stream.context().as_ref() {
-            return Err(DriverError(
-                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_CONTEXT,
-            ));
-        }
-        self.ctx.bind_to_thread()?;
-        unsafe {
-            cuda_bindings::cuStreamBeginCaptureToGraph(
-                stream.cu_stream(),
-                self.body_graph,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                cuda_bindings::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-        }
-        .result()?;
+        self.begin_body_capture_after(stream, &[])
+    }
+
+    /// Begin body capture after the supplied nodes in this WHILE body graph.
+    ///
+    /// This supports segmented construction around nested conditionals: finish
+    /// a prefix with [`CudaGraphBodyCapture::finish_with_dependencies`], add a
+    /// nested IF after those dependencies, then capture the suffix after the IF
+    /// node. CUDA requires every dependency to belong to this body graph.
+    pub fn begin_body_capture_after<'capture>(
+        &'capture mut self,
+        stream: &'capture CudaStream,
+        dependencies: &[cuda_bindings::CUgraphNode],
+    ) -> Result<CudaGraphBodyCapture<'capture, 'graph>, DriverError> {
+        validate_capture_context(&self.ctx, stream)?;
+        begin_capture_to_graph(stream, self.body_graph, dependencies)?;
         Ok(CudaGraphBodyCapture {
             stream,
             node: self,
             active: true,
             _same_thread: PhantomData,
         })
+    }
+
+    /// Add a nested conditional IF node to this WHILE body graph.
+    ///
+    /// `dependencies` must contain nodes from this WHILE body. The returned IF
+    /// body can be populated with [`CudaGraphIfNode::begin_body_capture`].
+    pub fn add_if_node<'node>(
+        &'node mut self,
+        dependencies: &[cuda_bindings::CUgraphNode],
+        options: CudaGraphConditionalOptions,
+    ) -> Result<CudaGraphIfNode<'node>, DriverError> {
+        let node = add_conditional_node(
+            self.owner_graph,
+            self.body_graph,
+            dependencies,
+            options,
+            cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_IF,
+            &self.ctx,
+        )?;
+        Ok(CudaGraphIfNode {
+            cu_node: node.cu_node,
+            body_graph: node.body_graph,
+            conditional_handle: node.conditional_handle,
+            ctx: Arc::clone(&self.ctx),
+            _graph: PhantomData,
+        })
+    }
+
+    /// Make `dependent` wait for every supplied node in this WHILE body.
+    ///
+    /// This is primarily useful when a kernel needs the handle of a nested IF:
+    /// create the IF to obtain its handle, capture the condition-setting kernel,
+    /// then connect that kernel's terminal dependencies to the IF.
+    pub fn add_dependencies_to(
+        &mut self,
+        dependencies: &[cuda_bindings::CUgraphNode],
+        dependent: cuda_bindings::CUgraphNode,
+    ) -> Result<(), DriverError> {
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        self.ctx.bind_to_thread()?;
+        let dependents = vec![dependent; dependencies.len()];
+        unsafe {
+            cuda_bindings::cuGraphAddDependencies(
+                self.body_graph,
+                dependencies.as_ptr(),
+                dependents.as_ptr(),
+                dependencies.len(),
+            )
+        }
+        .result()
     }
 }
 
@@ -178,6 +275,15 @@ pub struct CudaStreamCapture<'a> {
 pub struct CudaGraphBodyCapture<'capture, 'graph> {
     stream: &'capture CudaStream,
     node: &'capture mut CudaGraphWhileNode<'graph>,
+    active: bool,
+    _same_thread: PhantomData<Rc<()>>,
+}
+
+/// Active thread-local capture into a CUDA-owned conditional IF body graph.
+#[derive(Debug)]
+pub struct CudaGraphIfBodyCapture<'capture, 'graph> {
+    stream: &'capture CudaStream,
+    node: &'capture mut CudaGraphIfNode<'graph>,
     active: bool,
     _same_thread: PhantomData<Rc<()>>,
 }
@@ -257,6 +363,36 @@ impl Drop for CudaStreamCapture<'_> {
 impl CudaGraphBodyCapture<'_, '_> {
     /// End capture, leaving the captured nodes in the WHILE body graph.
     pub fn finish(mut self) -> Result<(), DriverError> {
+        self.finish_capture().map(|_| ())
+    }
+
+    /// End capture and return the terminal dependency set for a later segment.
+    ///
+    /// The returned raw nodes remain owned by the parent graph and are valid
+    /// until it is destroyed. No ownership is transferred to the caller.
+    pub fn finish_with_dependencies(
+        mut self,
+    ) -> Result<Vec<cuda_bindings::CUgraphNode>, DriverError> {
+        self.finish_capture()
+    }
+
+    fn finish_capture(&mut self) -> Result<Vec<cuda_bindings::CUgraphNode>, DriverError> {
+        self.stream.context().bind_to_thread()?;
+        let dependencies = capture_dependencies(self.stream)?;
+        let mut captured_graph = std::ptr::null_mut();
+        let result = unsafe {
+            cuda_bindings::cuStreamEndCapture(self.stream.cu_stream(), &mut captured_graph)
+        };
+        self.active = false;
+        result.result()?;
+        validate_captured_body_graph(self.node.body_graph, captured_graph)?;
+        Ok(dependencies)
+    }
+}
+
+impl CudaGraphIfBodyCapture<'_, '_> {
+    /// End capture, leaving the captured nodes in the IF body graph.
+    pub fn finish(mut self) -> Result<(), DriverError> {
         self.stream.context().bind_to_thread()?;
         let mut captured_graph = std::ptr::null_mut();
         let result = unsafe {
@@ -269,6 +405,31 @@ impl CudaGraphBodyCapture<'_, '_> {
 }
 
 impl Drop for CudaGraphBodyCapture<'_, '_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.stream
+            .context()
+            .record_err(self.stream.context().bind_to_thread());
+        let mut captured_graph = std::ptr::null_mut();
+        let end = unsafe {
+            cuda_bindings::cuStreamEndCapture(self.stream.cu_stream(), &mut captured_graph)
+        };
+        self.stream.context().record_err(end.result());
+        if end == cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+            self.stream
+                .context()
+                .record_err(validate_captured_body_graph(
+                    self.node.body_graph,
+                    captured_graph,
+                ));
+        }
+    }
+}
+
+impl Drop for CudaGraphIfBodyCapture<'_, '_> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -315,6 +476,33 @@ impl CudaGraph {
         &self.ctx
     }
 
+    /// Add a conditional IF node and return its empty body graph.
+    ///
+    /// `dependencies` contains raw nodes in this graph that must finish before
+    /// the IF condition is evaluated. The body executes once when the
+    /// device-visible condition is nonzero.
+    pub fn add_if_node(
+        &mut self,
+        dependencies: &[cuda_bindings::CUgraphNode],
+        options: CudaGraphConditionalOptions,
+    ) -> Result<CudaGraphIfNode<'_>, DriverError> {
+        let node = add_conditional_node(
+            self.cu_graph,
+            self.cu_graph,
+            dependencies,
+            options,
+            cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_IF,
+            &self.ctx,
+        )?;
+        Ok(CudaGraphIfNode {
+            cu_node: node.cu_node,
+            body_graph: node.body_graph,
+            conditional_handle: node.conditional_handle,
+            ctx: Arc::clone(&self.ctx),
+            _graph: PhantomData,
+        })
+    }
+
     /// Add a conditional WHILE node and return its empty body graph.
     ///
     /// `dependencies` contains raw nodes in this parent graph that must finish
@@ -332,46 +520,20 @@ impl CudaGraph {
         dependencies: &[cuda_bindings::CUgraphNode],
         options: CudaGraphConditionalOptions,
     ) -> Result<CudaGraphWhileNode<'_>, DriverError> {
-        self.ctx.bind_to_thread()?;
-
-        let mut conditional_handle = MaybeUninit::uninit();
-        unsafe {
-            cuda_bindings::cuGraphConditionalHandleCreate(
-                conditional_handle.as_mut_ptr(),
-                self.cu_graph,
-                self.ctx.cu_ctx(),
-                options.default_launch_value(),
-                options.flags(),
-            )
-        }
-        .result()?;
-        let conditional_handle = unsafe { conditional_handle.assume_init() };
-
-        let mut params = conditional_while_node_params(conditional_handle, self.ctx.cu_ctx());
-        let mut cu_node = MaybeUninit::uninit();
-        let dependency_ptr = if dependencies.is_empty() {
-            std::ptr::null()
-        } else {
-            dependencies.as_ptr()
-        };
-        unsafe {
-            cuda_bindings::cuGraphAddNode(
-                cu_node.as_mut_ptr(),
-                self.cu_graph,
-                dependency_ptr,
-                dependencies.len(),
-                &mut params,
-            )
-        }
-        .result()?;
-        // SAFETY: successful node creation populates `phGraph_out` with a
-        // CUDA-owned array containing exactly `size` graph handles.
-        let body_graph = unsafe { conditional_body_graph(&params)? };
+        let node = add_conditional_node(
+            self.cu_graph,
+            self.cu_graph,
+            dependencies,
+            options,
+            cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_WHILE,
+            &self.ctx,
+        )?;
 
         Ok(CudaGraphWhileNode {
-            cu_node: unsafe { cu_node.assume_init() },
-            body_graph,
-            conditional_handle,
+            cu_node: node.cu_node,
+            owner_graph: self.cu_graph,
+            body_graph: node.body_graph,
+            conditional_handle: node.conditional_handle,
             ctx: Arc::clone(&self.ctx),
             _graph: PhantomData,
         })
@@ -395,9 +557,88 @@ impl CudaGraph {
     }
 }
 
+struct AddedConditionalNode {
+    cu_node: cuda_bindings::CUgraphNode,
+    body_graph: cuda_bindings::CUgraph,
+    conditional_handle: CudaGraphConditionalHandle,
+}
+
+fn add_conditional_node(
+    owner_graph: cuda_bindings::CUgraph,
+    target_graph: cuda_bindings::CUgraph,
+    dependencies: &[cuda_bindings::CUgraphNode],
+    options: CudaGraphConditionalOptions,
+    node_type: cuda_bindings::CUgraphConditionalNodeType,
+    ctx: &Arc<CudaContext>,
+) -> Result<AddedConditionalNode, DriverError> {
+    ctx.bind_to_thread()?;
+    let mut conditional_handle = MaybeUninit::uninit();
+    unsafe {
+        cuda_bindings::cuGraphConditionalHandleCreate(
+            conditional_handle.as_mut_ptr(),
+            owner_graph,
+            ctx.cu_ctx(),
+            options.default_launch_value(),
+            options.flags(),
+        )
+    }
+    .result()?;
+    let conditional_handle = unsafe { conditional_handle.assume_init() };
+    let mut params = conditional_node_params(conditional_handle, ctx.cu_ctx(), node_type);
+    let mut cu_node = MaybeUninit::uninit();
+    let dependency_ptr = if dependencies.is_empty() {
+        std::ptr::null()
+    } else {
+        dependencies.as_ptr()
+    };
+    unsafe {
+        cuda_bindings::cuGraphAddNode(
+            cu_node.as_mut_ptr(),
+            target_graph,
+            dependency_ptr,
+            dependencies.len(),
+            &mut params,
+        )
+    }
+    .result()?;
+    // SAFETY: successful IF/WHILE creation populates a one-entry CUDA-owned
+    // body array for the lifetime of the conditional node.
+    let body_graph = unsafe { conditional_body_graph(&params)? };
+    Ok(AddedConditionalNode {
+        cu_node: unsafe { cu_node.assume_init() },
+        body_graph,
+        conditional_handle,
+    })
+}
+
+#[cfg(test)]
 fn conditional_while_node_params(
     handle: cuda_bindings::CUgraphConditionalHandle,
     ctx: cuda_bindings::CUcontext,
+) -> cuda_bindings::CUgraphNodeParams {
+    conditional_node_params(
+        handle,
+        ctx,
+        cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_WHILE,
+    )
+}
+
+#[cfg(test)]
+fn conditional_if_node_params(
+    handle: cuda_bindings::CUgraphConditionalHandle,
+    ctx: cuda_bindings::CUcontext,
+) -> cuda_bindings::CUgraphNodeParams {
+    conditional_node_params(
+        handle,
+        ctx,
+        cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_IF,
+    )
+}
+
+fn conditional_node_params(
+    handle: cuda_bindings::CUgraphConditionalHandle,
+    ctx: cuda_bindings::CUcontext,
+    node_type: cuda_bindings::CUgraphConditionalNodeType,
 ) -> cuda_bindings::CUgraphNodeParams {
     // CUDA requires every reserved byte and every byte after the selected
     // union member to be zero. Initialize the complete tagged union before
@@ -407,12 +648,84 @@ fn conditional_while_node_params(
     params.type_ = cuda_bindings::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_CONDITIONAL;
     params.__bindgen_anon_1.conditional = cuda_bindings::CUDA_CONDITIONAL_NODE_PARAMS {
         handle,
-        type_: cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_WHILE,
+        type_: node_type,
         size: 1,
         phGraph_out: std::ptr::null_mut(),
         ctx,
     };
     params
+}
+
+fn validate_capture_context(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+) -> Result<(), DriverError> {
+    if ctx.as_ref() != stream.context().as_ref() {
+        return Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_CONTEXT,
+        ));
+    }
+    ctx.bind_to_thread()
+}
+
+fn begin_capture_to_graph(
+    stream: &CudaStream,
+    graph: cuda_bindings::CUgraph,
+    dependencies: &[cuda_bindings::CUgraphNode],
+) -> Result<(), DriverError> {
+    let dependency_ptr = if dependencies.is_empty() {
+        std::ptr::null()
+    } else {
+        dependencies.as_ptr()
+    };
+    unsafe {
+        cuda_bindings::cuStreamBeginCaptureToGraph(
+            stream.cu_stream(),
+            graph,
+            dependency_ptr,
+            std::ptr::null(),
+            dependencies.len(),
+            cuda_bindings::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+    }
+    .result()
+}
+
+fn capture_dependencies(
+    stream: &CudaStream,
+) -> Result<Vec<cuda_bindings::CUgraphNode>, DriverError> {
+    let mut status = MaybeUninit::uninit();
+    let mut dependencies = std::ptr::null();
+    let mut count = 0;
+    unsafe {
+        cuda_bindings::cuStreamGetCaptureInfo_v2(
+            stream.cu_stream(),
+            status.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dependencies,
+            &mut count,
+        )
+    }
+    .result()?;
+    if unsafe { status.assume_init() }
+        != cuda_bindings::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_ACTIVE
+    {
+        return Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_ILLEGAL_STATE,
+        ));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if dependencies.is_null() {
+        return Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+        ));
+    }
+    // SAFETY: CUDA reports `count` live graph nodes in a driver-owned array;
+    // copy them before the next stream operation invalidates the array view.
+    Ok(unsafe { std::slice::from_raw_parts(dependencies, count) }.to_vec())
 }
 
 unsafe fn conditional_body_graph(
@@ -548,6 +861,29 @@ mod tests {
         let used_words = std::mem::size_of::<cuda_bindings::CUDA_CONDITIONAL_NODE_PARAMS>()
             .div_ceil(std::mem::size_of::<i64>());
         assert!(storage[used_words..].iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn if_node_params_select_one_true_body_and_zero_reserved_storage() {
+        let handle = 0xfedc_ba98_7654_3210;
+        let ctx = 0x2468usize as cuda_bindings::CUcontext;
+        let params = conditional_if_node_params(handle, ctx);
+
+        assert_eq!(
+            params.type_,
+            cuda_bindings::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_CONDITIONAL
+        );
+        assert_eq!(params.reserved0, [0; 3]);
+        assert_eq!(params.reserved2, 0);
+        let conditional = unsafe { params.__bindgen_anon_1.conditional };
+        assert_eq!(conditional.handle, handle);
+        assert_eq!(
+            conditional.type_,
+            cuda_bindings::CUgraphConditionalNodeType_enum_CU_GRAPH_COND_TYPE_IF
+        );
+        assert_eq!(conditional.size, 1);
+        assert!(conditional.phGraph_out.is_null());
+        assert_eq!(conditional.ctx, ctx);
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub use error::{DriverError, IntoResult};
 pub use event::CudaEvent;
 pub use graph::{
     CudaGraph, CudaGraphBodyCapture, CudaGraphConditionalHandle, CudaGraphConditionalOptions,
-    CudaGraphExec, CudaGraphWhileNode, CudaStreamCapture,
+    CudaGraphExec, CudaGraphIfBodyCapture, CudaGraphIfNode, CudaGraphWhileNode, CudaStreamCapture,
 };
 pub use launch::{
     BlockRequirement, DeviceLaunchLimits, DynamicSharedMemoryRequirement, KernelLaunchConfig,
