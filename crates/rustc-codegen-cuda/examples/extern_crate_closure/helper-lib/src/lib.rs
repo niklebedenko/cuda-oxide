@@ -20,6 +20,48 @@
 //! the resulting callable receiver belongs to this external crate.
 #![no_std]
 
+use core::ops::{Add, Mul};
+
+/// Small newtype matching the generic scalar wrapper used by Impulse device
+/// code. Keeping the arithmetic behind a wrapper prevents this regression
+/// from collapsing to a primitive-only closure.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Scalar<T>(pub T);
+
+impl<T: Add<Output = T>> Add for Scalar<T> {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl<T: Mul<Output = T>> Mul for Scalar<T> {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Self(self.0 * rhs.0)
+    }
+}
+
+/// Applies one captured closure to both slots of a wrapped scalar pair.
+///
+/// The closure and its `FnMut` shim both belong to this dependency crate. The
+/// caller's device kernel therefore requires cross-crate closure-shim MIR.
+#[inline]
+pub fn two_slot_affine<T>(
+    input: [Scalar<T>; 2],
+    scale: Scalar<T>,
+    bias: Scalar<T>,
+) -> [Scalar<T>; 2]
+where
+    T: Copy + Add<Output = T> + Mul<Output = T>,
+{
+    let compute_output = |index: usize| input[index] * scale + bias;
+    [compute_output(0), compute_output(1)]
+}
+
 /// Calls a callable trait receiver. `inline(never)` keeps this frame (and
 /// with it the `FnOnce::call_once` receiver call) out of MIR inlining, so the
 /// collector actually walks it and reaches the closure DefId — mirroring how

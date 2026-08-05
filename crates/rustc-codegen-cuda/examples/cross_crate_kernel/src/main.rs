@@ -24,7 +24,7 @@
 //! 2. Monomorphization at use site (`scale::<f32>` instantiated here)
 //! 3. PTX generation for cross-crate kernels
 //! 4. Const-generic entries instantiated for two values in the consuming crate
-//! 5. Device helper functions from external crates
+//! 5. Generic and ordinary non-inlined device helpers from external crates
 //!
 //! ## Build and Run
 //!
@@ -33,10 +33,26 @@
 //! ```
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 // Import the public kernel functions and their generated `<kernel>_ptx_name`
 // helpers. Entry symbols and marker types remain implementation details.
 use kernel_lib::kernels;
+
+#[cuda_module]
+mod plain_helper_kernels {
+    use super::*;
+
+    /// Local entry calling an ordinary non-generic dependency function.
+    #[kernel]
+    pub fn transform_with_plain_helper(input: &[u32], mut output: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = output.get_mut(idx) {
+            *out_elem = kernel_lib::kernels::plain_device_helper(input[idx_raw]);
+        }
+    }
+}
 
 fn specialization_names() -> [&'static str; 4] {
     [
@@ -91,6 +107,8 @@ fn main() {
         .load_module_from_file("cross_crate_kernel.ptx")
         .expect("Failed to load PTX module");
     let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
+    let plain_helper_module =
+        plain_helper_kernels::load(&ctx).expect("load plain helper regression module");
 
     // Test data
     const N: usize = 1024;
@@ -267,11 +285,36 @@ fn main() {
         println!("  ✓ PASSED: const-generic library entries remain distinct!\n");
     }
 
+    // =========================================================================
+    // Test 6: Ordinary non-generic, non-inlined dependency MIR
+    // =========================================================================
+    println!("Test 6: dependency helper imported without relying on inlining");
+    {
+        let input: Vec<u32> = (0..N as u32).collect();
+        let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
+        let mut output_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            plain_helper_module.transform_with_plain_helper(
+                &stream,
+                LaunchConfig::for_num_elems(N as u32),
+                &input_dev,
+                &mut output_dev,
+            )
+        }
+        .expect("transform_with_plain_helper launch failed");
+
+        let output = output_dev.to_host_vec(&stream).unwrap();
+        assert!((0..N).all(|i| output[i] == input[i].wrapping_mul(3).wrapping_add(7)));
+        println!("  ✓ PASSED: plain dependency MIR was collected and executed!\n");
+    }
+
     println!("=== All Cross-Crate Tests Passed! ===");
     println!("\nThis demonstrates:");
     println!("  - Generic kernels can be defined in library crates");
     println!("  - They are monomorphized when used in the application");
     println!("  - PTX is generated for all used instantiations");
     println!("  - Const values participate in cross-crate kernel identity");
-    println!("  - Device helper functions from libraries also work");
+    println!("  - Generic and non-inlined device helpers from libraries also work");
 }

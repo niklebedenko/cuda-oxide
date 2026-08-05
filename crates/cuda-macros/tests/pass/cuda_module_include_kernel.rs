@@ -11,15 +11,16 @@ mod kernels {
         let _ = value;
     }
 
-    include!("cuda_module_include_kernel_boundary_items.rs");
+    include!("cuda_module_include_kernel_items.rs");
 }
 
-fn undiscovered(
+fn included_launcher(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
 ) {
-    let _ = module.from_include(stream, config, 1u32);
+    // SAFETY: this type-checking fixture supplies the raw launch proof.
+    let _ = unsafe { module.from_include(stream, config, 1u32) };
 }
 
 fn main() {}

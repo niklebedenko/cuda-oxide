@@ -17,6 +17,15 @@ use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 pub mod kernels {
     use super::*;
 
+    /// Ordinary, non-generic device helper retained as a separate MIR body.
+    ///
+    /// This is deliberately `inline(never)`: cross-crate device collection
+    /// must import reachable dependency MIR independently of Rust inlining.
+    #[inline(never)]
+    pub fn plain_device_helper(value: u32) -> u32 {
+        value.wrapping_mul(3).wrapping_add(7)
+    }
+
     /// Generic scale kernel - multiplies each element by a factor.
     ///
     /// This kernel is exported from the library and can be instantiated

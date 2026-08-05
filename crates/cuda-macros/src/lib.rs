@@ -29,7 +29,7 @@
 //! so the same switch that turns host emission on also adds the `cuda-host`
 //! dependency that resolves it.
 
-#![feature(proc_macro_def_site, proc_macro_tracked_env)]
+#![feature(proc_macro_def_site, proc_macro_tracked_env, proc_macro_tracked_path)]
 
 mod address_space;
 mod device_copy;
@@ -205,6 +205,7 @@ use reserved_oxide_symbols::{
     MATERIALIZER_PROVENANCE_ENV, RESERVED_ROOT, artifact_anchor_symbol, artifact_anchor_symbol_v2,
     constant_symbol,
 };
+use std::path::{Path as FilePath, PathBuf};
 use syn::{
     Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, ForeignItem, GenericArgument, GenericParam,
     Ident, Item, ItemFn, ItemForeignMod, ItemMod, LitStr, Pat, Path, PathArguments, Stmt, Token,
@@ -525,9 +526,16 @@ fn scope_parameter_collision(input: &ItemFn, scope: &Ident) -> Option<Ident> {
 /// The generated method name `as_cuda_module` is reserved in every kernel
 /// namespace, and `from_parent` is additionally reserved in nested namespaces.
 ///
-/// Procedural macros cannot see the contents of `mod child;` or `include!`.
-/// Those items are preserved, but kernels behind either boundary do not get
-/// generated launchers. Keep auto-launched nested kernels in inline modules.
+/// Literal item-level `include!("path.rs")` fragments are expanded before
+/// launcher discovery. Paths follow Rust's `include!` rule and are resolved
+/// relative to the file containing the invocation; nested literal includes are
+/// supported and tracked as build inputs. Included fragments must contain Rust
+/// items and may not begin with inner attributes.
+///
+/// Procedural macros cannot see the contents of `mod child;`. File-backed
+/// modules are preserved, but kernels behind that boundary do not get generated
+/// launchers. Use an inline module whose body includes a literal source fragment
+/// when kernels need to live in another file.
 ///
 /// Launcher methods are namespace-qualified, but PTX entry symbols are still
 /// bare function names. Kernel names must therefore be unique throughout one
@@ -589,11 +597,139 @@ pub fn cuda_module(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    let input = parse_macro_input!(item as ItemMod);
+    let mut input = parse_macro_input!(item as ItemMod);
+    if let Err(error) = expand_cuda_module_source_includes(&mut input) {
+        return error.to_compile_error().into();
+    }
     match expand_cuda_module(input) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
+}
+
+/// Expand literal item-level `include!` invocations while their source paths
+/// are still available through the procedural-macro bridge.
+///
+/// Rust expands an attribute macro before the built-in `include!`, so launcher
+/// discovery otherwise cannot see kernels in source fragments. Reading only a
+/// literal path keeps the supported surface deterministic; generated paths
+/// such as `concat!(env!("OUT_DIR"), ...)` remain ordinary Rust includes and
+/// are intentionally not claimed as launcher-visible.
+fn expand_cuda_module_source_includes(module: &mut ItemMod) -> syn::Result<()> {
+    let Some((_brace, items)) = module.content.as_mut() else {
+        return Ok(());
+    };
+    let Some(source_file) = module.ident.span().unwrap().local_file() else {
+        return Ok(());
+    };
+    let Some(source_dir) = source_file.parent() else {
+        return Err(syn::Error::new_spanned(
+            &module.ident,
+            "cuda_module could not resolve the source directory for literal include! fragments",
+        ));
+    };
+    expand_literal_item_includes(items, source_dir, &mut Vec::new())
+}
+
+fn expand_literal_item_includes(
+    items: &mut Vec<Item>,
+    source_dir: &FilePath,
+    include_stack: &mut Vec<PathBuf>,
+) -> syn::Result<()> {
+    let mut expanded = Vec::with_capacity(items.len());
+    for mut item in items.drain(..) {
+        if let Item::Mod(item_mod) = &mut item
+            && let Some((_brace, nested_items)) = item_mod.content.as_mut()
+        {
+            expand_literal_item_includes(nested_items, source_dir, include_stack)?;
+        }
+
+        let Item::Macro(item_macro) = &item else {
+            expanded.push(item);
+            continue;
+        };
+        if !item_macro.mac.path.is_ident("include") {
+            expanded.push(item);
+            continue;
+        }
+        let Ok(path_literal) = syn::parse2::<LitStr>(item_macro.mac.tokens.clone()) else {
+            // Rust itself still expands generated/non-literal include paths.
+            // The cuda_module documentation deliberately promises launcher
+            // discovery only for one literal path.
+            expanded.push(item);
+            continue;
+        };
+
+        let requested = PathBuf::from(path_literal.value());
+        let resolved = if requested.is_absolute() {
+            requested
+        } else {
+            source_dir.join(requested)
+        };
+        let canonical = resolved.canonicalize().map_err(|error| {
+            syn::Error::new_spanned(
+                &path_literal,
+                format!(
+                    "cuda_module could not resolve included source `{}`: {error}",
+                    resolved.display()
+                ),
+            )
+        })?;
+        if include_stack.contains(&canonical) {
+            return Err(syn::Error::new_spanned(
+                &path_literal,
+                format!(
+                    "cuda_module found a recursive include of `{}`",
+                    canonical.display()
+                ),
+            ));
+        }
+        if proc_macro::is_available() {
+            proc_macro::tracked::path(&canonical);
+        }
+        let source = std::fs::read_to_string(&canonical).map_err(|error| {
+            syn::Error::new_spanned(
+                &path_literal,
+                format!(
+                    "cuda_module could not read included source `{}`: {error}",
+                    canonical.display()
+                ),
+            )
+        })?;
+        let mut file = syn::parse_file(&source).map_err(|error| {
+            syn::Error::new_spanned(
+                &path_literal,
+                format!(
+                    "cuda_module could not parse included source `{}`: {error}",
+                    canonical.display()
+                ),
+            )
+        })?;
+        if !file.attrs.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &path_literal,
+                "cuda_module source fragments cannot begin with inner attributes; attach outer attributes to the included items instead",
+            ));
+        }
+
+        include_stack.push(canonical.clone());
+        let nested_source_dir = canonical
+            .parent()
+            .expect("canonical include path must have a parent");
+        expand_literal_item_includes(&mut file.items, nested_source_dir, include_stack)?;
+        include_stack.pop();
+
+        if item_macro.attrs.is_empty() {
+            expanded.extend(file.items);
+        } else {
+            for included_item in file.items {
+                let attrs = &item_macro.attrs;
+                expanded.push(syn::parse2(quote! { #(#attrs)* #included_item })?);
+            }
+        }
+    }
+    *items = expanded;
+    Ok(())
 }
 
 struct CudaModuleKernel {
@@ -9805,7 +9941,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_modules_and_include_macros_are_preserved_without_being_walked() {
+    fn unexpanded_file_modules_and_include_macros_are_preserved_by_tree_transform() {
         let module: ItemMod = parse_quote! {
             mod kernels {
                 #[kernel]

@@ -5,7 +5,8 @@
 
 //! Nested-module `#[cuda_module]` example.
 //!
-//! Kernels live at three levels of inline nesting:
+//! Kernels live at three levels of nesting, including a module sourced through
+//! a literal item-level `include!`:
 //!
 //! - `init::fill_index`, `scale::scale_by`, and `offset::offset_by` one level
 //!   down,
@@ -53,19 +54,7 @@ mod kernels {
         }
     }
 
-    /// Inline nested module: out[i] = a[i] + 10
-    pub mod offset {
-        use cuda_device::{DisjointSlice, kernel, thread};
-
-        #[kernel]
-        pub fn offset_by(a: &[f32], mut out: DisjointSlice<f32>) {
-            let idx = thread::index_1d();
-            let idx_raw = idx.get();
-            if let Some(elem) = out.get_mut(idx) {
-                *elem = a[idx_raw] + 10.0;
-            }
-        }
-    }
+    include!("offset_kernels.rs");
 
     /// An empty bridge namespace containing a doubly nested kernel module.
     pub mod post {
