@@ -1003,12 +1003,21 @@ impl CodegenBackend for CudaCodegenBackend {
                 let device_functions = &collection_result.functions;
 
                 // Create device codegen config from our config
+                let device_output_name = rustc_unit_output_name(
+                    crate_name.as_str(),
+                    tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+                        .as_u64()
+                );
                 let device_config =
                     device_codegen::DeviceCodegenConfig {
                         output_dir: self.config.ptx_output_dir.clone().unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| ".".into())
                         }),
-                        output_name: tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string(),
+                        // Cargo can compile the regular library and its unit-test
+                        // harness into one executable. Their owner is the same,
+                        // but their stable crate identities and device artifacts
+                        // are distinct, so retain both emission streams.
+                        output_name: device_output_name,
                         verbose: self.config.verbose,
                         dump_rustc_mir: self.config.dump_rustc_mir,
                         dump_mir_dialect: self.config.dump_mir_dialect,
@@ -1103,6 +1112,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             match write_device_artifact_object(
                                 &device_config.output_dir,
                                 &device_config.output_name,
+                                crate_name.as_str(),
                                 crate_name.as_str(),
                                 tcx.sess.target.llvm_target.as_ref(),
                                 &result,
@@ -1212,10 +1222,15 @@ impl CodegenBackend for CudaCodegenBackend {
     }
 }
 
+fn rustc_unit_output_name(owner: &str, stable_crate_id: u64) -> String {
+    format!("{owner}.{stable_crate_id:016x}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_device_artifact_object(
     output_dir: &Path,
-    output_name: &str,
+    artifact_output_name: &str,
+    target_output_name: &str,
     device_owner: &str,
     host_target: &str,
     result: &device_codegen::DeviceCodegenResult,
@@ -1223,7 +1238,8 @@ fn write_device_artifact_object(
     use_target_specific_anchor: bool,
     materialization_request: Option<materialize::MaterializationRequest>,
 ) -> Result<ArtifactObject, Box<dyn std::error::Error>> {
-    let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
+    let bundle_name =
+        std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| device_owner.to_string());
     let materialized_artifact;
     let materialized_ptx_audit_path;
     let source_artifact = result
@@ -1342,7 +1358,7 @@ fn write_device_artifact_object(
         let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
             &bundle_name,
             &package_version,
-            output_name,
+            target_output_name,
             binary_name.as_deref(),
         );
         let comdat_symbol = generic_artifact_comdat_symbol(&blob);
@@ -1358,7 +1374,7 @@ fn write_device_artifact_object(
         let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
             &bundle_name,
             &package_version,
-            output_name,
+            target_output_name,
             binary_name.as_deref(),
         );
         oxide_artifacts::build_host_object_for_target_with_legacy_anchor(
@@ -1371,7 +1387,13 @@ fn write_device_artifact_object(
         oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&legacy_anchor))?
     };
     Ok(ArtifactObject {
-        path: write_artifact_object(output_dir, output_name, host_target, &object, "embed")?,
+        path: write_artifact_object(
+            output_dir,
+            artifact_output_name,
+            host_target,
+            &object,
+            "embed",
+        )?,
         retain_in_host_cgus: generic_only,
     })
 }
@@ -2225,5 +2247,17 @@ mod tests {
             "concrete",
         ]));
         assert!(!generic_kernel_exports_require_cgu_retention([]));
+    }
+
+    #[test]
+    fn rustc_units_from_one_owner_have_distinct_output_names() {
+        assert_eq!(
+            rustc_unit_output_name("impulse_host", 0x1234),
+            "impulse_host.0000000000001234"
+        );
+        assert_ne!(
+            rustc_unit_output_name("impulse_host", 0x1234),
+            rustc_unit_output_name("impulse_host", 0x5678)
+        );
     }
 }

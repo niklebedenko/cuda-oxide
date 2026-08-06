@@ -818,12 +818,15 @@ pub fn build_host_object_for_target_with_legacy_anchor(
     )
 }
 
-/// Wrap an artifact blob in an ELF COMDAT group.
+/// Wrap an artifact blob in an ELF COMDAT group with weak anchor aliases.
 ///
 /// The CUDA backend merges the returned object into every host CGU for an
 /// artifact containing only generic kernel specializations. Any host CGU that
 /// an archive consumer extracts therefore carries the bundle, while the shared
-/// COMDAT signature makes the final linker retain exactly one copy.
+/// COMDAT signature makes the final linker retain exactly one copy. Both
+/// anchors are weak because one executable can contain distinct generic
+/// bundles from the regular and `cfg(test)` builds of the same package target;
+/// those bundles have different COMDAT signatures but the same target identity.
 #[cfg(feature = "object-write")]
 pub fn build_host_object_for_target_with_legacy_anchor_and_comdat(
     section_data: &[u8],
@@ -844,7 +847,7 @@ pub fn build_host_object_for_target_with_legacy_anchor_and_comdat(
         ARTIFACT_SECTION_NAME,
         section_data,
         target,
-        &[(anchor_symbol, false), (legacy_anchor_symbol, true)],
+        &[(anchor_symbol, true), (legacy_anchor_symbol, true)],
         Some(comdat_symbol),
     )
 }
@@ -1665,7 +1668,7 @@ mod tests {
     #[cfg(all(feature = "object-read", feature = "object-write"))]
     #[test]
     fn generic_artifact_object_places_oxart_in_comdat_group() {
-        use object::{Object, ObjectComdat, ObjectSection};
+        use object::{Object, ObjectComdat, ObjectSection, ObjectSymbol};
 
         let bytes = build_host_object_for_target_with_legacy_anchor_and_comdat(
             &sample_blob(),
@@ -1686,6 +1689,97 @@ mod tests {
         assert_eq!(comdat.name(), Ok("generic_artifact_comdat"));
         assert_eq!(comdat.sections().collect::<Vec<_>>(), [oxart]);
         assert!(comdats.next().is_none());
+        let target = file
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("target_anchor"))
+            .expect("target-specific anchor missing");
+        assert!(target.is_weak());
+    }
+
+    /// A unit-test crate can link its own generic bundle alongside the regular
+    /// build of the same library through a dev-dependency. Their target anchors
+    /// are identical, while their payload-specific COMDAT groups are not.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "object-read",
+        feature = "object-write"
+    ))]
+    #[test]
+    fn distinct_generic_bundles_for_one_target_link_together() {
+        use std::process::Command;
+
+        let second_blob = build_artifact_blob(
+            &ArtifactBundleSpec::new("demo_test", "sm_90")
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::Ptx,
+                    "demo_test.ptx",
+                    b"test ptx",
+                ))
+                .with_entry(ArtifactEntrySpec::new(
+                    "hello_test",
+                    ArtifactEntryKind::Kernel,
+                )),
+        )
+        .unwrap();
+        let regular = build_host_object_for_target_with_legacy_anchor_and_comdat(
+            &sample_blob(),
+            "x86_64-unknown-linux-gnu",
+            "shared_target_anchor",
+            "shared_legacy_anchor",
+            "regular_bundle_comdat",
+        )
+        .unwrap();
+        let test = build_host_object_for_target_with_legacy_anchor_and_comdat(
+            &second_blob,
+            "x86_64-unknown-linux-gnu",
+            "shared_target_anchor",
+            "shared_legacy_anchor",
+            "test_bundle_comdat",
+        )
+        .unwrap();
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide_distinct_generic_bundles_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let regular_path = root.join("regular.o");
+        let test_path = root.join("test.o");
+        let source_path = root.join("main.c");
+        let binary_path = root.join("app");
+        std::fs::write(&regular_path, regular).unwrap();
+        std::fs::write(&test_path, test).unwrap();
+        std::fs::write(&source_path, b"int main(void) { return 0; }\n").unwrap();
+
+        let link = Command::new("cc")
+            .arg(&source_path)
+            .arg(&regular_path)
+            .arg(&test_path)
+            .args(["-Wl,--gc-sections", "-Wl,-z,noexecstack"])
+            .arg("-o")
+            .arg(&binary_path)
+            .status()
+            .expect("a C linker driver is required for the generic bundle test");
+        assert!(
+            link.success(),
+            "distinct generic bundles for one package target did not link"
+        );
+
+        let executable = std::fs::read(&binary_path).unwrap();
+        let mut bundle_names = read_artifact_bundles_from_object_bytes(&executable)
+            .unwrap()
+            .into_iter()
+            .map(|bundle| bundle.name)
+            .collect::<Vec<_>>();
+        bundle_names.sort();
+        assert_eq!(bundle_names, ["demo", "demo_test"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(
