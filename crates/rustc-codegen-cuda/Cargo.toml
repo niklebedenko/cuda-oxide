@@ -23,7 +23,7 @@ llvm-export = { path = "../llvm-export" }
 dialect-mir = { path = "../dialect-mir" }
 dialect-nvvm = { path = "../dialect-nvvm" }
 reserved-oxide-symbols = { path = "../reserved-oxide-symbols" }
-oxide-artifacts = { path = "../oxide-artifacts", features = ["object-write"] }
+oxide-artifacts = { path = "../oxide-artifacts", features = ["object-read", "object-write"] }
 # Shared driver-independent libNVVM + nvJitLink finalization policy. This
 # crate loads CUDA compiler libraries at run time and never links libcuda.
 cuda-artifact-finalizer = { path = "../cuda-artifact-finalizer" }
@@ -39,6 +39,7 @@ combine = "4.6"           # must match workspace
 once_cell = "1.18"        # must match workspace
 thiserror = "2"           # must match workspace
 sha2 = "0.10"             # must match workspace
+fs2 = "0.4"
 
 # Note: rustc internal crates are NOT listed here.
 # They're accessed via `extern crate` with #![feature(rustc_private)]
@@ -46,4 +47,3 @@ sha2 = "0.10"             # must match workspace
 
 [package.metadata.rust-analyzer]
 rustc_private = true
-

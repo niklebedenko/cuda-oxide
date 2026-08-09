@@ -126,6 +126,19 @@ inputs are not yet represented by this path. Materialization is also a
 final-output mode, so it cannot be combined with `--emit-nvvm-ir` or
 `emit-ltoir`.
 
+Set `CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_DIR` to an absolute directory to reuse
+final materialized owner objects across independent Cargo target directories.
+The backend keys entries by reachable device MIR, concrete signatures, layouts,
+discriminants, constants/statics, derived inline policy, scoped codegen
+identity, the exact backend and rustc/LLVM implementations, host/GPU targets,
+and exact CUDA-tool provenance. Every hit is digest-checked and reparsed against
+the current owner entries before host codegen can consume it; corrupt or
+interrupted entries are ignored and replaced atomically. The cache is capped at
+2 GiB by opportunistic oldest-entry reclamation. Set
+`CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_TRACE=1` to print hit, miss, rejection, and
+publication events. Neither operational path affects Cargo's device-code
+fingerprint.
+
 ## Commands
 
 ### `cargo oxide list [--json]`

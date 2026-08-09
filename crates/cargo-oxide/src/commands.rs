@@ -19,8 +19,13 @@ use std::process::Command;
 const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
 const EXPECTED_PROVENANCE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV;
 const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV;
+const BACKEND_PROVENANCE_ENV: &str = reserved_oxide_symbols::BACKEND_PROVENANCE_ENV;
+const BACKEND_PATH_ENV: &str = reserved_oxide_symbols::BACKEND_PATH_ENV;
+const COMPILER_PROVENANCE_ENV: &str = reserved_oxide_symbols::COMPILER_PROVENANCE_ENV;
+const COMPILER_COMPONENTS_ENV: &str = reserved_oxide_symbols::COMPILER_COMPONENTS_ENV;
 const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV;
 const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
+const COMPILER_IDENTITY_CFG: &str = "cuda_oxide_internal_compiler_identity";
 const LEGACY_CODEGEN_FINGERPRINT_CFG: &str = "cuda_oxide_internal_codegen_env";
 const LEGACY_MATERIALIZER_PROVENANCE_CFG: &str = "cuda_oxide_internal_materializer_provenance";
 const CODEGEN_ACTIVE_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_ACTIVE";
@@ -2777,12 +2782,20 @@ fn passthrough_codegen_fingerprint(
 
 fn affects_scoped_codegen_fingerprint(key: &str) -> bool {
     // The resolved backend path and binary digest are already part of the
-    // global rustflags identity. The loaded-kernel manifest is a runtime trace
-    // destination and cannot affect generated device code.
+    // global rustflags identity. Runtime traces and the content-addressed cache
+    // location are operational destinations and cannot affect generated code.
     key.starts_with("CUDA_OXIDE_")
         && !matches!(
             key,
-            CODEGEN_FINGERPRINT_ENV | BACKEND_ENV | LOADED_KERNEL_MANIFEST_ENV
+            CODEGEN_FINGERPRINT_ENV
+                | BACKEND_PROVENANCE_ENV
+                | BACKEND_PATH_ENV
+                | COMPILER_PROVENANCE_ENV
+                | COMPILER_COMPONENTS_ENV
+                | BACKEND_ENV
+                | LOADED_KERNEL_MANIFEST_ENV
+                | reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_DIR_ENV
+                | reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_TRACE_ENV
         )
 }
 
@@ -3111,6 +3124,191 @@ fn backend_artifact_digest(path: &Path) -> Result<String, String> {
     }
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(digest_hex(&digest))
+}
+
+/// Content identity of the compiler implementation which will load the
+/// backend. `rustc -vV` names the release, commit, host, and LLVM version; the
+/// binary digests additionally cover local/rebuilt compilers which retain the
+/// same version text.
+#[derive(Debug)]
+struct CompilerProvenance {
+    digest: String,
+    components: Vec<CompilerComponent>,
+}
+
+#[derive(Debug)]
+struct CompilerComponent {
+    label: String,
+    digest: String,
+    path: PathBuf,
+}
+
+impl CompilerProvenance {
+    fn component_manifest(&self) -> Result<String, String> {
+        let mut manifest = String::new();
+        for component in &self.components {
+            let path = component.path.to_str().ok_or_else(|| {
+                format!(
+                    "compiler component path {} is not valid Unicode",
+                    component.path.display()
+                )
+            })?;
+            if component.label.chars().any(char::is_control) || path.chars().any(char::is_control) {
+                return Err("compiler component manifest contains a control character".to_string());
+            }
+            use std::fmt::Write as _;
+            writeln!(
+                &mut manifest,
+                "{}\t{}\t{}",
+                component.label, component.digest, path
+            )
+            .expect("writing to String cannot fail");
+        }
+        Ok(manifest)
+    }
+}
+
+fn active_compiler_provenance() -> Result<CompilerProvenance, String> {
+    let rustc_program = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let verbose_version = rustc_output(&rustc_program, &["-vV"], "version")?;
+    let sysroot_output = rustc_output(&rustc_program, &["--print", "sysroot"], "sysroot")?;
+    let sysroot = std::str::from_utf8(&sysroot_output)
+        .map_err(|_| "active rustc returned a non-UTF-8 sysroot".to_string())?;
+    let sysroot = PathBuf::from(sysroot.trim());
+
+    let mut artifacts = Vec::<(String, PathBuf)>::new();
+    artifacts.push(("rustc".to_string(), sysroot.join("bin/rustc")));
+    if let Some(launcher) = resolve_executable(rustc_program.as_os_str()) {
+        artifacts.push(("rustc-launcher".to_string(), launcher));
+    }
+    for (variable, label) in [
+        ("RUSTC_WRAPPER", "rustc-wrapper"),
+        ("RUSTC_WORKSPACE_WRAPPER", "rustc-workspace-wrapper"),
+    ] {
+        if let Some(wrapper) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            let wrapper = resolve_executable(&wrapper).ok_or_else(|| {
+                format!(
+                    "could not resolve {variable}={} for compiler fingerprinting",
+                    Path::new(&wrapper).display()
+                )
+            })?;
+            artifacts.push((label.to_string(), wrapper));
+        }
+    }
+
+    let compiler_lib = sysroot.join("lib");
+    let mut driver_count = 0;
+    let mut llvm_count = 0;
+    let entries = std::fs::read_dir(&compiler_lib).map_err(|error| {
+        format!(
+            "could not inspect compiler libraries in {}: {error}",
+            compiler_lib.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect compiler library in {}: {error}",
+                compiler_lib.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let name_bytes = name.as_encoded_bytes();
+        let category = if name_bytes.starts_with(b"librustc_driver") {
+            driver_count += 1;
+            "rustc-driver"
+        } else if name_bytes.starts_with(b"libLLVM") {
+            llvm_count += 1;
+            "llvm"
+        } else {
+            continue;
+        };
+        artifacts.push((
+            format!("{category}:{}", name.to_string_lossy()),
+            entry.path(),
+        ));
+    }
+    if driver_count == 0 || llvm_count == 0 {
+        return Err(format!(
+            "active compiler sysroot {} does not expose both rustc-driver and LLVM artifacts",
+            sysroot.display()
+        ));
+    }
+
+    compiler_provenance_from_files(&verbose_version, &mut artifacts)
+}
+
+fn rustc_output(
+    program: &std::ffi::OsStr,
+    arguments: &[&str],
+    description: &str,
+) -> Result<Vec<u8>, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not query rustc {description}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc {description} query failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Err(format!("rustc {description} query returned no output"));
+    }
+    Ok(output.stdout)
+}
+
+fn resolve_executable(program: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return path.canonicalize().ok();
+    }
+    std::env::var_os("PATH").and_then(|search_path| {
+        std::env::split_paths(&search_path)
+            .map(|directory| directory.join(path))
+            .find_map(|candidate| {
+                candidate
+                    .is_file()
+                    .then(|| candidate.canonicalize().ok())
+                    .flatten()
+            })
+    })
+}
+
+fn compiler_provenance_from_files(
+    verbose_version: &[u8],
+    artifacts: &mut [(String, PathBuf)],
+) -> Result<CompilerProvenance, String> {
+    use sha2::{Digest, Sha256};
+
+    artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    update_codegen_fingerprint_hash(&mut hasher, b"cuda-oxide-compiler-provenance-v1");
+    update_codegen_fingerprint_hash(&mut hasher, verbose_version);
+    update_codegen_fingerprint_hash(&mut hasher, &(artifacts.len() as u64).to_le_bytes());
+    let mut components = Vec::with_capacity(artifacts.len());
+    for (label, path) in artifacts {
+        update_codegen_fingerprint_hash(&mut hasher, label.as_bytes());
+        let canonical = path.canonicalize().map_err(|error| {
+            format!(
+                "could not resolve compiler artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        let digest = backend_artifact_digest(&canonical)?;
+        update_codegen_fingerprint_hash(&mut hasher, digest.as_bytes());
+        components.push(CompilerComponent {
+            label: label.clone(),
+            digest,
+            path: canonical,
+        });
+    }
+    Ok(CompilerProvenance {
+        digest: finish_codegen_fingerprint(hasher),
+        components,
+    })
 }
 
 fn cargo_passthrough_command(
@@ -5315,9 +5513,10 @@ fn apply_codegen_rustflags(
     .env_remove("RUSTFLAGS");
 }
 
-/// Apply the two deliberately different Cargo cache boundaries:
+/// Apply the deliberately different Cargo cache boundaries:
 ///
-/// - the exact backend binary is global because it compiles every crate;
+/// - the exact backend and compiler implementations are global because they
+///   compile every crate;
 /// - mode/architecture/tool settings are an env dependency recorded only by
 ///   CUDA macros in crates that can own or instantiate device code.
 fn apply_codegen_configuration(
@@ -5327,13 +5526,47 @@ fn apply_codegen_configuration(
     user_device_cfgs: &[String],
     codegen_fingerprint: &str,
 ) -> Result<(), String> {
+    let backend_path = if ctx.backend_so == Path::new("llvm") {
+        PathBuf::from("llvm")
+    } else {
+        ctx.backend_so.canonicalize().map_err(|error| {
+            format!(
+                "could not resolve backend {}: {error}",
+                ctx.backend_so.display()
+            )
+        })?
+    };
     let backend_digest = backend_artifact_digest(&ctx.backend_so)?;
-    let mut global_cfgs = Vec::with_capacity(user_device_cfgs.len() + 1);
+    let compiler_provenance = active_compiler_provenance()
+        .and_then(|provenance| {
+            provenance
+                .component_manifest()
+                .map(|manifest| (provenance, manifest))
+        })
+        .ok();
+    let mut global_cfgs = Vec::with_capacity(user_device_cfgs.len() + 2);
     global_cfgs.push(format!("{BACKEND_IDENTITY_CFG}=\"{backend_digest}\""));
+    if let Some((provenance, _)) = &compiler_provenance {
+        global_cfgs.push(format!("{COMPILER_IDENTITY_CFG}=\"{}\"", provenance.digest));
+    }
     global_cfgs.extend(user_device_cfgs.iter().cloned());
 
     apply_codegen_rustflags(cmd, ctx, profile, &global_cfgs);
-    cmd.env(CODEGEN_FINGERPRINT_ENV, codegen_fingerprint);
+    cmd.env(CODEGEN_FINGERPRINT_ENV, codegen_fingerprint)
+        .env(BACKEND_PROVENANCE_ENV, backend_digest)
+        .env(BACKEND_PATH_ENV, backend_path);
+    match compiler_provenance {
+        Some((provenance, manifest)) => {
+            cmd.env(COMPILER_PROVENANCE_ENV, provenance.digest)
+                .env(COMPILER_COMPONENTS_ENV, manifest);
+        }
+        None => {
+            // Code generation remains available, but the backend requires this
+            // handshake before enabling the cross-target artifact cache.
+            cmd.env_remove(COMPILER_PROVENANCE_ENV)
+                .env_remove(COMPILER_COMPONENTS_ENV);
+        }
+    }
     Ok(())
 }
 
@@ -6306,6 +6539,14 @@ mod tests {
         flags.windows(2).any(|pair| {
             pair[0] == "--cfg"
                 && pair[1].starts_with("cuda_oxide_internal_backend_identity=\"")
+                && pair[1].ends_with('"')
+        })
+    }
+
+    fn has_compiler_identity_cfg(flags: &[&str]) -> bool {
+        flags.windows(2).any(|pair| {
+            pair[0] == "--cfg"
+                && pair[1].starts_with("cuda_oxide_internal_compiler_identity=\"")
                 && pair[1].ends_with('"')
         })
     }
@@ -8677,7 +8918,7 @@ device-owner = { path = "../device-owner" }
     }
 
     #[test]
-    fn passthrough_fingerprint_ignores_backend_selector_and_runtime_manifest() {
+    fn passthrough_fingerprint_ignores_non_semantic_paths_and_traces() {
         let ctx = test_context(OxideConfig::default());
         let opts = CargoPassthroughOptions {
             verbose: false,
@@ -8712,6 +8953,14 @@ device-owner = { path = "../device-owner" }
                 LOADED_KERNEL_MANIFEST_ENV.to_string(),
                 b"/tmp/runtime-only-kernels.jsonl".to_vec(),
             ),
+            (
+                reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_DIR_ENV.to_string(),
+                b"/tmp/device-object-cache".to_vec(),
+            ),
+            (
+                reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_TRACE_ENV.to_string(),
+                b"1".to_vec(),
+            ),
         ]);
         let configured = test_context(OxideConfig {
             env: vec![
@@ -8722,6 +8971,14 @@ device-owner = { path = "../device-owner" }
                 (
                     LOADED_KERNEL_MANIFEST_ENV.to_string(),
                     "/tmp/runtime-only-kernels.jsonl".to_string(),
+                ),
+                (
+                    reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_DIR_ENV.to_string(),
+                    "/tmp/device-object-cache".to_string(),
+                ),
+                (
+                    reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_TRACE_ENV.to_string(),
+                    "1".to_string(),
                 ),
             ],
             ..OxideConfig::default()
@@ -8761,6 +9018,9 @@ device-owner = { path = "../device-owner" }
         )
         .unwrap();
         let before = command_env(&before_cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+        assert!(has_compiler_identity_cfg(&decoded_rustflags(&before)));
+        let before_backend = command_env(&before_cmd, BACKEND_PROVENANCE_ENV).unwrap();
+        let before_compiler = command_env(&before_cmd, COMPILER_PROVENANCE_ENV);
         // Preserve the weak metadata identity that used to be fingerprinted:
         // only the bytes differ.
         std::fs::write(&backend, b"other").unwrap();
@@ -8783,11 +9043,71 @@ device-owner = { path = "../device-owner" }
         )
         .unwrap();
         let after = command_env(&after_cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+        let after_backend = command_env(&after_cmd, BACKEND_PROVENANCE_ENV).unwrap();
 
         assert_ne!(before, after);
+        assert_ne!(before_backend, after_backend);
+        assert_eq!(
+            command_env(&before_cmd, BACKEND_PATH_ENV),
+            command_env(&after_cmd, BACKEND_PATH_ENV)
+        );
+        assert_eq!(
+            before_compiler,
+            command_env(&after_cmd, COMPILER_PROVENANCE_ENV)
+        );
         assert_eq!(
             command_env(&before_cmd, CODEGEN_FINGERPRINT_ENV),
             command_env(&after_cmd, CODEGEN_FINGERPRINT_ENV)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compiler_provenance_tracks_same_path_rustc_and_llvm_rebuilds() {
+        let root = unique_temp_dir("cargo_oxide_compiler_provenance");
+        std::fs::create_dir_all(&root).unwrap();
+        let rustc_driver = root.join("librustc_driver.so");
+        let llvm = root.join("libLLVM.so");
+        std::fs::write(&rustc_driver, b"driver-a").unwrap();
+        std::fs::write(&llvm, b"llvm-a").unwrap();
+        let modified = std::fs::metadata(&rustc_driver)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let fingerprint = |version: &[u8]| {
+            compiler_provenance_from_files(
+                version,
+                &mut [
+                    ("rustc-driver".to_string(), rustc_driver.clone()),
+                    ("llvm".to_string(), llvm.clone()),
+                ],
+            )
+            .unwrap()
+            .digest
+        };
+        let base = fingerprint(b"rustc 1.0\nLLVM version: 1\n");
+
+        std::fs::write(&rustc_driver, b"driver-b").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&rustc_driver)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let rebuilt_rustc = fingerprint(b"rustc 1.0\nLLVM version: 1\n");
+        assert_ne!(base, rebuilt_rustc);
+
+        std::fs::write(&llvm, b"llvm-b").unwrap();
+        let rebuilt_llvm = fingerprint(b"rustc 1.0\nLLVM version: 1\n");
+        assert_ne!(rebuilt_rustc, rebuilt_llvm);
+        assert_ne!(rebuilt_llvm, fingerprint(b"rustc 1.1\nLLVM version: 2\n"));
+
+        std::fs::remove_file(&llvm).unwrap();
+        assert!(
+            compiler_provenance_from_files(b"rustc 1.0\n", &mut [("llvm".to_string(), llvm)],)
+                .is_err(),
+            "unreadable compiler components must fail closed"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

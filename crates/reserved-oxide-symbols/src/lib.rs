@@ -59,12 +59,34 @@ use alloc::string::String;
 /// Cargo invalidates those crates without invalidating unrelated host crates.
 pub const CODEGEN_FINGERPRINT_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_FINGERPRINT";
 
+/// SHA-256 of the exact resolved rustc-codegen backend binary loaded by rustc.
+pub const BACKEND_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_BACKEND_PROVENANCE";
+
+/// Canonical path whose bytes produced [`BACKEND_PROVENANCE_ENV`]. The backend
+/// revalidates it before cache reads and publications.
+pub const BACKEND_PATH_ENV: &str = "CUDA_OXIDE_INTERNAL_BACKEND_PATH";
+
+/// Content identity of the active rustc driver and LLVM implementation.
+pub const COMPILER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_COMPILER_PROVENANCE";
+
+/// Canonical compiler component paths and their digests. The backend
+/// revalidates this retained implementation manifest around cache operations.
+pub const COMPILER_COMPONENTS_ENV: &str = "CUDA_OXIDE_INTERNAL_COMPILER_COMPONENTS";
+
 /// Internal cargo-oxide/backend opt-in for build-time cubin materialization.
 pub const MATERIALIZE_CUBIN_ENV: &str = "CUDA_OXIDE_MATERIALIZE_CUBIN";
 
 /// Exact CUDA compiler/linker provenance discovered by cargo-oxide and checked
 /// again by the codegen backend before materialization.
 pub const MATERIALIZER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_MATERIALIZER_PROVENANCE";
+
+/// Optional absolute root for immutable, content-addressed device-owner
+/// objects. This changes where compiler output is retained, never its bytes.
+pub const DEVICE_ARTIFACT_CACHE_DIR_ENV: &str = "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_DIR";
+
+/// Emit one cache/phase record for each selected device owner. Diagnostics do
+/// not participate in code generation and therefore are not cache identity.
+pub const DEVICE_ARTIFACT_CACHE_TRACE_ENV: &str = "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_TRACE";
 
 /// Optional comma-separated filter selecting crates that may own device code.
 pub const DEVICE_CODEGEN_CRATE_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_CRATE";

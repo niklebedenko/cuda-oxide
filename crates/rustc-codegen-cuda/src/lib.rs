@@ -324,7 +324,9 @@ extern crate rustc_public_bridge;
 extern crate rustc_codegen_llvm;
 
 mod collector;
+mod device_artifact_cache;
 mod device_codegen;
+mod device_semantic_fingerprint;
 mod generated_intrinsics;
 mod materialize;
 
@@ -370,7 +372,169 @@ struct CudaOngoingCodegen {
 
 struct ArtifactObject {
     path: PathBuf,
+    audit_path: Option<PathBuf>,
     retain_in_host_cgus: bool,
+}
+
+struct PreparedDeviceArtifactCache {
+    cache: device_artifact_cache::DeviceArtifactObjectCache,
+    key: String,
+    expected: device_artifact_cache::ExpectedArtifactObject,
+    retain_in_host_cgus: bool,
+    backend_path: PathBuf,
+    backend_provenance: String,
+    compiler_components: Vec<CompilerComponentProvenance>,
+    materialization_request: materialize::MaterializationRequest,
+}
+
+struct CompilerComponentProvenance {
+    label: String,
+    path: PathBuf,
+    digest: String,
+}
+
+impl PreparedDeviceArtifactCache {
+    fn verify_backend_provenance(&self) -> Result<(), String> {
+        let actual = device_artifact_cache::file_sha256(&self.backend_path)?;
+        if actual == self.backend_provenance {
+            Ok(())
+        } else {
+            Err(format!(
+                "codegen backend {} changed during this build (expected {}, found {actual})",
+                self.backend_path.display(),
+                self.backend_provenance
+            ))
+        }
+    }
+
+    fn verify_compiler_provenance(&self) -> Result<(), String> {
+        verify_compiler_components(&self.compiler_components)?;
+        verify_running_compiler_components(&self.compiler_components)
+    }
+
+    fn verify_implementation_provenance(&self) -> Result<(), String> {
+        self.verify_backend_provenance()?;
+        self.verify_compiler_provenance()?;
+        materialize::validate_provenance(self.materialization_request)
+            .map_err(|error| format!("CUDA materializer provenance changed: {error}"))
+    }
+
+    fn load(
+        &self,
+        output_dir: &Path,
+        output_name: &str,
+        host_target: &str,
+    ) -> Result<Option<ArtifactObject>, Box<dyn std::error::Error>> {
+        if let Err(error) = self.verify_implementation_provenance() {
+            device_artifact_cache::trace("rejected-compiler-provenance", &self.key);
+            eprintln!("[rustc_codegen_cuda] Device artifact cache disabled: {error}");
+            return Ok(None);
+        }
+        let cached = match self.cache.load(&self.key) {
+            device_artifact_cache::CacheRead::Miss => {
+                device_artifact_cache::trace("miss", &self.key);
+                return Ok(None);
+            }
+            device_artifact_cache::CacheRead::Corrupt(error) => {
+                device_artifact_cache::trace("rejected-corrupt", &self.key);
+                eprintln!(
+                    "[rustc_codegen_cuda] Ignoring corrupt device artifact cache entry {}: {error}",
+                    self.key
+                );
+                return Ok(None);
+            }
+            device_artifact_cache::CacheRead::Hit(cached) => cached,
+        };
+        if let Err(error) =
+            device_artifact_cache::validate_artifact_object(&cached.object, &self.expected)
+        {
+            device_artifact_cache::trace("rejected-identity", &self.key);
+            eprintln!(
+                "[rustc_codegen_cuda] Ignoring invalid device artifact cache entry {}: {error}",
+                self.key
+            );
+            return Ok(None);
+        }
+        let audit_path = cached
+            .audit
+            .map(|audit| -> Result<PathBuf, Box<dyn std::error::Error>> {
+                std::fs::create_dir_all(output_dir)?;
+                let suffix = match audit.kind {
+                    device_artifact_cache::AuditArtifactKind::Ptx => "ptx",
+                    device_artifact_cache::AuditArtifactKind::PtxBundle => "ptx.bundle",
+                };
+                let path = output_dir.join(format!("{output_name}.{suffix}"));
+                std::fs::write(&path, audit.bytes)?;
+                Ok(path)
+            })
+            .transpose()?;
+        let path = write_artifact_object(
+            output_dir,
+            output_name,
+            host_target,
+            &cached.object,
+            "cache",
+        )?;
+        device_artifact_cache::trace("hit", &self.key);
+        Ok(Some(ArtifactObject {
+            path,
+            audit_path,
+            retain_in_host_cgus: self.retain_in_host_cgus,
+        }))
+    }
+
+    fn publish(&self, artifact: &ArtifactObject) {
+        if let Err(error) = self.verify_implementation_provenance() {
+            device_artifact_cache::trace("rejected-compiler-provenance", &self.key);
+            eprintln!("[rustc_codegen_cuda] Device artifact cache publication skipped: {error}");
+            return;
+        }
+        let object = std::fs::read(&artifact.path).map_err(|error| error.to_string());
+        let audit = artifact
+            .audit_path
+            .as_ref()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let kind = if name.ends_with(".ptx.bundle") {
+                    device_artifact_cache::AuditArtifactKind::PtxBundle
+                } else if name.ends_with(".ptx") {
+                    device_artifact_cache::AuditArtifactKind::Ptx
+                } else {
+                    return Err(format!(
+                        "unsupported materialized audit artifact {}",
+                        path.display()
+                    ));
+                };
+                std::fs::read(path)
+                    .map(|bytes| (kind, bytes))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose();
+        match object
+            .and_then(|object| {
+                audit.and_then(|audit| {
+                    self.cache.publish_validated_artifact(
+                        &self.key,
+                        &object,
+                        audit
+                            .as_ref()
+                            .map(|(kind, bytes)| (*kind, bytes.as_slice())),
+                        &self.expected,
+                    )
+                })
+            })
+            .and_then(|()| self.cache.reclaim(&self.key))
+        {
+            Ok(()) => device_artifact_cache::trace("published", &self.key),
+            Err(error) => eprintln!(
+                "[rustc_codegen_cuda] Device artifact cache publication failed for {}: {error}",
+                self.key
+            ),
+        }
+    }
 }
 
 static ARTIFACT_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -424,9 +588,8 @@ impl CudaCodegenConfig {
                 .ok()
                 .as_deref(),
         );
-        let parsed_roots = match std::env::var_os(
-            reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV,
-        ) {
+        let parsed_roots = match std::env::var_os(reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV)
+        {
             None => Ok(None),
             Some(raw) => raw.to_str().map_or_else(
                 || {
@@ -441,25 +604,21 @@ impl CudaCodegenConfig {
         let parsed_roots = parsed_roots.and_then(|filters| {
             validate_device_codegen_root_owners(filters, device_codegen_crates.as_ref())
         });
-        let parsed_descriptors = match std::env::var_os(
-            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV,
-        ) {
-            None => Ok(None),
-            Some(raw) => raw.to_str().map_or_else(
-                || {
-                    Err(format!(
-                        "{} is not valid Unicode",
-                        reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
-                    ))
-                },
-                |raw| parse_device_codegen_root_descriptors(Some(raw)),
-            ),
-        };
+        let parsed_descriptors =
+            match std::env::var_os(reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV) {
+                None => Ok(None),
+                Some(raw) => raw.to_str().map_or_else(
+                    || {
+                        Err(format!(
+                            "{} is not valid Unicode",
+                            reserved_oxide_symbols::DEVICE_CODEGEN_ROOT_DESCRIPTORS_ENV
+                        ))
+                    },
+                    |raw| parse_device_codegen_root_descriptors(Some(raw)),
+                ),
+            };
         let parsed_descriptors = parsed_descriptors.and_then(|filters| {
-            validate_device_codegen_root_descriptor_owners(
-                filters,
-                device_codegen_crates.as_ref(),
-            )
+            validate_device_codegen_root_descriptor_owners(filters, device_codegen_crates.as_ref())
         });
         let (device_codegen_roots, device_codegen_root_descriptors, mut device_codegen_roots_error) =
             match (parsed_roots, parsed_descriptors) {
@@ -479,11 +638,9 @@ impl CudaCodegenConfig {
         let monolithic_device_codegen =
             std::env::var_os("CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN").is_some();
         if device_codegen_roots_error.is_none() {
-            device_codegen_roots_error = validate_monolithic_device_codegen(
-                monolithic_device_codegen,
-                has_exact_roots,
-            )
-            .err();
+            device_codegen_roots_error =
+                validate_monolithic_device_codegen(monolithic_device_codegen, has_exact_roots)
+                    .err();
         }
         Self {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
@@ -535,12 +692,10 @@ fn validate_monolithic_device_codegen(
     has_exact_roots: bool,
 ) -> Result<(), String> {
     if monolithic_device_codegen && !has_exact_roots {
-        Err(
-            "CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
+        Err("CUDA_OXIDE_MONOLITHIC_DEVICE_CODEGEN requires \
              CUDA_OXIDE_DEVICE_CODEGEN_ROOTS or \
              CUDA_OXIDE_DEVICE_CODEGEN_ROOT_DESCRIPTORS"
-                .to_string(),
-        )
+            .to_string())
     } else {
         Ok(())
     }
@@ -606,11 +761,7 @@ fn parse_device_codegen_roots(
                 reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
             ));
         }
-        if !filters
-            .entry(owner)
-            .or_default()
-            .insert(root.to_string())
-        {
+        if !filters.entry(owner).or_default().insert(root.to_string()) {
             return Err(format!(
                 "duplicate {} entry {entry:?}",
                 reserved_oxide_symbols::DEVICE_CODEGEN_ROOTS_ENV
@@ -647,9 +798,7 @@ fn parse_device_codegen_root_descriptors(
         if !is_ascii_identifier(&owner)
             || !descriptor.starts_with(collector::ROOT_DESCRIPTOR_VERSION_PREFIX)
             || descriptor.len() == collector::ROOT_DESCRIPTOR_VERSION_PREFIX.len()
-            || descriptor
-                .chars()
-                .any(|character| character.is_control())
+            || descriptor.chars().any(|character| character.is_control())
         {
             return Err(format!(
                 "invalid {} entry {entry:?}; owner must be an ASCII identifier and descriptor must be a control-free `{}...` value",
@@ -899,6 +1048,7 @@ impl CodegenBackend for CudaCodegenBackend {
                 ) {
                     Ok(path) => artifact_objects.push(ArtifactObject {
                         path,
+                        audit_path: None,
                         retain_in_host_cgus: false,
                     }),
                     Err(error) => tcx.dcx().fatal(format!(
@@ -966,10 +1116,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             eprintln!(
                                 "[rustc_codegen_cuda] Device-root map: owner={} descriptor={} export={}",
                                 normalize_device_crate_name(crate_name.as_str()),
-                                function
-                                    .root_descriptor
-                                    .as_deref()
-                                    .expect("filtered above"),
+                                function.root_descriptor.as_deref().expect("filtered above"),
                                 function.export_name,
                             );
                         }
@@ -982,11 +1129,11 @@ impl CodegenBackend for CudaCodegenBackend {
                     .map(|declaration| declaration.export_name.as_str())
                     .collect::<Vec<_>>();
                 materialize::validate_collection(materialization_request, &device_extern_names)
-                .unwrap_or_else(|error| {
-                    tcx.dcx().fatal(format!(
-                        "[rustc_codegen_cuda] Cannot materialize this device artifact: {error}"
-                    ))
-                });
+                    .unwrap_or_else(|error| {
+                        tcx.dcx().fatal(format!(
+                            "[rustc_codegen_cuda] Cannot materialize this device artifact: {error}"
+                        ))
+                    });
 
                 if self.config.verbose {
                     eprintln!(
@@ -1005,8 +1152,7 @@ impl CodegenBackend for CudaCodegenBackend {
                 // Create device codegen config from our config
                 let device_output_name = rustc_unit_output_name(
                     crate_name.as_str(),
-                    tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
-                        .as_u64()
+                    tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE).as_u64(),
                 );
                 let device_config =
                     device_codegen::DeviceCodegenConfig {
@@ -1028,131 +1174,184 @@ impl CodegenBackend for CudaCodegenBackend {
                         ),
                     };
 
-                // Run the cuda-oxide pipeline, catching backend panics and
-                // re-emitting them as a cuda-oxide diagnostic. A panic
-                // inside the pipeline (typically pliron's IR invariant
-                // checks) would otherwise escape to rustc's panic hook and
-                // get dressed up as "the compiler unexpectedly panicked,
-                // please file a rustc bug". The bug is in cuda-oxide, so
-                // we want users pointed at our tracker, not rustc's.
-                //
-                // We also briefly swap rustc's ICE hook for our own, because
-                // panic hooks fire *before* catch_unwind catches the unwind.
-                // Without the swap, the rustc-flavoured banner would still
-                // print to stderr ahead of our diagnostic. The replacement
-                // hook also captures a backtrace, since by the time we
-                // catch the unwind the stack we want is gone. Capture
-                // honours `RUST_BACKTRACE` so an unset env var still costs
-                // nothing. Hooks are global; rustc's codegen at this entry
-                // point is effectively single-threaded, so the brief
-                // window where the hook is swapped is safe.
-                let (panic_outcome, panic_backtrace) = {
-                    use std::backtrace::Backtrace;
-                    use std::panic::{AssertUnwindSafe, catch_unwind};
-                    use std::sync::{Arc, Mutex};
-                    let bt_slot: Arc<Mutex<Option<Backtrace>>> = Arc::new(Mutex::new(None));
-                    let bt_setter = Arc::clone(&bt_slot);
-                    let prev_hook = std::panic::take_hook();
-                    std::panic::set_hook(Box::new(move |_info| {
-                        if let Ok(mut g) = bt_setter.lock() {
-                            *g = Some(Backtrace::capture());
-                        }
-                    }));
-                    let r = catch_unwind(AssertUnwindSafe(|| {
-                        device_codegen::generate_device_code(
-                            tcx,
-                            device_functions,
-                            &collection_result.function_families,
-                            &collection_result.device_externs,
-                            &device_config,
-                        )
-                    }));
-                    std::panic::set_hook(prev_hook);
-                    (r, bt_slot)
+                let prepared_cache = if let Some(materialization_request) = materialization_request
+                {
+                    prepare_device_artifact_cache(
+                        tcx,
+                        crate_name.as_str(),
+                        crate_name.as_str(),
+                        tcx.sess.target.llvm_target.as_ref(),
+                        &device_config,
+                        &collection_result,
+                        materialization_request,
+                        self.config.device_codegen_crates.is_some(),
+                    )
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "[rustc_codegen_cuda] Device artifact cache disabled for \
+                             `{crate_name}`: {error}"
+                        );
+                        None
+                    })
+                } else {
+                    None
                 };
+                let cached_artifact = prepared_cache.as_ref().and_then(|prepared| {
+                    prepared
+                        .load(
+                            &device_config.output_dir,
+                            &device_config.output_name,
+                            tcx.sess.target.llvm_target.as_ref(),
+                        )
+                        .unwrap_or_else(|error| {
+                            tcx.dcx().fatal(format!(
+                                "[rustc_codegen_cuda] Failed to restore cached device artifact: \
+                                 {error}"
+                            ))
+                        })
+                });
 
-                match panic_outcome {
-                    Err(payload) => {
-                        let msg = payload
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "<opaque panic payload>".into());
-                        match panic_backtrace.lock().ok().and_then(|mut g| g.take()) {
-                            Some(bt)
-                                if bt.status() == std::backtrace::BacktraceStatus::Captured =>
-                            {
-                                eprintln!("[rustc_codegen_cuda] backtrace:\n{bt}");
+                if let Some(cached_artifact) = cached_artifact {
+                    if self.config.verbose {
+                        eprintln!(
+                            "[rustc_codegen_cuda] Reused materialized device artifact: {}",
+                            cached_artifact.path.display()
+                        );
+                    }
+                    artifact_objects.push(cached_artifact);
+                    None
+                } else {
+                    // Run the cuda-oxide pipeline, catching backend panics and
+                    // re-emitting them as a cuda-oxide diagnostic. A panic
+                    // inside the pipeline (typically pliron's IR invariant
+                    // checks) would otherwise escape to rustc's panic hook and
+                    // get dressed up as "the compiler unexpectedly panicked,
+                    // please file a rustc bug". The bug is in cuda-oxide, so
+                    // we want users pointed at our tracker, not rustc's.
+                    //
+                    // We also briefly swap rustc's ICE hook for our own, because
+                    // panic hooks fire *before* catch_unwind catches the unwind.
+                    // Without the swap, the rustc-flavoured banner would still
+                    // print to stderr ahead of our diagnostic. The replacement
+                    // hook also captures a backtrace, since by the time we
+                    // catch the unwind the stack we want is gone. Capture
+                    // honours `RUST_BACKTRACE` so an unset env var still costs
+                    // nothing. Hooks are global; rustc's codegen at this entry
+                    // point is effectively single-threaded, so the brief
+                    // window where the hook is swapped is safe.
+                    let (panic_outcome, panic_backtrace) = {
+                        use std::backtrace::Backtrace;
+                        use std::panic::{AssertUnwindSafe, catch_unwind};
+                        use std::sync::{Arc, Mutex};
+                        let bt_slot: Arc<Mutex<Option<Backtrace>>> = Arc::new(Mutex::new(None));
+                        let bt_setter = Arc::clone(&bt_slot);
+                        let prev_hook = std::panic::take_hook();
+                        std::panic::set_hook(Box::new(move |_info| {
+                            if let Ok(mut g) = bt_setter.lock() {
+                                *g = Some(Backtrace::capture());
                             }
-                            _ => {
-                                eprintln!(
-                                    "[rustc_codegen_cuda] note: run with `RUST_BACKTRACE=1` to display a backtrace"
-                                );
+                        }));
+                        let r = catch_unwind(AssertUnwindSafe(|| {
+                            device_codegen::generate_device_code(
+                                tcx,
+                                device_functions,
+                                &collection_result.function_families,
+                                &collection_result.device_externs,
+                                &device_config,
+                            )
+                        }));
+                        std::panic::set_hook(prev_hook);
+                        (r, bt_slot)
+                    };
+
+                    match panic_outcome {
+                        Err(payload) => {
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<opaque panic payload>".into());
+                            match panic_backtrace.lock().ok().and_then(|mut g| g.take()) {
+                                Some(bt)
+                                    if bt.status() == std::backtrace::BacktraceStatus::Captured =>
+                                {
+                                    eprintln!("[rustc_codegen_cuda] backtrace:\n{bt}");
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "[rustc_codegen_cuda] note: run with `RUST_BACKTRACE=1` to display a backtrace"
+                                    );
+                                }
                             }
-                        }
-                        tcx.dcx().fatal(format!(
-                            "[rustc_codegen_cuda] Internal compiler error in \
+                            tcx.dcx().fatal(format!(
+                                "[rustc_codegen_cuda] Internal compiler error in \
                              device codegen: {msg}. This is a bug in cuda-oxide. \
                              Please file at https://github.com/NVlabs/cuda-oxide/issues"
-                        ));
-                    }
-                    Ok(Ok(result)) => {
-                        if self.config.verbose
-                            && let Some(artifact) = result.artifacts.first()
-                        {
-                            eprintln!(
-                                "[rustc_codegen_cuda] Device codegen complete: {} partition(s), first={} ({:?}, target: {})",
-                                result.artifacts.len(),
-                                artifact.name,
-                                artifact.kind,
-                                result.target
-                            );
+                            ));
                         }
-                        if !result.artifacts.is_empty() {
-                            match write_device_artifact_object(
-                                &device_config.output_dir,
-                                &device_config.output_name,
-                                crate_name.as_str(),
-                                crate_name.as_str(),
-                                tcx.sess.target.llvm_target.as_ref(),
-                                &result,
-                                device_functions,
-                                self.config.device_codegen_crates.is_some(),
-                                materialization_request,
-                            ) {
-                                Ok(path) => {
-                                    if self.config.verbose {
-                                        eprintln!(
-                                            "[rustc_codegen_cuda] Embedded artifact object complete: {}",
-                                            path.path.display()
-                                        );
+                        Ok(Ok(result)) => {
+                            if self.config.verbose
+                                && let Some(artifact) = result.artifacts.first()
+                            {
+                                eprintln!(
+                                    "[rustc_codegen_cuda] Device codegen complete: {} partition(s), first={} ({:?}, target: {})",
+                                    result.artifacts.len(),
+                                    artifact.name,
+                                    artifact.kind,
+                                    result.target
+                                );
+                            }
+                            if !result.artifacts.is_empty() {
+                                match write_device_artifact_object(
+                                    &device_config.output_dir,
+                                    &device_config.output_name,
+                                    crate_name.as_str(),
+                                    crate_name.as_str(),
+                                    tcx.sess.target.llvm_target.as_ref(),
+                                    &result,
+                                    device_functions,
+                                    self.config.device_codegen_crates.is_some(),
+                                    materialization_request,
+                                ) {
+                                    Ok(path) => {
+                                        if self.config.verbose {
+                                            eprintln!(
+                                                "[rustc_codegen_cuda] Embedded artifact object complete: {}",
+                                                path.path.display()
+                                            );
+                                        }
+                                        if let Some(prepared_cache) = &prepared_cache {
+                                            prepared_cache.publish(&path);
+                                        }
+                                        artifact_objects.push(path);
                                     }
-                                    artifact_objects.push(path);
-                                }
-                                Err(e) => {
-                                    tcx.dcx().fatal(format!(
+                                    Err(e) => {
+                                        tcx.dcx().fatal(format!(
                                         "[rustc_codegen_cuda] Failed to embed device artifact: {e}"
                                     ));
+                                    }
                                 }
-                            }
-                        } else {
-                            tcx.dcx().fatal(
+                            } else {
+                                tcx.dcx().fatal(
                                 "[rustc_codegen_cuda] Device codegen did not produce an embeddable artifact",
                             );
+                            }
+                            Some(result)
                         }
-                        Some(result)
-                    }
-                    Ok(Err(e)) => {
-                        // Hard-fail: a swallowed device codegen error produces
-                        // a host binary with stale or missing PTX, which then
-                        // silently mis-runs on the GPU. The wrapper script
-                        // (cargo-oxide) reports "✓ Build succeeded" in that
-                        // case because the host LLVM backend below succeeds.
-                        // Surface the failure as a rustc fatal so cargo exits
-                        // non-zero and the wrapper's success print never fires.
-                        // See `.cursor/rules/compiler-gaps-are-bugs.mdc`.
-                        tcx.dcx()
-                            .fatal(format!("[rustc_codegen_cuda] Device codegen failed: {}", e));
+                        Ok(Err(e)) => {
+                            // Hard-fail: a swallowed device codegen error produces
+                            // a host binary with stale or missing PTX, which then
+                            // silently mis-runs on the GPU. The wrapper script
+                            // (cargo-oxide) reports "✓ Build succeeded" in that
+                            // case because the host LLVM backend below succeeds.
+                            // Surface the failure as a rustc fatal so cargo exits
+                            // non-zero and the wrapper's success print never fires.
+                            // See `.cursor/rules/compiler-gaps-are-bugs.mdc`.
+                            tcx.dcx().fatal(format!(
+                                "[rustc_codegen_cuda] Device codegen failed: {}",
+                                e
+                            ));
+                        }
                     }
                 }
             } else {
@@ -1226,6 +1425,313 @@ fn rustc_unit_output_name(owner: &str, stable_crate_id: u64) -> String {
     format!("{owner}.{stable_crate_id:016x}")
 }
 
+fn parse_compiler_component_provenance(
+    manifest: &str,
+) -> Result<Vec<CompilerComponentProvenance>, String> {
+    let mut components = Vec::new();
+    let mut labels = BTreeSet::new();
+    for line in manifest.lines() {
+        let mut fields = line.split('\t');
+        let label = fields.next().unwrap_or_default();
+        let digest = fields.next().unwrap_or_default();
+        let path = fields.next().unwrap_or_default();
+        if label.is_empty()
+            || fields.next().is_some()
+            || !device_artifact_cache::is_sha256_digest(digest)
+        {
+            return Err("compiler component provenance manifest is malformed".to_string());
+        }
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "compiler component {label} path must be absolute, got {}",
+                path.display()
+            ));
+        }
+        let canonical = path.canonicalize().map_err(|error| {
+            format!(
+                "cannot resolve compiler component {label} at {}: {error}",
+                path.display()
+            )
+        })?;
+        if canonical != path {
+            return Err(format!(
+                "compiler component {label} path is not canonical: {}",
+                path.display()
+            ));
+        }
+        if !labels.insert(label.to_string()) {
+            return Err(
+                "compiler component provenance manifest contains duplicate labels".to_string(),
+            );
+        }
+        components.push(CompilerComponentProvenance {
+            label: label.to_string(),
+            path,
+            digest: digest.to_string(),
+        });
+    }
+    if !labels.contains("rustc")
+        || !labels
+            .iter()
+            .any(|label| label.starts_with("rustc-driver:"))
+        || !labels.iter().any(|label| label.starts_with("llvm:"))
+    {
+        return Err(
+            "compiler component provenance must include rustc, rustc-driver, and LLVM".to_string(),
+        );
+    }
+    Ok(components)
+}
+
+fn verify_compiler_components(components: &[CompilerComponentProvenance]) -> Result<(), String> {
+    for component in components {
+        let actual = device_artifact_cache::file_sha256(&component.path)?;
+        if actual != component.digest {
+            return Err(format!(
+                "compiler component {} at {} changed after cargo-oxide fingerprinted it (expected {}, found {actual})",
+                component.label,
+                component.path.display(),
+                component.digest
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_running_compiler_components(
+    components: &[CompilerComponentProvenance],
+) -> Result<(), String> {
+    let expected_rustc = components
+        .iter()
+        .find(|component| component.label == "rustc")
+        .expect("validated compiler manifest contains rustc");
+    let running_rustc = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the running rustc executable: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize the running rustc executable: {error}"))?;
+    if running_rustc != expected_rustc.path {
+        return Err(format!(
+            "cargo-oxide fingerprinted rustc at {}, but the backend is loaded by {}",
+            expected_rustc.path.display(),
+            running_rustc.display()
+        ));
+    }
+
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|error| {
+        format!("cannot inspect loaded rustc/LLVM implementations through /proc/self/maps: {error}")
+    })?;
+    let mut loaded_driver = BTreeSet::new();
+    let mut loaded_llvm = BTreeSet::new();
+    for line in maps.lines() {
+        let Some(raw_path) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !raw_path.starts_with('/') {
+            continue;
+        }
+        let path = PathBuf::from(raw_path);
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let destination = if name.starts_with("librustc_driver") {
+            &mut loaded_driver
+        } else if name.starts_with("libLLVM") {
+            &mut loaded_llvm
+        } else {
+            continue;
+        };
+        destination.insert(path.canonicalize().map_err(|error| {
+            format!(
+                "cannot resolve loaded compiler library {}: {error}",
+                path.display()
+            )
+        })?);
+    }
+
+    for (category, loaded) in [("rustc-driver", loaded_driver), ("llvm", loaded_llvm)] {
+        if loaded.is_empty() {
+            return Err(format!(
+                "the running compiler exposes no loaded {category} library in /proc/self/maps"
+            ));
+        }
+        let expected = components
+            .iter()
+            .filter(|component| component.label.starts_with(&format!("{category}:")))
+            .map(|component| component.path.clone())
+            .collect::<BTreeSet<_>>();
+        for path in loaded {
+            if !expected.contains(&path) {
+                return Err(format!(
+                    "loaded {category} implementation {} was not fingerprinted by cargo-oxide",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_device_artifact_cache<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    device_owner: &str,
+    target_output_name: &str,
+    host_target: &str,
+    device_config: &device_codegen::DeviceCodegenConfig,
+    collection: &collector::CollectionResult<'tcx>,
+    materialization_request: materialize::MaterializationRequest,
+    use_target_specific_anchor: bool,
+) -> Result<Option<PreparedDeviceArtifactCache>, String> {
+    let Some(cache) = device_artifact_cache::DeviceArtifactObjectCache::from_env()? else {
+        return Ok(None);
+    };
+    materialize::validate_provenance(materialization_request)
+        .map_err(|error| format!("cannot verify CUDA materializer provenance: {error}"))?;
+    let target = std::env::var("CUDA_OXIDE_TARGET").map_err(|_| {
+        "device artifact caching requires the materialized CUDA target to be pinned".to_string()
+    })?;
+    let codegen_fingerprint = std::env::var(reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV)
+        .map_err(|_| {
+            "device artifact caching requires cargo-oxide's codegen fingerprint".to_string()
+        })?;
+    let backend_provenance = std::env::var(reserved_oxide_symbols::BACKEND_PROVENANCE_ENV)
+        .map_err(|_| {
+            "device artifact caching requires the exact codegen backend provenance".to_string()
+        })?;
+    if !device_artifact_cache::is_sha256_digest(&backend_provenance) {
+        return Err("codegen backend provenance is not a SHA-256 digest".to_string());
+    }
+    let backend_path =
+        std::env::var_os(reserved_oxide_symbols::BACKEND_PATH_ENV).ok_or_else(|| {
+            "device artifact caching requires the resolved codegen backend path".to_string()
+        })?;
+    let backend_path = PathBuf::from(backend_path);
+    if !backend_path.is_absolute() {
+        return Err(format!(
+            "device artifact caching requires an absolute codegen backend path, got {}",
+            backend_path.display()
+        ));
+    }
+    let actual_backend_provenance = device_artifact_cache::file_sha256(&backend_path)?;
+    if actual_backend_provenance != backend_provenance {
+        return Err(format!(
+            "resolved codegen backend {} changed after cargo-oxide fingerprinted it (expected {}, found {actual_backend_provenance})",
+            backend_path.display(),
+            backend_provenance
+        ));
+    }
+    let compiler_provenance = std::env::var(reserved_oxide_symbols::COMPILER_PROVENANCE_ENV)
+        .map_err(|_| {
+            "device artifact caching requires the exact rustc/LLVM compiler provenance".to_string()
+        })?;
+    if !device_artifact_cache::is_sha256_digest(&compiler_provenance) {
+        return Err("rustc/LLVM compiler provenance is not a SHA-256 digest".to_string());
+    }
+    let compiler_component_manifest =
+        std::env::var(reserved_oxide_symbols::COMPILER_COMPONENTS_ENV).map_err(|_| {
+            "device artifact caching requires the rustc/LLVM component manifest".to_string()
+        })?;
+    let compiler_components = parse_compiler_component_provenance(&compiler_component_manifest)?;
+    verify_compiler_components(&compiler_components)?;
+    verify_running_compiler_components(&compiler_components)?;
+    let materializer_provenance =
+        std::env::var(reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV).map_err(|_| {
+            "device artifact caching requires cargo-oxide's materializer provenance".to_string()
+        })?;
+    let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| device_owner.to_string());
+    let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let binary_name = std::env::var("CARGO_BIN_NAME").unwrap_or_default();
+    let allow_fma_contraction = std::env::var_os("CUDA_OXIDE_NO_FMA").is_none();
+    let debug_kind = device_codegen::device_debug_kind(tcx.sess.opts.debuginfo);
+    let compile_options = embedded_compile_options(allow_fma_contraction, debug_kind, true);
+    let entries = collection
+        .functions
+        .iter()
+        .map(|function| device_artifact_cache::ExpectedArtifactEntry {
+            symbol: function.export_name.clone(),
+            kind: if function.is_kernel {
+                oxide_artifacts::ArtifactEntryKind::Kernel
+            } else {
+                oxide_artifacts::ArtifactEntryKind::DeviceFunction
+            },
+            root_descriptor: function
+                .root_descriptor
+                .as_ref()
+                .map(|descriptor| format!("{device_owner}\n{descriptor}")),
+        })
+        .collect::<Vec<_>>();
+    let expected = device_artifact_cache::ExpectedArtifactObject {
+        bundle_name: bundle_name.clone(),
+        target: target.clone(),
+        compile_options,
+        entries,
+    };
+
+    let mut parts = Vec::<Vec<u8>>::new();
+    let mut push = |name: &str, value: String| {
+        parts.push(name.as_bytes().to_vec());
+        parts.push(value.into_bytes());
+    };
+    push("codegen-fingerprint", codegen_fingerprint);
+    push("backend-provenance", backend_provenance.clone());
+    push("compiler-provenance", compiler_provenance);
+    push("materializer-provenance", materializer_provenance);
+    push("device-target", target);
+    push("host-target", host_target.to_string());
+    push("device-owner", device_owner.to_string());
+    push("target-output", target_output_name.to_string());
+    push("device-output", device_config.output_name.clone());
+    push("bundle", bundle_name);
+    push("package-version", package_version);
+    push("binary", binary_name);
+    push(
+        "target-specific-anchor",
+        use_target_specific_anchor.to_string(),
+    );
+    push(
+        "partition-large-owner",
+        device_config.partition_large_owner.to_string(),
+    );
+    push(
+        "compile-options",
+        format!(
+            "fma={};debug={:?}",
+            compile_options.fma_contraction_enabled(),
+            compile_options.debug_policy()
+        ),
+    );
+
+    let semantic_fingerprint =
+        device_semantic_fingerprint::device_semantic_fingerprint(tcx, collection)
+            .map_err(|error| format!("device semantic fingerprint unavailable: {error}"))?;
+    push("semantic-input-v2", semantic_fingerprint.to_hex());
+
+    if std::env::var_os(reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_TRACE_ENV)
+        .is_some_and(|value| value == "identity")
+    {
+        for pair in parts.chunks_exact(2) {
+            eprintln!(
+                "[rustc_codegen_cuda] device artifact cache identity {}={}",
+                String::from_utf8_lossy(&pair[0]),
+                String::from_utf8_lossy(&pair[1])
+            );
+        }
+    }
+
+    let key =
+        device_artifact_cache::DeviceArtifactObjectCache::key(parts.iter().map(Vec::as_slice));
+    Ok(Some(PreparedDeviceArtifactCache {
+        cache,
+        key,
+        expected,
+        retain_in_host_cgus: artifact_contains_only_generic_kernels(&collection.functions),
+        backend_path,
+        backend_provenance,
+        compiler_components,
+        materialization_request,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_device_artifact_object(
     output_dir: &Path,
@@ -1238,8 +1744,7 @@ fn write_device_artifact_object(
     use_target_specific_anchor: bool,
     materialization_request: Option<materialize::MaterializationRequest>,
 ) -> Result<ArtifactObject, Box<dyn std::error::Error>> {
-    let bundle_name =
-        std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| device_owner.to_string());
+    let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| device_owner.to_string());
     let materialized_artifact;
     let materialized_ptx_audit_path;
     let source_artifact = result
@@ -1324,8 +1829,7 @@ fn write_device_artifact_object(
         } else {
             oxide_artifacts::ArtifactEntryKind::DeviceFunction
         };
-        let mut entry =
-            oxide_artifacts::ArtifactEntrySpec::new(&function.export_name, kind);
+        let mut entry = oxide_artifacts::ArtifactEntrySpec::new(&function.export_name, kind);
         if let Some(root_descriptor) = root_descriptor {
             entry = entry.with_root_descriptor(root_descriptor);
         }
@@ -1394,6 +1898,7 @@ fn write_device_artifact_object(
             &object,
             "embed",
         )?,
+        audit_path: materialized_ptx_audit_path,
         retain_in_host_cgus: generic_only,
     })
 }
@@ -1967,9 +2472,7 @@ mod tests {
         assert!(parse_device_codegen_roots(Some("gpu_kernels=first,")).is_err());
         assert!(parse_device_codegen_roots(Some("gpu_kernels=")).is_err());
         assert!(parse_device_codegen_roots(Some("gpu_kernels=bad-root")).is_err());
-        assert!(
-            parse_device_codegen_roots(Some("gpu-kernels=first,gpu_kernels=first")).is_err()
-        );
+        assert!(parse_device_codegen_roots(Some("gpu-kernels=first,gpu_kernels=first")).is_err());
 
         assert!(
             validate_device_codegen_root_owners(
@@ -2016,8 +2519,7 @@ mod tests {
 
     #[test]
     fn semantic_device_root_filters_preserve_full_descriptors_and_fail_closed() {
-        let descriptor =
-            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>";
+        let descriptor = "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>";
         let filters = parse_device_codegen_root_descriptors(Some(&format!(
             "gpu-kernels={descriptor}\nmath_gpu=rust-instance-v1:math::reduce::<f64>"
         )))
@@ -2044,14 +2546,11 @@ mod tests {
             config.device_codegen_root_descriptor_selectors("gpu-kernels"),
             Some(&BTreeSet::from([descriptor.to_string()]))
         );
-        assert!(
-            parse_device_codegen_root_descriptors(Some("gpu_kernels=scale_TID_hash")).is_err()
-        );
+        assert!(parse_device_codegen_root_descriptors(Some("gpu_kernels=scale_TID_hash")).is_err());
         assert!(parse_device_codegen_root_descriptors(Some("gpu_kernels=")).is_err());
-        assert!(parse_device_codegen_root_descriptors(Some(
-            "gpu_kernels=rust-instance-v1:"
-        ))
-        .is_err());
+        assert!(
+            parse_device_codegen_root_descriptors(Some("gpu_kernels=rust-instance-v1:")).is_err()
+        );
         assert!(
             parse_device_codegen_root_descriptors(Some(&format!(
                 "gpu_kernels={descriptor}\ngpu-kernels={descriptor}"
@@ -2259,5 +2758,40 @@ mod tests {
             rustc_unit_output_name("impulse_host", 0x1234),
             rustc_unit_output_name("impulse_host", 0x5678)
         );
+    }
+
+    #[test]
+    fn compiler_component_manifest_is_exact_and_revalidated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda-codegen-compiler-components-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let rustc = root.join("rustc");
+        let driver = root.join("librustc_driver.so");
+        let llvm = root.join("libLLVM.so");
+        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(&driver, b"driver-a").unwrap();
+        std::fs::write(&llvm, b"llvm").unwrap();
+        let manifest = format!(
+            "rustc\t{}\t{}\nrustc-driver:test\t{}\t{}\nllvm:test\t{}\t{}\n",
+            device_artifact_cache::file_sha256(&rustc).unwrap(),
+            rustc.canonicalize().unwrap().display(),
+            device_artifact_cache::file_sha256(&driver).unwrap(),
+            driver.canonicalize().unwrap().display(),
+            device_artifact_cache::file_sha256(&llvm).unwrap(),
+            llvm.canonicalize().unwrap().display(),
+        );
+        let components = parse_compiler_component_provenance(&manifest).unwrap();
+        verify_compiler_components(&components).unwrap();
+
+        std::fs::write(&driver, b"driver-b").unwrap();
+        assert!(verify_compiler_components(&components).is_err());
+        assert!(parse_compiler_component_provenance("rustc\tnot-a-digest\t/tmp/rustc\n").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -153,6 +153,56 @@ struct DeviceInlinePlan<'tcx> {
     conflicting_deferred_unroll_closures: usize,
 }
 
+/// Exact per-function policy derived before stable-MIR import.
+///
+/// Device artifact cache identities consume this same policy so a query used
+/// only by the planner (for example an enclosing closure parent's inline
+/// attribute) cannot change emitted code behind an otherwise unchanged cache
+/// key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceFunctionCodegenPolicy {
+    pub(crate) inline_attr: mir_importer::InlineAttr,
+    pub(crate) device_link_always: bool,
+    pub(crate) device_link_inline_candidate: bool,
+    pub(crate) deferred_full_unroll: bool,
+}
+
+pub(crate) fn device_function_codegen_policies<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[CollectedFunction<'tcx>],
+) -> Vec<DeviceFunctionCodegenPolicy> {
+    let plan = build_device_inline_plan(tcx, functions);
+    device_function_codegen_policies_from_plan(tcx, functions, &plan)
+}
+
+fn device_function_codegen_policies_from_plan<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[CollectedFunction<'tcx>],
+    plan: &DeviceInlinePlan<'tcx>,
+) -> Vec<DeviceFunctionCodegenPolicy> {
+    functions
+        .iter()
+        .map(|function| {
+            let instance = function.instance;
+            let borrowed_closure = plan.borrowed_kernel_closures.contains(&instance)
+                || plan
+                    .borrowed_always_inline_helper_closures
+                    .contains(&instance);
+            DeviceFunctionCodegenPolicy {
+                inline_attr: if borrowed_closure {
+                    mir_importer::InlineAttr::DeviceAlways
+                } else {
+                    inline_attr_for_device_function(tcx, instance)
+                },
+                device_link_always: plan.array_closures.contains(&instance)
+                    || plan.deferred_full_unroll_helpers.contains(&instance),
+                device_link_inline_candidate: plan.array_builders.contains(&instance),
+                deferred_full_unroll: plan.deferred_full_unroll_helpers.contains(&instance),
+            }
+        })
+        .collect()
+}
+
 // These are compile-resource guards rather than semantic limits. Mandatory
 // device-link inlining is restricted to concrete array callbacks and the
 // erased helpers selected for bounded deferred full unrolling.
@@ -372,8 +422,7 @@ fn is_bounded_borrowed_closure_in_always_inline_helper<'tcx>(
         !crate::collector::is_kernel_function(tcx, parent)
             && matches!(
                 tcx.codegen_fn_attrs(parent).inline,
-                rustc_hir::attrs::InlineAttr::Always
-                    | rustc_hir::attrs::InlineAttr::Force { .. }
+                rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
             )
     })
 }
@@ -528,8 +577,7 @@ fn outermost_closure_instances<'tcx>(
         .into_iter()
         .filter(|candidate| {
             !all.iter().any(|ancestor| {
-                ancestor != candidate
-                    && closure_is_nested_under(tcx, *candidate, ancestor.def_id())
+                ancestor != candidate && closure_is_nested_under(tcx, *candidate, ancestor.def_id())
             })
         })
         .collect()
@@ -595,10 +643,7 @@ fn has_bounded_fixed_array_reference_argument<'tcx>(
     })
 }
 
-fn has_bounded_fixed_array_local(
-    tcx: TyCtxt<'_>,
-    def_id: rustc_hir::def_id::DefId,
-) -> bool {
+fn has_bounded_fixed_array_local(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
     let body = tcx.optimized_mir(def_id);
     body.local_decls
         .iter()
@@ -1495,7 +1540,7 @@ fn finalize_owner_partition(
     }
 }
 
-fn build_debug_source_scope_map<'tcx>(
+pub(crate) fn device_debug_source_scope_map<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &CollectedFunction<'tcx>,
 ) -> DebugSourceScopeMap {
@@ -1750,7 +1795,7 @@ pub fn generate_device_code<'tcx>(
         .collect::<Vec<_>>();
     let debug_scope_maps: Vec<_> = functions
         .iter()
-        .map(|f| build_debug_source_scope_map(tcx, f))
+        .map(|function| device_debug_source_scope_map(tcx, function))
         .collect();
     let partition_stats = std::env::var_os("CUDA_OXIDE_PARTITION_STATS").is_some();
     let partition_plan_started = std::time::Instant::now();
@@ -2047,48 +2092,11 @@ pub fn generate_device_code<'tcx>(
             inline_plan.conflicting_deferred_unroll_closures,
             inline_plan.deferred_full_unroll_helpers.len(),
             inline_plan.borrowed_kernel_closures.len(),
-            inline_plan
-                .borrowed_always_inline_helper_closures
-                .len()
+            inline_plan.borrowed_always_inline_helper_closures.len()
         );
     }
-    let inline_attrs: Vec<mir_importer::InlineAttr> = functions
-        .iter()
-        .map(|func| {
-            if inline_plan
-                .borrowed_kernel_closures
-                .contains(&func.instance)
-                || inline_plan
-                    .borrowed_always_inline_helper_closures
-                    .contains(&func.instance)
-            {
-                mir_importer::InlineAttr::DeviceAlways
-            } else {
-                inline_attr_for_device_function(tcx, func.instance)
-            }
-        })
-        .collect();
-    let device_link_always: Vec<bool> = functions
-        .iter()
-        .map(|func| {
-            inline_plan.array_closures.contains(&func.instance)
-                || inline_plan
-                    .deferred_full_unroll_helpers
-                    .contains(&func.instance)
-        })
-        .collect();
-    let device_link_inline_candidate: Vec<bool> = functions
-        .iter()
-        .map(|func| inline_plan.array_builders.contains(&func.instance))
-        .collect();
-    let deferred_full_unroll: Vec<bool> = functions
-        .iter()
-        .map(|func| {
-            inline_plan
-                .deferred_full_unroll_helpers
-                .contains(&func.instance)
-        })
-        .collect();
+    let function_codegen_policies =
+        device_function_codegen_policies_from_plan(tcx, functions, &inline_plan);
     let device_mono_reachability: Vec<crate::collector::DeviceMonoReachability> = functions
         .iter()
         .map(|func| crate::collector::device_mono_reachability(tcx, func.instance))
@@ -2135,10 +2143,11 @@ pub fn generate_device_code<'tcx>(
                     is_kernel: *is_kernel,
                     export_name: export_name.clone(),
                     debug_source_scopes: Some(debug_scope_maps[index].clone()),
-                    inline_attr: inline_attrs[index],
-                    device_link_always: device_link_always[index],
-                    device_link_inline_candidate: device_link_inline_candidate[index],
-                    deferred_full_unroll: deferred_full_unroll[index],
+                    inline_attr: function_codegen_policies[index].inline_attr,
+                    device_link_always: function_codegen_policies[index].device_link_always,
+                    device_link_inline_candidate: function_codegen_policies[index]
+                        .device_link_inline_candidate,
+                    deferred_full_unroll: function_codegen_policies[index].deferred_full_unroll,
                     core_index_trait: stable_core_index_trait,
                 },
             ));
@@ -2378,7 +2387,7 @@ pub fn generate_device_code<'tcx>(
     }
 }
 
-fn device_debug_kind(rustc_debug: DebugInfo) -> llvm_export::export::DebugKind {
+pub(crate) fn device_debug_kind(rustc_debug: DebugInfo) -> llvm_export::export::DebugKind {
     device_debug_kind_with_override(
         rustc_debug,
         std::env::var("CUDA_OXIDE_DEBUG").ok().as_deref(),

@@ -225,6 +225,12 @@ fn checked_finalizer(request: MaterializationRequest) -> Result<Finalizer, Mater
     Ok(finalizer)
 }
 
+/// Pin and verify the exact CUDA compiler implementation before a shared
+/// artifact cache operation can trust the wrapper-supplied provenance key.
+pub(crate) fn validate_provenance(request: MaterializationRequest) -> Result<(), MaterializeError> {
+    checked_finalizer(request).map(drop)
+}
+
 fn parse_bool(value: &str) -> Result<bool, MaterializeError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
