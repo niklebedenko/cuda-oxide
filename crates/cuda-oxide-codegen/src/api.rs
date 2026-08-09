@@ -4,7 +4,9 @@
  */
 
 use crate::error::PipelineError;
-use crate::llvm_tools::{LlvmToolchain, OptTool, probe_runnable, resolve_sibling_tool};
+use crate::llvm_tools::{
+    LlvmToolchain, OptTool, probe_runnable, resolve_sibling_tool, resolve_toolchain,
+};
 use crate::options::BackendOptions;
 use crate::pipeline::{
     ModuleArtifactKind, ModulePipelineRequest, OutputFiles, compile_translated_module,
@@ -444,7 +446,7 @@ impl Toolchain {
     /// toolchain can compile only with [`Optimization::None`].
     pub fn discover() -> Result<Self, CompileError> {
         let opts = BackendOptions::default();
-        let inner = LlvmToolchain::resolve(&opts).ok_or_else(|| CompileError::Toolchain {
+        let inner = resolve_toolchain(&opts).ok_or_else(|| CompileError::Toolchain {
             message: "no runnable LLVM 21+ `llc` was found in the Rust sysroot or PATH".to_string(),
         })?;
         validate_llvm_major("llc", inner.llc_major)?;

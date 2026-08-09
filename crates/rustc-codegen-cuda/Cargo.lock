@@ -208,6 +208,7 @@ dependencies = [
 name = "cuda-oxide-codegen"
 version = "0.1.0"
 dependencies = [
+ "cuda-artifact-finalizer",
  "dialect-mir",
  "dialect-nvvm",
  "libnvvm-sys",
@@ -216,6 +217,7 @@ dependencies = [
  "mir-transforms",
  "nvvm-transforms",
  "pliron",
+ "reserved-oxide-symbols",
  "tempfile",
  "thiserror",
 ]

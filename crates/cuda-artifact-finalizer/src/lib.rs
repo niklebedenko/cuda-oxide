@@ -11,6 +11,7 @@
 //! FMA, debug, input-order, validation, and provenance rules.
 
 mod link;
+mod llvm_tools;
 mod nvvm;
 mod options;
 mod partition;
@@ -20,6 +21,10 @@ mod validation;
 
 pub use libnvvm_sys::{CudaArch, CudaArchParseError, LibdeviceNotFound, NvvmError, find_libdevice};
 pub use link::LtoLinker;
+pub use llvm_tools::{
+    LlvmToolchain, LlvmToolchainOptions, OptTool, ToolchainProcessContext, describe_tool,
+    libdevice_ir_linking_available, probe_runnable, resolve_sibling_tool,
+};
 pub use nvjitlink_sys::NvJitLinkError;
 pub use nvvm::NvvmCompiler;
 pub use options::{DebugPolicy, FinalizationOptions, FinalizerOutput, NamedInput};

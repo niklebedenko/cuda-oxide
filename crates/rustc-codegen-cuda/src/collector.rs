@@ -870,9 +870,8 @@ fn semantic_root_descriptor<'tcx>(
     let (position, prefix) = prefixes
         .into_iter()
         .find_map(|prefix| fqdn.find(prefix).map(|position| (position, prefix)))?;
-    let mut semantic = String::with_capacity(
-        ROOT_DESCRIPTOR_VERSION_PREFIX.len() + fqdn.len() - prefix.len(),
-    );
+    let mut semantic =
+        String::with_capacity(ROOT_DESCRIPTOR_VERSION_PREFIX.len() + fqdn.len() - prefix.len());
     semantic.push_str(ROOT_DESCRIPTOR_VERSION_PREFIX);
     semantic.push_str(&fqdn[..position]);
     semantic.push_str(&fqdn[position + prefix.len()..]);
@@ -2681,8 +2680,7 @@ mod tests {
 
     #[test]
     fn semantic_root_selection_survives_export_hash_churn() {
-        let descriptor =
-            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
+        let descriptor = "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
         let selected = BTreeSet::from([descriptor.clone()]);
         let old = vec![(
             Some(descriptor.clone()),
@@ -2705,8 +2703,7 @@ mod tests {
 
     #[test]
     fn semantic_root_selection_fails_closed_on_missing_or_ambiguous_descriptors() {
-        let descriptor =
-            "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
+        let descriptor = "rust-instance-v1:kernel_crate::kernels::scale::<f32, 4>".to_string();
         let selected = BTreeSet::from([descriptor.clone()]);
         let missing = vec![(
             Some("rust-instance-v1:kernel_crate::kernels::scale::<f64, 4>".to_string()),

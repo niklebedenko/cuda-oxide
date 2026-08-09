@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Manual real-compiler validation for the cross-target device artifact cache.
 #
-# Quick mode proves clean-target reuse plus source/architecture invalidation:
+# Quick mode proves clean-target reuse, external-closure restoration, and
+# source/architecture invalidation:
 #   scripts/device-artifact-cache-e2e.sh
-# Full mode additionally checks cross-crate closure signatures, type layout,
-# static initializers, backend bytes, and CUDA compiler-tool bytes:
+# Full mode additionally checks type layout, static initializers, backend
+# bytes, LLVM program bytes, and CUDA compiler-tool bytes:
 #   scripts/device-artifact-cache-e2e.sh --full
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -74,6 +75,9 @@ run_build() {
     fi
     if [[ -n "${LIBNVVM_OVERRIDE:-}" ]]; then
         env_args+=("LIBNVVM_PATH=$LIBNVVM_OVERRIDE")
+    fi
+    if [[ -n "${LLC_OVERRIDE:-}" ]]; then
+        env_args+=("CUDA_OXIDE_LLC=$LLC_OVERRIDE")
     fi
     if ! env "${env_args[@]}" "$cargo_oxide" build \
         --materialize-cubin \
@@ -169,34 +173,35 @@ run_fixture_mutation() {
     [[ "$changed" != "$base" ]]
 }
 
+run_external_closure() {
+    label=$1
+    target_dir=$2
+    log=$run_root/$label.log
+    if ! env \
+        "CARGO_TARGET_DIR=$target_dir" \
+        "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_DIR=$cache" \
+        "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_TRACE=${CUDA_OXIDE_CACHE_E2E_TRACE:-1}" \
+        "$cargo_oxide" run extern_crate_closure \
+        --materialize-cubin --arch "$arch" >"$log" 2>&1; then
+        tail -200 "$log" >&2
+        echo "device-cache-e2e: $label cross-crate closure build or GPU run failed" >&2
+        return 1
+    fi
+    grep -Fq 'PASSED: all external closure and wrapped-pair results correct' "$log"
+}
+
+run_external_closure closure-cold "$run_root/target-extern-crate-closure-a"
+closure_key=$(require_event miss "$run_root/closure-cold.log")
+closure_published_key=$(require_event published "$run_root/closure-cold.log")
+[[ "$closure_published_key" == "$closure_key" ]]
+
+run_external_closure closure-warm "$run_root/target-extern-crate-closure-b"
+closure_warm_key=$(require_event hit "$run_root/closure-warm.log")
+[[ "$closure_warm_key" == "$closure_key" ]]
+[[ $(grep -c 'device artifact cache hit:' "$run_root/closure-warm.log") -eq 1 ]]
+! grep -Eq 'device artifact cache (miss|published):' "$run_root/closure-warm.log"
+
 if [[ "$mode" == "--full" ]]; then
-    run_external_closure() {
-        label=$1
-        target_dir=$2
-        log=$run_root/$label.log
-        if ! env \
-            "CARGO_TARGET_DIR=$target_dir" \
-            "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_DIR=$cache" \
-            "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_TRACE=${CUDA_OXIDE_CACHE_E2E_TRACE:-1}" \
-            "$cargo_oxide" run extern_crate_closure \
-            --materialize-cubin --arch "$arch" >"$log" 2>&1; then
-            tail -200 "$log" >&2
-            echo "device-cache-e2e: $label cross-crate closure build or GPU run failed" >&2
-            return 1
-        fi
-        grep -Fq 'PASSED: all external closure and wrapped-pair results correct' "$log"
-    }
-
-    run_external_closure closure-cold "$run_root/target-extern-crate-closure-a"
-    closure_key=$(require_event miss "$run_root/closure-cold.log")
-    closure_published_key=$(require_event published "$run_root/closure-cold.log")
-    [[ "$closure_published_key" == "$closure_key" ]]
-
-    run_external_closure closure-warm "$run_root/target-extern-crate-closure-b"
-    closure_warm_key=$(require_event hit "$run_root/closure-warm.log")
-    [[ "$closure_warm_key" == "$closure_key" ]]
-    [[ $(grep -c 'device artifact cache hit:' "$run_root/closure-warm.log") -eq 1 ]]
-    ! grep -Eq 'device artifact cache (miss|published):' "$run_root/closure-warm.log"
 
     run_fixture_mutation \
         layout \
@@ -222,6 +227,40 @@ if [[ "$mode" == "--full" ]]; then
         echo "device-cache-e2e: backend not found after build: $backend" >&2
         exit 1
     fi
+
+    rust_sysroot=$(rustc --print sysroot)
+    llc=$rust_sysroot/lib/rustlib/$host/bin/llc
+    if [[ ! -x "$llc" ]]; then
+        llc=$(command -v llc-22 || command -v llc-21 || command -v llc || true)
+    fi
+    if [[ -z "$llc" || ! -x "$llc" ]]; then
+        echo "device-cache-e2e: --full could not locate the selected llc" >&2
+        exit 1
+    fi
+    llc=$(realpath "$llc")
+    llc_variant=$run_root/llc.variant
+    printf '#!/bin/sh\n# cache-e2e-llvm-tool-a\nexec "%s" "$@"\n' \
+        "$llc" >"$llc_variant"
+    chmod +x "$llc_variant"
+    LLC_OVERRIDE=$llc_variant run_build \
+        llvm-tool-baseline "$arch" "$run_root/target-llvm-tool-change"
+    llvm_tool_base_key=$(require_event miss "$run_root/llvm-tool-baseline.log")
+    llvm_tool_base_published_key=$(require_event published "$run_root/llvm-tool-baseline.log")
+    [[ "$llvm_tool_base_published_key" == "$llvm_tool_base_key" ]]
+    sed -i 's/cache-e2e-llvm-tool-a/cache-e2e-llvm-tool-b/' "$llc_variant"
+    LLC_OVERRIDE=$llc_variant run_build \
+        llvm-tool-change "$arch" "$run_root/target-llvm-tool-change"
+    llvm_tool_changed_key=$(require_event miss "$run_root/llvm-tool-change.log")
+    llvm_tool_changed_published_key=$(require_event published "$run_root/llvm-tool-change.log")
+    [[ "$llvm_tool_changed_published_key" == "$llvm_tool_changed_key" ]]
+    [[ "$llvm_tool_changed_key" != "$llvm_tool_base_key" ]]
+    sed -i 's/cache-e2e-llvm-tool-b/cache-e2e-llvm-tool-a/' "$llc_variant"
+    LLC_OVERRIDE=$llc_variant run_build \
+        llvm-tool-restored "$arch" "$run_root/target-llvm-tool-change"
+    llvm_tool_restored_key=$(require_event hit "$run_root/llvm-tool-restored.log")
+    [[ "$llvm_tool_restored_key" == "$llvm_tool_base_key" ]]
+    ! grep -Eq 'device artifact cache (miss|published):' "$run_root/llvm-tool-restored.log"
+
     backend_variant=$run_root/librustc_codegen_cuda.variant.so
     cp -- "$backend" "$backend_variant"
     printf 'cache-e2e-backend-variant\n' >"$run_root/backend-marker"
@@ -257,7 +296,8 @@ echo "  clean target B hit:          $warm_key"
 echo "  evaluated constant miss:     $constant_key"
 echo "  reachable source miss:       $code_key"
 echo "  alternate architecture miss: $arch_key"
+echo "  cross-crate closure miss:     $closure_key"
+echo "  cross-crate closure hit:      $closure_warm_key"
 if [[ "$mode" == "--full" ]]; then
-    echo "  cross-crate closure miss:     $closure_key"
-    echo "  cross-crate closure hit:      $closure_warm_key"
+    echo "  LLVM tool byte-change miss:   $llvm_tool_changed_key"
 fi

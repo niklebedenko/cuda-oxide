@@ -9,6 +9,8 @@ repository.workspace = true
 description = "Experimental rustc-independent cuda-oxide PTX backend"
 
 [dependencies]
+cuda-artifact-finalizer = { workspace = true }
+reserved-oxide-symbols = { workspace = true }
 pliron = { workspace = true }
 thiserror = { workspace = true }
 dialect-mir = { workspace = true }

@@ -23,6 +23,9 @@ const BACKEND_PROVENANCE_ENV: &str = reserved_oxide_symbols::BACKEND_PROVENANCE_
 const BACKEND_PATH_ENV: &str = reserved_oxide_symbols::BACKEND_PATH_ENV;
 const COMPILER_PROVENANCE_ENV: &str = reserved_oxide_symbols::COMPILER_PROVENANCE_ENV;
 const COMPILER_COMPONENTS_ENV: &str = reserved_oxide_symbols::COMPILER_COMPONENTS_ENV;
+const LLVM_TOOLCHAIN_PROVENANCE_ENV: &str = reserved_oxide_symbols::LLVM_TOOLCHAIN_PROVENANCE_ENV;
+const LLVM_TOOLCHAIN_COMPONENTS_ENV: &str = reserved_oxide_symbols::LLVM_TOOLCHAIN_COMPONENTS_ENV;
+const LLVM_LINK_DISABLED_ENV: &str = reserved_oxide_symbols::LLVM_LINK_DISABLED_ENV;
 const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV;
 const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
 const COMPILER_IDENTITY_CFG: &str = "cuda_oxide_internal_compiler_identity";
@@ -2792,6 +2795,9 @@ fn affects_scoped_codegen_fingerprint(key: &str) -> bool {
                 | BACKEND_PATH_ENV
                 | COMPILER_PROVENANCE_ENV
                 | COMPILER_COMPONENTS_ENV
+                | LLVM_TOOLCHAIN_PROVENANCE_ENV
+                | LLVM_TOOLCHAIN_COMPONENTS_ENV
+                | LLVM_LINK_DISABLED_ENV
                 | BACKEND_ENV
                 | LOADED_KERNEL_MANIFEST_ENV
                 | reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_DIR_ENV
@@ -3143,6 +3149,12 @@ struct CompilerComponent {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+struct ResolvedLlvmToolchainProvenance {
+    selection: cuda_artifact_finalizer::LlvmToolchain,
+    provenance: CompilerProvenance,
+}
+
 impl CompilerProvenance {
     fn component_manifest(&self) -> Result<String, String> {
         let mut manifest = String::new();
@@ -3168,25 +3180,37 @@ impl CompilerProvenance {
     }
 }
 
-fn active_compiler_provenance() -> Result<CompilerProvenance, String> {
-    let rustc_program = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let verbose_version = rustc_output(&rustc_program, &["-vV"], "version")?;
-    let sysroot_output = rustc_output(&rustc_program, &["--print", "sysroot"], "sysroot")?;
+fn active_compiler_provenance(
+    process_context: &cuda_artifact_finalizer::ToolchainProcessContext,
+) -> Result<CompilerProvenance, String> {
+    let rustc_program = process_context
+        .var_os("RUSTC")
+        .unwrap_or_else(|| std::ffi::OsStr::new("rustc"));
+    let verbose_version = rustc_output(process_context, rustc_program, &["-vV"], "version")?;
+    let sysroot_output = rustc_output(
+        process_context,
+        rustc_program,
+        &["--print", "sysroot"],
+        "sysroot",
+    )?;
     let sysroot = std::str::from_utf8(&sysroot_output)
         .map_err(|_| "active rustc returned a non-UTF-8 sysroot".to_string())?;
     let sysroot = PathBuf::from(sysroot.trim());
 
     let mut artifacts = Vec::<(String, PathBuf)>::new();
     artifacts.push(("rustc".to_string(), sysroot.join("bin/rustc")));
-    if let Some(launcher) = resolve_executable(rustc_program.as_os_str()) {
+    if let Some(launcher) = process_context.resolve_executable(rustc_program) {
         artifacts.push(("rustc-launcher".to_string(), launcher));
     }
     for (variable, label) in [
         ("RUSTC_WRAPPER", "rustc-wrapper"),
         ("RUSTC_WORKSPACE_WRAPPER", "rustc-workspace-wrapper"),
     ] {
-        if let Some(wrapper) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-            let wrapper = resolve_executable(&wrapper).ok_or_else(|| {
+        if let Some(wrapper) = process_context
+            .var_os(variable)
+            .filter(|value| !value.is_empty())
+        {
+            let wrapper = process_context.resolve_executable(wrapper).ok_or_else(|| {
                 format!(
                     "could not resolve {variable}={} for compiler fingerprinting",
                     Path::new(&wrapper).display()
@@ -3238,15 +3262,110 @@ fn active_compiler_provenance() -> Result<CompilerProvenance, String> {
     compiler_provenance_from_files(&verbose_version, &mut artifacts)
 }
 
+fn effective_configured_env(ctx: &Context, key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key).or_else(|| project_config_env(ctx, key).map(std::ffi::OsString::from))
+}
+
+fn device_artifact_cache_requested(ctx: &Context) -> bool {
+    effective_configured_env(ctx, reserved_oxide_symbols::DEVICE_ARTIFACT_CACHE_DIR_ENV).is_some()
+}
+
+fn resolved_llvm_toolchain_provenance(
+    process_context: &cuda_artifact_finalizer::ToolchainProcessContext,
+) -> Result<ResolvedLlvmToolchainProvenance, String> {
+    let options = cuda_artifact_finalizer::LlvmToolchainOptions {
+        no_opt: process_context.var_os("CUDA_OXIDE_NO_OPT").is_some(),
+        llc_override: process_context.var_os("CUDA_OXIDE_LLC").map(PathBuf::from),
+        opt_override: process_context.var_os("CUDA_OXIDE_OPT").map(PathBuf::from),
+        llvm_link_override: process_context
+            .var_os("CUDA_OXIDE_LLVM_LINK")
+            .map(PathBuf::from),
+        llvm_link_disabled: false,
+    };
+    let selection =
+        cuda_artifact_finalizer::LlvmToolchain::resolve_with_context(&options, process_context)
+            .ok_or_else(|| {
+                "device artifact caching requires a runnable LLVM `llc` toolchain".to_string()
+            })?;
+    let mut components = vec![("llc".to_string(), PathBuf::from(&selection.llc_path))];
+    if let Some(opt) = &selection.opt {
+        components.push(("opt".to_string(), PathBuf::from(&opt.path)));
+    }
+    if let Some(llvm_link) = &selection.llvm_link {
+        components.push(("llvm-link".to_string(), PathBuf::from(&llvm_link.path)));
+    }
+    let mut provenance =
+        compiler_provenance_from_files(b"cuda-oxide-selected-llvm-toolchain-v1", &mut components)?;
+    let component_manifest = provenance.component_manifest()?;
+    let mut identity = sha2::Sha256::new();
+    update_codegen_fingerprint_hash(
+        &mut identity,
+        b"cuda-oxide-selected-llvm-toolchain-paths-v1",
+    );
+    update_codegen_fingerprint_hash(&mut identity, provenance.digest.as_bytes());
+    update_codegen_fingerprint_hash(&mut identity, component_manifest.as_bytes());
+    provenance.digest = finish_codegen_fingerprint(identity);
+    Ok(ResolvedLlvmToolchainProvenance {
+        selection,
+        provenance,
+    })
+}
+
+fn fingerprint_with_llvm_toolchain(base: &str, provenance: &str) -> String {
+    let mut hash = sha2::Sha256::new();
+    for bytes in [
+        b"cuda-oxide-codegen-with-llvm-toolchain-v1".as_slice(),
+        base.as_bytes(),
+        provenance.as_bytes(),
+    ] {
+        update_codegen_fingerprint_hash(&mut hash, bytes);
+    }
+    finish_codegen_fingerprint(hash)
+}
+
+fn effective_command_process_context(
+    command: &Command,
+) -> Result<cuda_artifact_finalizer::ToolchainProcessContext, String> {
+    let mut environment = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            environment.insert(key.to_os_string(), value.to_os_string());
+        } else {
+            environment.remove(key);
+        }
+    }
+    let ambient_dir = std::env::current_dir()
+        .map_err(|error| format!("could not resolve the current directory: {error}"))?;
+    let configured_dir = command
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| ambient_dir.clone());
+    let configured_dir = if configured_dir.is_absolute() {
+        configured_dir
+    } else {
+        ambient_dir.join(configured_dir)
+    };
+    let current_dir = configured_dir.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve child working directory {}: {error}",
+            configured_dir.display()
+        )
+    })?;
+    Ok(cuda_artifact_finalizer::ToolchainProcessContext::new(
+        current_dir,
+        environment,
+    ))
+}
+
 fn rustc_output(
+    process_context: &cuda_artifact_finalizer::ToolchainProcessContext,
     program: &std::ffi::OsStr,
     arguments: &[&str],
     description: &str,
 ) -> Result<Vec<u8>, String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("could not query rustc {description}: {error}"))?;
+    let output = process_context
+        .output(program, arguments)
+        .ok_or_else(|| format!("could not query rustc {description}"))?;
     if !output.status.success() {
         return Err(format!(
             "rustc {description} query failed with {}: {}",
@@ -3258,23 +3377,6 @@ fn rustc_output(
         return Err(format!("rustc {description} query returned no output"));
     }
     Ok(output.stdout)
-}
-
-fn resolve_executable(program: &std::ffi::OsStr) -> Option<PathBuf> {
-    let path = Path::new(program);
-    if path.components().count() > 1 {
-        return path.canonicalize().ok();
-    }
-    std::env::var_os("PATH").and_then(|search_path| {
-        std::env::split_paths(&search_path)
-            .map(|directory| directory.join(path))
-            .find_map(|candidate| {
-                candidate
-                    .is_file()
-                    .then(|| candidate.canonicalize().ok())
-                    .flatten()
-            })
-    })
 }
 
 fn compiler_provenance_from_files(
@@ -3525,6 +3627,21 @@ pub fn codegen_show_pipeline(
     cmd.args(["build", "--release"]).current_dir(&example_dir);
 
     apply_config_env(&mut cmd, ctx);
+    cmd.env("CUDA_OXIDE_VERBOSE", "1");
+    cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
+    cmd.env("CUDA_OXIDE_DUMP_MIR", "1");
+    cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
+    if no_fmad {
+        cmd.env("CUDA_OXIDE_NO_FMA", "1");
+    }
+    if unchecked_indexing {
+        cmd.env("CUDA_OXIDE_UNCHECKED_INDEXING", "1");
+    }
+    if let Some(level) = device_debug.env_value() {
+        cmd.env("CUDA_OXIDE_DEBUG", level);
+    }
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch, &materialization);
+    apply_ld_library_path(&mut cmd, ctx);
     let fingerprint = pipeline_codegen_fingerprint(
         ctx,
         no_fmad,
@@ -3541,22 +3658,6 @@ pub fn codegen_show_pipeline(
         &[],
         &fingerprint,
     );
-    cmd.env("CUDA_OXIDE_VERBOSE", "1");
-    cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
-    cmd.env("CUDA_OXIDE_DUMP_MIR", "1");
-    cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
-    if no_fmad {
-        cmd.env("CUDA_OXIDE_NO_FMA", "1");
-    }
-    if unchecked_indexing {
-        cmd.env("CUDA_OXIDE_UNCHECKED_INDEXING", "1");
-    }
-    if let Some(level) = device_debug.env_value() {
-        cmd.env("CUDA_OXIDE_DEBUG", level);
-    }
-
-    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch, &materialization);
-    apply_ld_library_path(&mut cmd, ctx);
 
     println!("Building {}...", example);
     println!();
@@ -3658,6 +3759,10 @@ pub fn codegen_debug(
     }
 
     apply_config_env(&mut cmd, ctx);
+    cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "2");
+    apply_output_mode(&mut cmd, false, target_arch, &materialization);
+    apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
+    apply_ld_library_path(&mut cmd, ctx);
     let fingerprint = standard_codegen_fingerprint(
         ctx,
         false,
@@ -3676,10 +3781,6 @@ pub fn codegen_debug(
         &[],
         &fingerprint,
     );
-    cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "2");
-    apply_output_mode(&mut cmd, false, target_arch, &materialization);
-    apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
-    apply_ld_library_path(&mut cmd, ctx);
 
     let binary =
         run_cargo_build_for_executable(&mut cmd, &example_dir, bin).unwrap_or_else(|message| {
@@ -5380,6 +5481,7 @@ enum CodegenProfilePolicy {
 /// every configured array element and `--device-cfg` value intact.
 fn build_encoded_rustflags(
     ctx: &Context,
+    backend_so: &Path,
     profile: CodegenProfilePolicy,
     device_cfgs: &[String],
 ) -> String {
@@ -5391,7 +5493,7 @@ fn build_encoded_rustflags(
         explicit_rustflags.push(cfg.clone());
     }
     build_encoded_rustflags_with_existing(
-        &ctx.backend_so,
+        backend_so,
         profile,
         &ctx.config.extra_rustflags,
         &explicit_rustflags,
@@ -5502,12 +5604,13 @@ fn strip_wrapper_owned_codegen_cfgs(flags: &mut Vec<String>) {
 fn apply_codegen_rustflags(
     cmd: &mut Command,
     ctx: &Context,
+    backend_so: &Path,
     profile: CodegenProfilePolicy,
     device_cfgs: &[String],
 ) {
     cmd.env(
         "CARGO_ENCODED_RUSTFLAGS",
-        build_encoded_rustflags(ctx, profile, device_cfgs),
+        build_encoded_rustflags(ctx, backend_so, profile, device_cfgs),
     )
     .env(CODEGEN_ACTIVE_ENV, "1")
     .env_remove("RUSTFLAGS");
@@ -5536,14 +5639,44 @@ fn apply_codegen_configuration(
             )
         })?
     };
-    let backend_digest = backend_artifact_digest(&ctx.backend_so)?;
-    let compiler_provenance = active_compiler_provenance()
+    let backend_digest = backend_artifact_digest(&backend_path)?;
+    let process_context = effective_command_process_context(cmd);
+    let compiler_provenance = process_context
+        .as_ref()
+        .ok()
+        .and_then(|process_context| active_compiler_provenance(process_context).ok())
         .and_then(|provenance| {
             provenance
                 .component_manifest()
                 .map(|manifest| (provenance, manifest))
+                .ok()
+        });
+    let llvm_toolchain = if device_artifact_cache_requested(ctx) {
+        match process_context
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|process_context| resolved_llvm_toolchain_provenance(process_context))
+            .and_then(|resolved| {
+                resolved
+                    .provenance
+                    .component_manifest()
+                    .map(|manifest| (resolved, manifest))
+            }) {
+            Ok(resolved) => Some(resolved),
+            Err(error) => {
+                eprintln!("warning: cross-target device artifact cache disabled: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let scoped_codegen_fingerprint = llvm_toolchain
+        .as_ref()
+        .map(|(resolved, _)| {
+            fingerprint_with_llvm_toolchain(codegen_fingerprint, &resolved.provenance.digest)
         })
-        .ok();
+        .unwrap_or_else(|| codegen_fingerprint.to_string());
     let mut global_cfgs = Vec::with_capacity(user_device_cfgs.len() + 2);
     global_cfgs.push(format!("{BACKEND_IDENTITY_CFG}=\"{backend_digest}\""));
     if let Some((provenance, _)) = &compiler_provenance {
@@ -5551,8 +5684,8 @@ fn apply_codegen_configuration(
     }
     global_cfgs.extend(user_device_cfgs.iter().cloned());
 
-    apply_codegen_rustflags(cmd, ctx, profile, &global_cfgs);
-    cmd.env(CODEGEN_FINGERPRINT_ENV, codegen_fingerprint)
+    apply_codegen_rustflags(cmd, ctx, &backend_path, profile, &global_cfgs);
+    cmd.env(CODEGEN_FINGERPRINT_ENV, scoped_codegen_fingerprint)
         .env(BACKEND_PROVENANCE_ENV, backend_digest)
         .env(BACKEND_PATH_ENV, backend_path);
     match compiler_provenance {
@@ -5565,6 +5698,32 @@ fn apply_codegen_configuration(
             // handshake before enabling the cross-target artifact cache.
             cmd.env_remove(COMPILER_PROVENANCE_ENV)
                 .env_remove(COMPILER_COMPONENTS_ENV);
+        }
+    }
+    match llvm_toolchain {
+        Some((resolved, manifest)) => {
+            cmd.env(LLVM_TOOLCHAIN_PROVENANCE_ENV, &resolved.provenance.digest)
+                .env(LLVM_TOOLCHAIN_COMPONENTS_ENV, manifest)
+                .env("CUDA_OXIDE_LLC", &resolved.selection.llc_path);
+            if let Some(opt) = &resolved.selection.opt {
+                cmd.env("CUDA_OXIDE_OPT", &opt.path)
+                    .env_remove("CUDA_OXIDE_NO_OPT");
+            } else {
+                cmd.env_remove("CUDA_OXIDE_OPT")
+                    .env("CUDA_OXIDE_NO_OPT", "1");
+            }
+            if let Some(llvm_link) = &resolved.selection.llvm_link {
+                cmd.env("CUDA_OXIDE_LLVM_LINK", &llvm_link.path)
+                    .env_remove(LLVM_LINK_DISABLED_ENV);
+            } else {
+                cmd.env_remove("CUDA_OXIDE_LLVM_LINK")
+                    .env(LLVM_LINK_DISABLED_ENV, "1");
+            }
+        }
+        None => {
+            cmd.env_remove(LLVM_TOOLCHAIN_PROVENANCE_ENV)
+                .env_remove(LLVM_TOOLCHAIN_COMPONENTS_ENV)
+                .env_remove(LLVM_LINK_DISABLED_ENV);
         }
     }
     Ok(())
@@ -9059,6 +9218,132 @@ device-owner = { path = "../device-owner" }
             command_env(&before_cmd, CODEGEN_FINGERPRINT_ENV),
             command_env(&after_cmd, CODEGEN_FINGERPRINT_ENV)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_symlink_is_canonicalized_before_fingerprinting_and_rustc_invocation() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("cargo_oxide_backend_symlink");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = root.join("librustc_codegen_cuda.real.so");
+        let alias = root.join("librustc_codegen_cuda.alias.so");
+        std::fs::write(&backend, b"backend").unwrap();
+        symlink(&backend, &alias).unwrap();
+
+        let mut ctx = test_context(OxideConfig::default());
+        ctx.backend_so = alias;
+        let mut command = Command::new("cargo");
+        apply_codegen_configuration(
+            &mut command,
+            &ctx,
+            CodegenProfilePolicy::ReleaseLike,
+            &[],
+            &"42".repeat(32),
+        )
+        .unwrap();
+
+        let canonical = backend.canonicalize().unwrap();
+        assert_eq!(
+            command_env(&command, BACKEND_PATH_ENV),
+            Some(canonical.to_string_lossy().into_owned())
+        );
+        let encoded_rustflags = command_env(&command, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+        let rustflags = decoded_rustflags(&encoded_rustflags);
+        let expected_backend = format!("-Zcodegen-backend={}", canonical.display());
+        assert!(
+            rustflags
+                .iter()
+                .any(|flag| *flag == expected_backend.as_str())
+        );
+        assert!(!rustflags.iter().any(|flag| flag.contains(".alias.so")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llvm_provenance_uses_child_environment_and_working_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_dir("cargo_oxide_child_llvm_context");
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let llc = tools.join("llc");
+        std::fs::write(&llc, "#!/bin/sh\nprintf 'LLVM version 22.1.0\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&llc).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&llc, permissions).unwrap();
+
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(&root)
+            .env("CUDA_OXIDE_LLC", "tools/llc")
+            .env("CUDA_OXIDE_NO_OPT", "1");
+        let process_context = effective_command_process_context(&command).unwrap();
+        let resolved = resolved_llvm_toolchain_provenance(&process_context).unwrap();
+
+        assert_eq!(
+            Path::new(&resolved.selection.llc_path),
+            llc.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llvm_provenance_uses_child_rust_toolchain_selection() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_dir("cargo_oxide_child_rust_toolchain");
+        let bin = root.join("bin");
+        let host = "x86_64-unknown-linux-gnu";
+        let sysroot_a = root.join("sysroot-a");
+        let sysroot_b = root.join("sysroot-b");
+        let llvm_bin = |sysroot: &Path| sysroot.join("lib/rustlib").join(host).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(llvm_bin(&sysroot_a)).unwrap();
+        std::fs::create_dir_all(llvm_bin(&sysroot_b)).unwrap();
+
+        let make_executable = |path: &Path, contents: String| {
+            std::fs::write(path, contents).unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        };
+        make_executable(
+            &bin.join("rustc"),
+            format!(
+                "#!/bin/sh\nif [ \"$RUSTUP_TOOLCHAIN\" = project-b ]; then\n  printf '%s\\n%s\\n' '{}' '{host}'\nelse\n  printf '%s\\n%s\\n' '{}' '{host}'\nfi\n",
+                sysroot_b.display(),
+                sysroot_a.display()
+            ),
+        );
+        make_executable(
+            &llvm_bin(&sysroot_a).join("llc"),
+            "#!/bin/sh\nprintf 'LLVM version 21.1.0\\n'\n".to_string(),
+        );
+        let llc_b = llvm_bin(&sysroot_b).join("llc");
+        make_executable(
+            &llc_b,
+            "#!/bin/sh\nprintf 'LLVM version 22.1.0\\n'\n".to_string(),
+        );
+
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(&root)
+            .env("PATH", &bin)
+            .env("RUSTUP_TOOLCHAIN", "project-b")
+            .env("CUDA_OXIDE_NO_OPT", "1");
+        let process_context = effective_command_process_context(&command).unwrap();
+        let resolved = resolved_llvm_toolchain_provenance(&process_context).unwrap();
+
+        assert_eq!(
+            Path::new(&resolved.selection.llc_path),
+            llc_b.canonicalize().unwrap()
+        );
+        assert_eq!(resolved.selection.llc_major, Some(22));
         std::fs::remove_dir_all(root).unwrap();
     }
 

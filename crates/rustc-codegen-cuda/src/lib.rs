@@ -384,6 +384,7 @@ struct PreparedDeviceArtifactCache {
     backend_path: PathBuf,
     backend_provenance: String,
     compiler_components: Vec<CompilerComponentProvenance>,
+    llvm_toolchain_components: Vec<CompilerComponentProvenance>,
     materialization_request: materialize::MaterializationRequest,
 }
 
@@ -412,9 +413,15 @@ impl PreparedDeviceArtifactCache {
         verify_running_compiler_components(&self.compiler_components)
     }
 
+    fn verify_llvm_toolchain_provenance(&self) -> Result<(), String> {
+        verify_compiler_components(&self.llvm_toolchain_components)?;
+        verify_selected_llvm_toolchain(&self.llvm_toolchain_components)
+    }
+
     fn verify_implementation_provenance(&self) -> Result<(), String> {
         self.verify_backend_provenance()?;
         self.verify_compiler_provenance()?;
+        self.verify_llvm_toolchain_provenance()?;
         materialize::validate_provenance(self.materialization_request)
             .map_err(|error| format!("CUDA materializer provenance changed: {error}"))
     }
@@ -1425,9 +1432,9 @@ fn rustc_unit_output_name(owner: &str, stable_crate_id: u64) -> String {
     format!("{owner}.{stable_crate_id:016x}")
 }
 
-fn parse_compiler_component_provenance(
+fn parse_component_provenance(
     manifest: &str,
-) -> Result<Vec<CompilerComponentProvenance>, String> {
+) -> Result<(Vec<CompilerComponentProvenance>, BTreeSet<String>), String> {
     let mut components = Vec::new();
     let mut labels = BTreeSet::new();
     for line in manifest.lines() {
@@ -1471,6 +1478,13 @@ fn parse_compiler_component_provenance(
             digest: digest.to_string(),
         });
     }
+    Ok((components, labels))
+}
+
+fn parse_compiler_component_provenance(
+    manifest: &str,
+) -> Result<Vec<CompilerComponentProvenance>, String> {
+    let (components, labels) = parse_component_provenance(manifest)?;
     if !labels.contains("rustc")
         || !labels
             .iter()
@@ -1479,6 +1493,23 @@ fn parse_compiler_component_provenance(
     {
         return Err(
             "compiler component provenance must include rustc, rustc-driver, and LLVM".to_string(),
+        );
+    }
+    Ok(components)
+}
+
+fn parse_llvm_toolchain_component_provenance(
+    manifest: &str,
+) -> Result<Vec<CompilerComponentProvenance>, String> {
+    let (components, labels) = parse_component_provenance(manifest)?;
+    let allowed = BTreeSet::from([
+        "llc".to_string(),
+        "opt".to_string(),
+        "llvm-link".to_string(),
+    ]);
+    if !labels.contains("llc") || !labels.is_subset(&allowed) {
+        return Err(
+            "LLVM toolchain provenance must contain llc and only known LLVM tools".to_string(),
         );
     }
     Ok(components)
@@ -1495,6 +1526,39 @@ fn verify_compiler_components(components: &[CompilerComponentProvenance]) -> Res
                 component.digest
             ));
         }
+    }
+    Ok(())
+}
+
+fn verify_selected_llvm_toolchain(
+    components: &[CompilerComponentProvenance],
+) -> Result<(), String> {
+    let options = cuda_artifact_finalizer::LlvmToolchainOptions {
+        no_opt: std::env::var_os("CUDA_OXIDE_NO_OPT").is_some(),
+        llc_override: std::env::var_os("CUDA_OXIDE_LLC").map(PathBuf::from),
+        opt_override: std::env::var_os("CUDA_OXIDE_OPT").map(PathBuf::from),
+        llvm_link_override: std::env::var_os("CUDA_OXIDE_LLVM_LINK").map(PathBuf::from),
+        llvm_link_disabled: std::env::var_os(reserved_oxide_symbols::LLVM_LINK_DISABLED_ENV)
+            .is_some(),
+    };
+    let selected = cuda_artifact_finalizer::LlvmToolchain::resolve(&options)
+        .ok_or_else(|| "the fingerprinted LLVM toolchain no longer resolves".to_string())?;
+    let mut selected_paths =
+        BTreeMap::from([("llc".to_string(), PathBuf::from(selected.llc_path))]);
+    if let Some(opt) = selected.opt {
+        selected_paths.insert("opt".to_string(), PathBuf::from(opt.path));
+    }
+    if let Some(llvm_link) = selected.llvm_link {
+        selected_paths.insert("llvm-link".to_string(), PathBuf::from(llvm_link.path));
+    }
+    let expected_paths = components
+        .iter()
+        .map(|component| (component.label.clone(), component.path.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if selected_paths != expected_paths {
+        return Err(format!(
+            "selected LLVM toolchain changed after cargo-oxide fingerprinted it: expected {expected_paths:?}, found {selected_paths:?}"
+        ));
     }
     Ok(())
 }
@@ -1634,6 +1698,21 @@ fn prepare_device_artifact_cache<'tcx>(
     let compiler_components = parse_compiler_component_provenance(&compiler_component_manifest)?;
     verify_compiler_components(&compiler_components)?;
     verify_running_compiler_components(&compiler_components)?;
+    let llvm_toolchain_provenance =
+        std::env::var(reserved_oxide_symbols::LLVM_TOOLCHAIN_PROVENANCE_ENV).map_err(|_| {
+            "device artifact caching requires the exact LLVM toolchain provenance".to_string()
+        })?;
+    if !device_artifact_cache::is_sha256_digest(&llvm_toolchain_provenance) {
+        return Err("LLVM toolchain provenance is not a SHA-256 digest".to_string());
+    }
+    let llvm_toolchain_component_manifest =
+        std::env::var(reserved_oxide_symbols::LLVM_TOOLCHAIN_COMPONENTS_ENV).map_err(|_| {
+            "device artifact caching requires the LLVM toolchain component manifest".to_string()
+        })?;
+    let llvm_toolchain_components =
+        parse_llvm_toolchain_component_provenance(&llvm_toolchain_component_manifest)?;
+    verify_compiler_components(&llvm_toolchain_components)?;
+    verify_selected_llvm_toolchain(&llvm_toolchain_components)?;
     let materializer_provenance =
         std::env::var(reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV).map_err(|_| {
             "device artifact caching requires cargo-oxide's materializer provenance".to_string()
@@ -1675,6 +1754,7 @@ fn prepare_device_artifact_cache<'tcx>(
     push("codegen-fingerprint", codegen_fingerprint);
     push("backend-provenance", backend_provenance.clone());
     push("compiler-provenance", compiler_provenance);
+    push("llvm-toolchain-provenance", llvm_toolchain_provenance);
     push("materializer-provenance", materializer_provenance);
     push("device-target", target);
     push("host-target", host_target.to_string());
@@ -1728,6 +1808,7 @@ fn prepare_device_artifact_cache<'tcx>(
         backend_path,
         backend_provenance,
         compiler_components,
+        llvm_toolchain_components,
         materialization_request,
     }))
 }
@@ -2792,6 +2873,71 @@ mod tests {
         std::fs::write(&driver, b"driver-b").unwrap();
         assert!(verify_compiler_components(&components).is_err());
         assert!(parse_compiler_component_provenance("rustc\tnot-a-digest\t/tmp/rustc\n").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn llvm_toolchain_manifest_is_exact_and_revalidated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda-codegen-llvm-toolchain-components-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let llc = root.join("llc");
+        let opt = root.join("opt");
+        let llvm_link = root.join("llvm-link");
+        std::fs::write(&llc, b"llc-a").unwrap();
+        std::fs::write(&opt, b"opt-a").unwrap();
+        std::fs::write(&llvm_link, b"llvm-link-a").unwrap();
+        let component = |label: &str, path: &Path| {
+            format!(
+                "{label}\t{}\t{}\n",
+                device_artifact_cache::file_sha256(path).unwrap(),
+                path.canonicalize().unwrap().display()
+            )
+        };
+        let manifest = [
+            component("llc", &llc),
+            component("opt", &opt),
+            component("llvm-link", &llvm_link),
+        ]
+        .concat();
+        let components = parse_llvm_toolchain_component_provenance(&manifest).unwrap();
+        verify_compiler_components(&components).unwrap();
+
+        std::fs::write(&opt, b"opt-b").unwrap();
+        assert!(verify_compiler_components(&components).is_err());
+
+        let llc_only = component("llc", &llc);
+        assert!(parse_llvm_toolchain_component_provenance(&llc_only).is_ok());
+        assert!(parse_llvm_toolchain_component_provenance(&component("opt", &opt)).is_err());
+        assert!(
+            parse_llvm_toolchain_component_provenance(
+                &[llc_only.clone(), component("llvm-as", &opt)].concat()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_llvm_toolchain_component_provenance(&[llc_only.clone(), llc_only].concat())
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let llc_alias = root.join("llc-alias");
+            symlink(&llc, &llc_alias).unwrap();
+            let noncanonical_llc = component("llc", &llc_alias).replace(
+                llc.canonicalize().unwrap().to_string_lossy().as_ref(),
+                llc_alias.to_string_lossy().as_ref(),
+            );
+            assert!(parse_llvm_toolchain_component_provenance(&noncanonical_llc).is_err());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

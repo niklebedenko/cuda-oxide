@@ -73,6 +73,17 @@ pub const COMPILER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_COMPILER_PROVENAN
 /// revalidates this retained implementation manifest around cache operations.
 pub const COMPILER_COMPONENTS_ENV: &str = "CUDA_OXIDE_INTERNAL_COMPILER_COMPONENTS";
 
+/// Content identity of the resolved `llc`, `opt`, and `llvm-link` programs.
+pub const LLVM_TOOLCHAIN_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_LLVM_TOOLCHAIN_PROVENANCE";
+
+/// Canonical LLVM tool paths and their digests. The backend revalidates this
+/// retained selection around device artifact cache operations.
+pub const LLVM_TOOLCHAIN_COMPONENTS_ENV: &str = "CUDA_OXIDE_INTERNAL_LLVM_TOOLCHAIN_COMPONENTS";
+
+/// Internal sentinel which freezes an absent `llvm-link` selection so device
+/// codegen cannot rediscover a different program after provenance capture.
+pub const LLVM_LINK_DISABLED_ENV: &str = "CUDA_OXIDE_INTERNAL_LLVM_LINK_DISABLED";
+
 /// Internal cargo-oxide/backend opt-in for build-time cubin materialization.
 pub const MATERIALIZE_CUBIN_ENV: &str = "CUDA_OXIDE_MATERIALIZE_CUBIN";
 

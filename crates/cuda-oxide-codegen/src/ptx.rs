@@ -5,7 +5,7 @@
 
 use crate::error::PipelineError;
 use crate::generated::GeneratedModuleRequirements;
-use crate::llvm_tools::LlvmToolchain;
+use crate::llvm_tools::{LlvmToolchain, resolve_toolchain};
 use crate::options::BackendOptions;
 use crate::target::{
     ModuleRequirements, detect_module_requirements_in_llvm_file,
@@ -277,7 +277,7 @@ pub fn generate_ptx(
     generated: &GeneratedModuleRequirements,
     libdevice_path: Option<&Path>,
 ) -> Result<GeneratedPtx, PipelineError> {
-    let Some(toolchain) = LlvmToolchain::resolve(opts) else {
+    let Some(toolchain) = resolve_toolchain(opts) else {
         return Err(PipelineError::PtxGeneration(
             "No working llc found.\n\
              cuda-oxide tries (in order): opts.llc_override (CUDA_OXIDE_LLC), the \
@@ -964,7 +964,7 @@ mod tests {
             target_arch: Some("sm_80".to_string()),
             ..BackendOptions::default()
         };
-        let Some(toolchain) = LlvmToolchain::resolve(&opts) else {
+        let Some(toolchain) = resolve_toolchain(&opts) else {
             return;
         };
         if toolchain.opt.is_none() || toolchain.llvm_link.is_none() {
@@ -1052,7 +1052,7 @@ mod tests {
             target_arch: Some("sm_80".to_string()),
             ..BackendOptions::default()
         };
-        let Some(toolchain) = LlvmToolchain::resolve(&opts) else {
+        let Some(toolchain) = resolve_toolchain(&opts) else {
             return;
         };
         if toolchain.opt.is_none() || toolchain.llvm_link.is_none() {
