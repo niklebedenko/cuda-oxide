@@ -28,6 +28,23 @@ use std::sync::Arc;
 /// [`cuda_device::graph::CudaGraphConditionalHandle`](https://docs.rs/cuda-device/latest/cuda_device/graph/type.CudaGraphConditionalHandle.html).
 pub type CudaGraphConditionalHandle = u64;
 
+/// Resolve CUDA's device-only conditional setter when materialized kernel
+/// objects participate in the native host link.
+///
+/// The device artifact retains `cudaGraphSetConditional` as an assembler
+/// builtin. Its host-side kernel mirror must never execute, but it can remain
+/// reachable in the merged native object and therefore needs a matching trap
+/// symbol. `libcudart` deliberately does not export this device-only entry.
+#[doc(hidden)]
+#[cold]
+#[unsafe(export_name = "cudaGraphSetConditional")]
+unsafe extern "C" fn cuda_graph_set_conditional_host_trap(
+    _handle: CudaGraphConditionalHandle,
+    _value: u32,
+) {
+    panic!("cudaGraphSetConditional can only execute in CUDA device code");
+}
+
 /// Options used when creating a graph conditional handle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaGraphConditionalOptions {

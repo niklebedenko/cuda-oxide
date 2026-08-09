@@ -28,6 +28,13 @@ mod kernels {
     use super::*;
 
     #[kernel]
+    pub unsafe fn graph_conditional(handle: u64) {
+        // SAFETY: this test only verifies that the device-only call does not
+        // escape into the host link; the kernel is never launched.
+        unsafe { cuda_device::graph::set_conditional(handle, 0) };
+    }
+
+    #[kernel]
     pub fn scalar_args(
         scale: f32,
         params: AffineParams,
