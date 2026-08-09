@@ -1093,10 +1093,12 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
 /// could not: this crate dev-depends on `cuda-host`, which turns the `host`
 /// feature back on under feature unification even for
 /// `cargo test --no-default-features`.
+#[cfg(test)]
 fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<TokenStream2> {
     expand_cuda_module_inner_with_artifact_anchor(module, emit_host, None)
 }
 
+#[cfg(test)]
 fn expand_cuda_module_with_artifact_anchor(
     module: ItemMod,
     artifact_anchor_override: Option<TokenStream2>,
