@@ -30,11 +30,12 @@ use rustc_middle::ty::{
     EarlyBinder, FnSig, Instance, Ty, TyCtxt, TyKind, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor, TypingEnv,
 };
+use rustc_target::callconv::FnAbi;
 use std::fmt;
 use std::ops::ControlFlow;
 
 /// Bump whenever the semantic-resource closure or framing changes.
-const SEMANTIC_FINGERPRINT_VERSION: &str = "cuda-oxide-device-semantic-v2";
+const SEMANTIC_FINGERPRINT_VERSION: &str = "cuda-oxide-device-semantic-v3";
 
 /// A rustc-stable 128-bit digest of all inputs which can affect one device module.
 ///
@@ -100,7 +101,7 @@ struct FunctionResource<'tcx> {
     is_kernel: bool,
     root_descriptor: Option<String>,
     instance: Instance<'tcx>,
-    signature: FnSig<'tcx>,
+    call_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
     attrs: &'tcx CodegenFnAttrs,
     body: &'tcx Body<'tcx>,
     evaluated_constants: Vec<ConstValue>,
@@ -263,7 +264,17 @@ impl<'tcx> ResourceCollector<'tcx> {
         let instance = function.instance;
         let def_id = instance.def_id();
         let symbol = self.tcx.symbol_name(instance).name.to_string();
-        let signature = self.function_signature(instance)?;
+        let call_abi = self
+            .tcx
+            .fn_abi_of_instance(
+                TypingEnv::fully_monomorphized()
+                    .as_query_input((instance, rustc_middle::ty::List::empty())),
+            )
+            .map_err(|error| {
+                DeviceSemanticFingerprintError::new(format!(
+                    "cannot compute device call ABI for `{symbol}`: {error:?}"
+                ))
+            })?;
         let body = self.tcx.instance_mir(instance.def);
         let debug_source_scopes =
             crate::device_codegen::device_debug_kind(self.tcx.sess.opts.debuginfo)
@@ -271,7 +282,10 @@ impl<'tcx> ResourceCollector<'tcx> {
                 .then(|| crate::device_codegen::device_debug_source_scope_map(self.tcx, function));
 
         self.seed_type(instance.ty(self.tcx, TypingEnv::fully_monomorphized()))?;
-        self.seed_signature_types(signature)?;
+        self.seed_type(call_abi.ret.layout.ty)?;
+        for argument in &call_abi.args {
+            self.seed_type(argument.layout.ty)?;
+        }
         let evaluated_constants = self.seed_body_resources(instance, body, &symbol)?;
 
         let reachability = crate::collector::device_mono_reachability(self.tcx, instance);
@@ -281,7 +295,7 @@ impl<'tcx> ResourceCollector<'tcx> {
             is_kernel: function.is_kernel,
             root_descriptor: function.root_descriptor.clone(),
             instance,
-            signature,
+            call_abi,
             attrs: self.tcx.codegen_fn_attrs(def_id),
             body,
             evaluated_constants,
@@ -307,25 +321,6 @@ impl<'tcx> ResourceCollector<'tcx> {
             attrs: declaration.attrs.clone(),
         });
         Ok(())
-    }
-
-    fn function_signature(
-        &self,
-        instance: Instance<'tcx>,
-    ) -> Result<FnSig<'tcx>, DeviceSemanticFingerprintError> {
-        let signature = self
-            .tcx
-            .fn_sig(instance.def_id())
-            .instantiate(self.tcx, instance.args);
-        let signature = self.tcx.instantiate_bound_regions_with_erased(signature);
-        self.tcx
-            .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), signature)
-            .map_err(|_| {
-                DeviceSemanticFingerprintError::new(format!(
-                    "cannot normalize device signature for `{}`",
-                    self.tcx.symbol_name(instance).name
-                ))
-            })
     }
 
     fn seed_signature_types(
@@ -636,7 +631,7 @@ fn hash_resources(
         function.is_kernel.hash_stable(hcx, hasher);
         function.root_descriptor.hash_stable(hcx, hasher);
         function.instance.hash_stable(hcx, hasher);
-        function.signature.hash_stable(hcx, hasher);
+        function.call_abi.hash_stable(hcx, hasher);
         function.attrs.hash_stable(hcx, hasher);
         function.body.hash_stable(hcx, hasher);
         function.evaluated_constants.hash_stable(hcx, hasher);

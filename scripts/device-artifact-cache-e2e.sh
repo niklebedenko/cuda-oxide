@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Quick mode proves clean-target reuse plus source/architecture invalidation:
 #   scripts/device-artifact-cache-e2e.sh
-# Full mode additionally checks type layout, static initializers, backend bytes,
-# and CUDA compiler-tool bytes:
+# Full mode additionally checks cross-crate closure signatures, type layout,
+# static initializers, backend bytes, and CUDA compiler-tool bytes:
 #   scripts/device-artifact-cache-e2e.sh --full
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -170,6 +170,34 @@ run_fixture_mutation() {
 }
 
 if [[ "$mode" == "--full" ]]; then
+    run_external_closure() {
+        label=$1
+        target_dir=$2
+        log=$run_root/$label.log
+        if ! env \
+            "CARGO_TARGET_DIR=$target_dir" \
+            "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_DIR=$cache" \
+            "CUDA_OXIDE_DEVICE_ARTIFACT_CACHE_TRACE=${CUDA_OXIDE_CACHE_E2E_TRACE:-1}" \
+            "$cargo_oxide" run extern_crate_closure \
+            --materialize-cubin --arch "$arch" >"$log" 2>&1; then
+            tail -200 "$log" >&2
+            echo "device-cache-e2e: $label cross-crate closure build or GPU run failed" >&2
+            return 1
+        fi
+        grep -Fq 'PASSED: all external closure and wrapped-pair results correct' "$log"
+    }
+
+    run_external_closure closure-cold "$run_root/target-extern-crate-closure-a"
+    closure_key=$(require_event miss "$run_root/closure-cold.log")
+    closure_published_key=$(require_event published "$run_root/closure-cold.log")
+    [[ "$closure_published_key" == "$closure_key" ]]
+
+    run_external_closure closure-warm "$run_root/target-extern-crate-closure-b"
+    closure_warm_key=$(require_event hit "$run_root/closure-warm.log")
+    [[ "$closure_warm_key" == "$closure_key" ]]
+    [[ $(grep -c 'device artifact cache hit:' "$run_root/closure-warm.log") -eq 1 ]]
+    ! grep -Eq 'device artifact cache (miss|published):' "$run_root/closure-warm.log"
+
     run_fixture_mutation \
         layout \
         field_array_assign \
@@ -229,3 +257,7 @@ echo "  clean target B hit:          $warm_key"
 echo "  evaluated constant miss:     $constant_key"
 echo "  reachable source miss:       $code_key"
 echo "  alternate architecture miss: $arch_key"
+if [[ "$mode" == "--full" ]]; then
+    echo "  cross-crate closure miss:     $closure_key"
+    echo "  cross-crate closure hit:      $closure_warm_key"
+fi
