@@ -84,6 +84,27 @@ pub fn prepare_mir_module(
     })?;
     verify_operation(ctx, module, "module post-mem2reg")?;
 
+    // Primitive comparison methods retain reference arguments in rustc MIR.
+    // Inline the exact two-load comparison shape when an argument comes from
+    // an indexed aggregate, then canonicalize the exposed nested scalar load.
+    // A second mem2reg pass promotes the compiler-owned aggregate local after
+    // its dynamic pointer projection has become SSA extraction.
+    mir_transforms::scalarize_borrowed_aggregate_reads::
+        canonicalize_trivial_indexed_comparison_calls(module, ctx, preparation.verbose);
+    let rewritten_nested_loads = mir_transforms::scalarize_borrowed_aggregate_reads::
+        canonicalize_read_only_aggregate_arguments(module, ctx, preparation.verbose);
+    if rewritten_nested_loads > 0 {
+        analyses = pliron::pass::AnalysisManager::default();
+        pliron::opts::mem2reg::mem2reg(module, ctx, &mut analyses).map_err(|error| {
+            PipelineError::Verification {
+                name: "post-comparison mem2reg".to_string(),
+                message: error.disp(ctx).to_string(),
+                operation: None,
+            }
+        })?;
+    }
+    verify_operation(ctx, module, "module post-nested-aggregate-scalarization")?;
+
     // Formation passes that need promoted SSA values but must still see the
     // original loop CFG run here. In particular, a reduction formation pass
     // cannot safely infer a source loop once generic unrolling has cloned it.
