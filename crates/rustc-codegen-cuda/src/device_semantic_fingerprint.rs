@@ -373,6 +373,11 @@ impl<'tcx> ResourceCollector<'tcx> {
     }
 
     fn seed_type(&mut self, ty: Ty<'tcx>) -> Result<(), DeviceSemanticFingerprintError> {
+        if ty.has_escaping_bound_vars() {
+            return Err(DeviceSemanticFingerprintError::new(format!(
+                "device semantic type has escaping bound variables before normalization: `{ty}`"
+            )));
+        }
         let ty = self
             .tcx
             .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty)
@@ -382,6 +387,11 @@ impl<'tcx> ResourceCollector<'tcx> {
                 ))
             })?;
         let ty = self.tcx.erase_and_anonymize_regions(ty);
+        if ty.has_escaping_bound_vars() {
+            return Err(DeviceSemanticFingerprintError::new(format!(
+                "device semantic type has escaping bound variables after region erasure: `{ty}`"
+            )));
+        }
         if ty.has_non_region_param() {
             return Err(DeviceSemanticFingerprintError::new(format!(
                 "device semantic type remains generic after normalization: `{ty}`"
@@ -398,6 +408,11 @@ impl<'tcx> ResourceCollector<'tcx> {
             let ty = self.type_queue[self.type_cursor];
             self.type_cursor += 1;
 
+            if ty.has_escaping_bound_vars() {
+                return Err(DeviceSemanticFingerprintError::new(format!(
+                    "device semantic type has escaping bound variables before layout: `{ty}`"
+                )));
+            }
             let layout = self
                 .tcx
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))

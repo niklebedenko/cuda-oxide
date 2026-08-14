@@ -23,8 +23,8 @@ jobs:
     # device codegen. Typically well under an hour with the shared
     # CARGO_TARGET_DIR; the timeout leaves headroom for cold runners.
     # Leave job-level headroom around the 50-minute full compile and the
-    # focused 10-minute materialization gate, plus toolkit/LLVM setup.
-    timeout-minutes: 75
+    # two focused 10-minute materialization gates, plus toolkit/LLVM setup.
+    timeout-minutes: 85
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
@@ -187,6 +187,21 @@ jobs:
           assert_only_expected_rebuilt \
             "${RUNNER_TEMP}/cross-crate-sm90-build.log" \
             '^(kernel-lib|cross_crate_kernel)$' kernel-lib cross_crate_kernel
+
+      - name: Escaping bound variables disable the device artifact cache safely
+        timeout-minutes: 10
+        env:
+          CUDA_TOOLKIT_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          CUDA_OXIDE_LLC: /usr/bin/llc-21
+          CARGO_TARGET_DIR: ${{ runner.temp }}/examples-shared-target
+        run: |
+          set -euo pipefail
+          sysroot="$(rustc --print sysroot)"
+          export LIBRARY_PATH="${sysroot}/lib:${LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="${CUDA_TOOLKIT_PATH}/lib64:${sysroot}/lib:${LD_LIBRARY_PATH:-}"
+
+          CARGO_OXIDE_BIN="${CARGO_TARGET_DIR}/debug/cargo-oxide" \
+            scripts/device-artifact-cache-e2e.sh --bound-vars-only
 
       - name: Upload failure logs
         if: failure()

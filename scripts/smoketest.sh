@@ -67,7 +67,7 @@ NOINLINE_MIR_EXAMPLES=(disjoint_slice_len)
 # binary must both succeed, but reporting a bare `PASS` would make them
 # indistinguishable in the summary from an example that launched kernels and
 # verified results.
-NO_LAUNCH_EXAMPLES=(wgmma_mma_bf16)
+NO_LAUNCH_EXAMPLES=(semantic_fingerprint_bound_vars wgmma_mma_bf16)
 
 # Examples whose verify-code-shape.sh asserts on `#[inline(never)]` marker
 # symbols. Those markers are private, so once the middle end inlines them into

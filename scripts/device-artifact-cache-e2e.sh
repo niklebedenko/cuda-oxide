@@ -6,14 +6,16 @@ set -euo pipefail
 # Quick mode proves clean-target reuse, external-closure restoration, and
 # source/architecture invalidation:
 #   scripts/device-artifact-cache-e2e.sh
+# The bound-variable mode is a GPU-less regression for cache fingerprinting:
+#   scripts/device-artifact-cache-e2e.sh --bound-vars-only
 # Full mode additionally checks type layout, static initializers, backend
 # bytes, LLVM program bytes, and CUDA compiler-tool bytes:
 #   scripts/device-artifact-cache-e2e.sh --full
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-quick}
-if [[ "$mode" != "quick" && "$mode" != "--full" ]]; then
-    echo "usage: $0 [--full]" >&2
+if [[ "$mode" != "quick" && "$mode" != "--bound-vars-only" && "$mode" != "--full" ]]; then
+    echo "usage: $0 [--bound-vars-only|--full]" >&2
     exit 2
 fi
 
@@ -108,6 +110,55 @@ require_event() {
     fi
     printf '%s' "$key"
 }
+
+run_bound_vars_regression() {
+    local fixture=$run_root/semantic-fingerprint-bound-vars
+    local target_dir=$run_root/target-semantic-fingerprint-bound-vars
+    local log=$run_root/semantic-fingerprint-bound-vars.log
+    local objcopy_bin artifact name_len target_len record_offset kind data_offset magic
+
+    cp -a crates/rustc-codegen-cuda/examples/semantic_fingerprint_bound_vars "$fixture"
+    rm -f -- "$fixture/Cargo.lock"
+    sed -i \
+        -e "s#../../../cuda-device#$repo_root/crates/cuda-device#g" \
+        -e "s#../../../cuda-host#$repo_root/crates/cuda-host#g" \
+        -e "s#../../../cuda-core#$repo_root/crates/cuda-core#g" \
+        "$fixture/Cargo.toml"
+
+    run_build semantic-fingerprint-bound-vars "$arch" "$target_dir"
+
+    grep -Fq \
+        'device semantic fingerprint unavailable: device semantic type has escaping bound variables before normalization' \
+        "$log"
+    ! grep -Eq "compiler unexpectedly panicked|thread 'rustc'.*panicked at" "$log"
+    ! grep -Eq 'device artifact cache (hit|miss|published):' "$log"
+    find "$fixture" -maxdepth 1 -type f -name '*.ptx' -size +0c -print -quit \
+        | grep -q .
+
+    objcopy_bin=$(command -v llvm-objcopy || command -v objcopy || true)
+    if [[ -z "$objcopy_bin" ]]; then
+        echo "device-cache-e2e: bound-vars regression requires llvm-objcopy or objcopy" >&2
+        return 1
+    fi
+    artifact=$run_root/semantic-fingerprint-bound-vars.oxart
+    "$objcopy_bin" --dump-section \
+        ".oxart=$artifact" \
+        "$target_dir/debug/semantic_fingerprint_bound_vars"
+    [[ -s "$artifact" ]]
+    name_len=$(od -An -tu2 -j16 -N2 "$artifact" | tr -d '[:space:]')
+    target_len=$(od -An -tu2 -j18 -N2 "$artifact" | tr -d '[:space:]')
+    record_offset=$((32 + name_len + target_len))
+    kind=$(od -An -tu2 -j"$record_offset" -N2 "$artifact" | tr -d '[:space:]')
+    data_offset=$(od -An -tu4 -j$((record_offset + 4)) -N4 "$artifact" | tr -d '[:space:]')
+    magic=$(od -An -tx1 -j"$data_offset" -N4 "$artifact" | tr -d '[:space:]')
+    [[ "$kind" == "512" && "$magic" == "7f454c46" ]]
+}
+
+run_bound_vars_regression
+if [[ "$mode" == "--bound-vars-only" ]]; then
+    echo "device-cache-e2e: bound-vars PASS"
+    exit 0
+fi
 
 run_build cold-a "$arch" "$run_root/target-a"
 baseline_key=$(require_event miss "$run_root/cold-a.log")
