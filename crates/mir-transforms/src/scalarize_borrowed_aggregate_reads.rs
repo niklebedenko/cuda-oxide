@@ -386,13 +386,7 @@ fn analyze_array_element_path(
         let mut next_fields = nested_fields.to_vec();
         next_fields.push(extraction);
         analysis.nested_field_addrs.push(user);
-        analyze_array_element_path(
-            ctx,
-            nested_pointer,
-            projection,
-            &next_fields,
-            analysis,
-        )?;
+        analyze_array_element_path(ctx, nested_pointer, projection, &next_fields, analysis)?;
     }
     Some(())
 }
