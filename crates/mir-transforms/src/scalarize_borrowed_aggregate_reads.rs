@@ -5,11 +5,11 @@
 
 //! Canonicalize bounded read-only aggregate projections before LLVM lowering.
 //!
-//! rustc MIR parameters are imported through entry-block slots:
+//! rustc MIR aggregate values are commonly imported through stack slots:
 //!
 //! ```text
 //! %slot = mir.alloca
-//! mir.store %slot, %argument
+//! mir.store %slot, %aggregate
 //! ...
 //! %field = mir.field_addr %slot, field
 //! %elem = mir.array_element_addr %field, %index
@@ -17,15 +17,21 @@
 //! ```
 //!
 //! `mir.field_addr` is intentionally non-promotable, so the ordinary mem2reg
-//! pass cannot recover the already-available SSA argument. For a compiler-owned
-//! entry slot initialized exactly once from an entry-block argument, this pass
-//! validates the complete pointer-use graph and rewrites read-only array loads
-//! to value operations:
+//! pass cannot recover the aggregate as an SSA value. For a compiler-owned slot
+//! initialized by one whole-value store, this pass validates the complete
+//! pointer-use graph and rewrites read-only array loads to value operations:
 //!
 //! ```text
-//! %array = mir.extract_field %argument, field
+//! %aggregate = mir.load %slot
+//! %array = mir.extract_field %aggregate, field
 //! %value = mir.extract_array_element %array, %index
 //! ```
+//!
+//! A slot initialized from an entry-block argument and read only in dominated
+//! blocks uses that argument directly. Other compiler-owned locals retain a
+//! whole-value load at the original scalar read point. The immediately
+//! following mem2reg pass promotes that load and store while preserving loop-
+//! carried and control-flow-dependent assignment semantics.
 //!
 //! This pass canonicalizes pointer-based read-only access independently of the
 //! runtime index shape. The later `mir.extract_array_element` lowering owns the
@@ -34,10 +40,9 @@
 //! the ordinary memory fallback.
 //!
 //! The pre-mem2reg phase fails closed on pointer provenance and mutation. It
-//! rejects additional stores, volatile loads, mutable derived pointers, calls,
-//! pointer casts, pointer PHIs/selects, unknown users, non-array fields, and
-//! projections in the entry block before the initializer can be proven to
-//! dominate them.
+//! rejects additional stores, volatile accesses, mutable derived pointers,
+//! calls, pointer casts, pointer PHIs/selects, unknown users, and non-array
+//! fields.
 //!
 //! A second, post-mem2reg phase handles immutable aggregate pointer arguments
 //! such as an `&self` device helper. It accepts only an exact single-use chain:
@@ -76,8 +81,9 @@ use dialect_mir::{
     attributes::{FieldIndexAttr, MirCastKindAttr},
     ops::{
         MAX_SCALARIZED_CANDIDATES, MirAllocaOp, MirArrayElementAddrOp, MirAssertOp, MirCallOp,
-        MirCastOp, MirConstantOp, MirExtractArrayElementOp, MirExtractFieldOp, MirFieldAddrOp,
-        MirFuncOp, MirLoadOp, MirLtOp, MirRemOp, MirStoreOp,
+        MirCastOp, MirConstantOp, MirEqOp, MirExtractArrayElementOp, MirExtractFieldOp,
+        MirFieldAddrOp, MirFuncOp, MirLoadOp, MirLtOp, MirNeOp, MirRemOp, MirReturnOp,
+        MirStorageDeadOp, MirStorageLiveOp, MirStoreOp,
     },
     types::{MirArrayType, MirPtrType, MirStructType},
 };
@@ -104,21 +110,52 @@ struct LoadRewrite {
     field_index: u32,
     index: Value,
     array_type: TypeHandle,
+    element_type: TypeHandle,
+    nested_fields: Vec<FieldExtraction>,
     result_type: TypeHandle,
 }
 
+#[derive(Clone, Copy)]
+struct FieldExtraction {
+    field_index: u32,
+    result_type: TypeHandle,
+}
+
+#[derive(Clone, Copy)]
+struct ArrayProjection {
+    field_index: u32,
+    index: Value,
+    array_type: TypeHandle,
+    element_type: TypeHandle,
+}
+
+struct ProjectionAnalysis<'a> {
+    nested_field_addrs: &'a mut Vec<Ptr<Operation>>,
+    loads: &'a mut Vec<LoadRewrite>,
+}
+
 struct AllocaPlan {
-    aggregate_value: Value,
+    source: AggregateSource,
     field_addrs: Vec<Ptr<Operation>>,
     array_addrs: Vec<Ptr<Operation>>,
+    nested_field_addrs: Vec<Ptr<Operation>>,
     loads: Vec<LoadRewrite>,
 }
 
-/// Rewrite read-only indexed aggregate argument loads before mem2reg.
+#[derive(Clone, Copy)]
+enum AggregateSource {
+    Direct(Value),
+    Slot {
+        pointer: Value,
+        aggregate_type: TypeHandle,
+    },
+}
+
+/// Rewrite read-only indexed compiler-owned aggregate loads before mem2reg.
 ///
-/// Only entry-block allocas initialized from an argument of the same block are
-/// considered. Every pointer use must belong to the exact read-only projection
-/// graph accepted by `analyze_alloca`.
+/// Only allocas initialized by exactly one whole-value store are considered.
+/// Every pointer use must belong to the exact read-only projection graph
+/// accepted by `analyze_alloca`.
 ///
 /// `verbose` is threaded from the pipeline's backend options; the pass itself
 /// never reads the environment.
@@ -126,7 +163,7 @@ pub fn canonicalize_read_only_aggregate_arguments(
     module: Ptr<Operation>,
     ctx: &mut Context,
     verbose: bool,
-) {
+) -> usize {
     let mut ops = Vec::new();
     collect_ops(ctx, module, &mut ops);
 
@@ -146,6 +183,7 @@ pub fn canonicalize_read_only_aggregate_arguments(
     if rewritten_loads > 0 && verbose {
         eprintln!("borrowed-aggregate scalarization: rewrote {rewritten_loads} dynamic load(s)");
     }
+    rewritten_loads
 }
 
 fn collect_ops(ctx: &Context, root: Ptr<Operation>, output: &mut Vec<Ptr<Operation>>) {
@@ -162,7 +200,7 @@ fn collect_ops(ctx: &Context, root: Ptr<Operation>, output: &mut Vec<Ptr<Operati
     }
 }
 
-/// Validate one entry-block aggregate slot without mutating the IR.
+/// Validate one compiler-owned aggregate slot without mutating the IR.
 fn analyze_alloca(ctx: &Context, alloca: Ptr<Operation>) -> Option<AllocaPlan> {
     let alloca_op = Operation::get_op::<MirAllocaOp>(alloca, ctx)?;
     let pointee = alloca_op.pointee_type(ctx);
@@ -172,9 +210,10 @@ fn analyze_alloca(ctx: &Context, alloca: Ptr<Operation>) -> Option<AllocaPlan> {
     let root = alloca.deref(ctx).get_result(0);
     let block_arguments: Vec<_> = alloca_block.deref(ctx).arguments().collect();
 
-    let mut aggregate_value = None;
+    let mut initializer = None;
     let mut field_addrs = Vec::new();
     let mut array_addrs = Vec::new();
+    let mut nested_field_addrs = Vec::new();
     let mut loads = Vec::new();
 
     for root_use in root.uses(ctx) {
@@ -182,34 +221,50 @@ fn analyze_alloca(ctx: &Context, alloca: Ptr<Operation>) -> Option<AllocaPlan> {
         let operand_index = root_use.find_index(ctx);
 
         if let Some(store) = Operation::get_op::<MirStoreOp>(user, ctx) {
-            if operand_index != 0
-                || store.is_volatile(ctx)
-                || user.deref(ctx).get_parent_block() != Some(alloca_block)
-                || aggregate_value.is_some()
-            {
+            if operand_index != 0 || store.is_volatile(ctx) || initializer.is_some() {
                 return None;
             }
 
             let stored_value = store.value_opd(ctx);
-            if !block_arguments.contains(&stored_value) {
-                return None;
-            }
-            aggregate_value = Some(stored_value);
+            initializer = Some((user, stored_value));
             continue;
         }
 
         let field = Operation::get_op::<MirFieldAddrOp>(user, ctx)?;
-        if operand_index != 0 || user.deref(ctx).get_parent_block() == Some(alloca_block) {
+        if operand_index != 0 {
             return None;
         }
 
-        analyze_field_path(ctx, field, &mut field_addrs, &mut array_addrs, &mut loads)?;
+        analyze_field_path(
+            ctx,
+            field,
+            &mut field_addrs,
+            &mut array_addrs,
+            &mut nested_field_addrs,
+            &mut loads,
+        )?;
     }
 
+    let (initializer, aggregate_value) = initializer?;
+    let can_use_direct_value = initializer.deref(ctx).get_parent_block() == Some(alloca_block)
+        && block_arguments.contains(&aggregate_value)
+        && field_addrs
+            .iter()
+            .all(|field| field.deref(ctx).get_parent_block() != Some(alloca_block));
+    let source = if can_use_direct_value {
+        AggregateSource::Direct(aggregate_value)
+    } else {
+        AggregateSource::Slot {
+            pointer: root,
+            aggregate_type: pointee,
+        }
+    };
+
     Some(AllocaPlan {
-        aggregate_value: aggregate_value?,
+        source,
         field_addrs,
         array_addrs,
+        nested_field_addrs,
         loads: (!loads.is_empty()).then_some(loads)?,
     })
 }
@@ -219,6 +274,7 @@ fn analyze_field_path(
     field: MirFieldAddrOp,
     field_addrs: &mut Vec<Ptr<Operation>>,
     array_addrs: &mut Vec<Ptr<Operation>>,
+    nested_field_addrs: &mut Vec<Ptr<Operation>>,
     loads: &mut Vec<LoadRewrite>,
 ) -> Option<()> {
     let field_op = field.get_operation();
@@ -237,6 +293,7 @@ fn analyze_field_path(
     if array_type_info.size() == 0 {
         return None;
     }
+    let element_type = array_type_info.element_type();
 
     let mut local_array_addrs = Vec::new();
     let mut local_loads = Vec::new();
@@ -257,30 +314,17 @@ fn analyze_field_path(
         }
 
         let index = array_op.deref(ctx).get_operand(1);
-        let mut found_load = false;
-        for array_use in array_pointer.uses(ctx) {
-            let load_op = array_use.user_op();
-            if array_use.find_index(ctx) != 0 {
-                return None;
-            }
-            let load = Operation::get_op::<MirLoadOp>(load_op, ctx)?;
-            if load.is_volatile(ctx) {
-                return None;
-            }
-
-            local_loads.push(LoadRewrite {
-                load: load_op,
-                field_index,
-                index,
-                array_type,
-                result_type: load_op.deref(ctx).get_result(0).get_type(ctx),
-            });
-            found_load = true;
-        }
-
-        if !found_load {
-            return None;
-        }
+        let projection = ArrayProjection {
+            field_index,
+            index,
+            array_type,
+            element_type,
+        };
+        let mut analysis = ProjectionAnalysis {
+            nested_field_addrs,
+            loads: &mut local_loads,
+        };
+        analyze_array_element_path(ctx, array_pointer, projection, &[], &mut analysis)?;
         local_array_addrs.push(array_op);
     }
 
@@ -294,18 +338,96 @@ fn analyze_field_path(
     Some(())
 }
 
+fn analyze_array_element_path(
+    ctx: &Context,
+    pointer: Value,
+    projection: ArrayProjection,
+    nested_fields: &[FieldExtraction],
+    analysis: &mut ProjectionAnalysis<'_>,
+) -> Option<()> {
+    let uses = pointer.uses(ctx);
+    if uses.is_empty() {
+        return None;
+    }
+
+    for pointer_use in uses {
+        if pointer_use.find_index(ctx) != 0 {
+            return None;
+        }
+        let user = pointer_use.user_op();
+        if let Some(load) = Operation::get_op::<MirLoadOp>(user, ctx) {
+            if load.is_volatile(ctx) {
+                return None;
+            }
+            analysis.loads.push(LoadRewrite {
+                load: user,
+                field_index: projection.field_index,
+                index: projection.index,
+                array_type: projection.array_type,
+                element_type: projection.element_type,
+                nested_fields: nested_fields.to_vec(),
+                result_type: user.deref(ctx).get_result(0).get_type(ctx),
+            });
+            continue;
+        }
+
+        let nested_field = Operation::get_op::<MirFieldAddrOp>(user, ctx)?;
+        let nested_pointer = user.deref(ctx).get_result(0);
+        let nested_pointer_type = nested_pointer.get_type(ctx);
+        let nested_pointer_type_ref = nested_pointer_type.deref(ctx);
+        let nested_pointer_type = nested_pointer_type_ref.downcast_ref::<MirPtrType>()?;
+        if nested_pointer_type.is_mutable {
+            return None;
+        }
+        let extraction = FieldExtraction {
+            field_index: nested_field.get_attr_field_index(ctx)?.0,
+            result_type: nested_pointer_type.pointee,
+        };
+        let mut next_fields = nested_fields.to_vec();
+        next_fields.push(extraction);
+        analysis.nested_field_addrs.push(user);
+        analyze_array_element_path(
+            ctx,
+            nested_pointer,
+            projection,
+            &next_fields,
+            analysis,
+        )?;
+    }
+    Some(())
+}
+
 fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan) -> usize {
     let load_count = plan.loads.len();
     let mut rewriter = IRRewriter::<Recorder>::default();
 
     for rewrite in plan.loads {
         let location = rewrite.load.deref(ctx).loc().clone();
+        let aggregate_value = match plan.source {
+            AggregateSource::Direct(value) => value,
+            AggregateSource::Slot {
+                pointer,
+                aggregate_type,
+            } => {
+                let load = Operation::new(
+                    ctx,
+                    MirLoadOp::get_concrete_op_info(),
+                    vec![aggregate_type],
+                    vec![pointer],
+                    vec![],
+                    0,
+                );
+                load.deref_mut(ctx).set_loc(location.clone());
+                load.insert_before(ctx, rewrite.load);
+                load.deref(ctx).get_result(0)
+            }
+        };
 
         let extract_field = Operation::new(
             ctx,
             MirExtractFieldOp::get_concrete_op_info(),
             vec![rewrite.array_type],
-            vec![plan.aggregate_value],
+            vec![aggregate_value],
             vec![],
             0,
         );
@@ -318,14 +440,34 @@ fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan) -> usize {
         let extract_element = Operation::new(
             ctx,
             MirExtractArrayElementOp::get_concrete_op_info(),
-            vec![rewrite.result_type],
+            vec![rewrite.element_type],
             vec![array_value, rewrite.index],
             vec![],
             0,
         );
-        extract_element.deref_mut(ctx).set_loc(location);
+        extract_element.deref_mut(ctx).set_loc(location.clone());
         extract_element.insert_before(ctx, rewrite.load);
-        let replacement = extract_element.deref(ctx).get_result(0);
+        let mut replacement = extract_element.deref(ctx).get_result(0);
+
+        for nested_field in rewrite.nested_fields {
+            let extract_field = Operation::new(
+                ctx,
+                MirExtractFieldOp::get_concrete_op_info(),
+                vec![nested_field.result_type],
+                vec![replacement],
+                vec![],
+                0,
+            );
+            extract_field.deref_mut(ctx).set_loc(location.clone());
+            MirExtractFieldOp::new(extract_field)
+                .set_attr_index(ctx, FieldIndexAttr(nested_field.field_index));
+            extract_field.insert_before(ctx, rewrite.load);
+            replacement = extract_field.deref(ctx).get_result(0);
+        }
+        assert!(
+            replacement.get_type(ctx) == rewrite.result_type,
+            "validated aggregate projection changed the scalar result type"
+        );
 
         let old_result = rewrite.load.deref(ctx).get_result(0);
         old_result.replace_all_uses_with(ctx, &replacement);
@@ -335,6 +477,9 @@ fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan) -> usize {
     // Loads are gone, so the exact validated pointer chain is dead. Erase it
     // from leaves to root through the rewriter so linked-list bookkeeping and
     // use-list updates remain valid for the immediately following mem2reg pass.
+    for nested_field_addr in plan.nested_field_addrs.into_iter().rev() {
+        rewriter.erase_operation(ctx, nested_field_addr);
+    }
     for array_addr in plan.array_addrs.into_iter().rev() {
         rewriter.erase_operation(ctx, array_addr);
     }
@@ -343,6 +488,238 @@ fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan) -> usize {
     }
 
     load_count
+}
+
+#[derive(Clone, Copy)]
+enum TrivialComparisonKind {
+    Eq,
+    Ne,
+}
+
+/// Inline trivial read-only scalar comparisons fed by an indexed aggregate.
+///
+/// Rust's primitive `PartialEq` methods take references, even when their body
+/// is only two non-volatile scalar loads and one comparison. After the first
+/// mem2reg pass, recognizing that exact helper shape exposes the terminal load
+/// behind an aggregate's field/index projection. The aggregate canonicalizer
+/// can then replace the address chain with SSA extraction before a second
+/// mem2reg pass.
+///
+/// Helpers with additional blocks, operations, pointer uses, or side effects
+/// fail closed. Calls without an indexed aggregate operand are left alone.
+pub fn canonicalize_trivial_indexed_comparison_calls(
+    module: Ptr<Operation>,
+    ctx: &mut Context,
+    verbose: bool,
+) -> usize {
+    let mut operations = Vec::new();
+    collect_ops(ctx, module, &mut operations);
+
+    let comparisons: HashMap<_, _> = operations
+        .iter()
+        .filter_map(|operation| {
+            let function = Operation::get_op::<MirFuncOp>(*operation, ctx)?;
+            let comparison = analyze_trivial_comparison(ctx, *operation)?;
+            Some((String::from(function.get_symbol_name(ctx)), comparison))
+        })
+        .collect();
+    let calls: Vec<_> = operations
+        .into_iter()
+        .filter(|operation| Operation::get_op::<MirCallOp>(*operation, ctx).is_some())
+        .collect();
+
+    let mut rewritten_calls = 0usize;
+    for call in calls {
+        let call_op = Operation::get_op::<MirCallOp>(call, ctx)
+            .expect("call list contains only mir.call operations");
+        let Some(callee) = call_op
+            .get_attr_callee(ctx)
+            .map(|attribute| String::from((*attribute).clone()))
+        else {
+            continue;
+        };
+        let Some(&comparison) = comparisons.get(&callee) else {
+            continue;
+        };
+        if call.deref(ctx).get_num_operands() != 2
+            || call.deref(ctx).get_num_results() != 1
+            || !(0..2).any(|index| {
+                pointer_has_indexed_aggregate_projection(ctx, call.deref(ctx).get_operand(index))
+            })
+        {
+            continue;
+        }
+        let Some(pointee_types) = (0..2)
+            .map(|index| {
+                let pointer_type = call.deref(ctx).get_operand(index).get_type(ctx);
+                let pointer_type_ref = pointer_type.deref(ctx);
+                let pointer_type = pointer_type_ref.downcast_ref::<MirPtrType>()?;
+                (!pointer_type.is_mutable).then_some(pointer_type.pointee)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if pointee_types[0] != pointee_types[1] {
+            continue;
+        }
+
+        rewrite_trivial_comparison_call(ctx, call, comparison, &pointee_types);
+        rewritten_calls += 1;
+    }
+
+    if rewritten_calls > 0 && verbose {
+        eprintln!("indexed scalar comparison canonicalization: rewrote {rewritten_calls} call(s)");
+    }
+    rewritten_calls
+}
+
+fn analyze_trivial_comparison(
+    ctx: &Context,
+    function: Ptr<Operation>,
+) -> Option<TrivialComparisonKind> {
+    Operation::get_op::<MirFuncOp>(function, ctx)?;
+    let region = function.deref(ctx).get_region(0);
+    let blocks: Vec<_> = region.deref(ctx).iter(ctx).collect();
+    let [block] = blocks.as_slice() else {
+        return None;
+    };
+    let arguments: Vec<_> = block.deref(ctx).arguments().collect();
+    let [lhs_pointer, rhs_pointer] = arguments.as_slice() else {
+        return None;
+    };
+    for &pointer in &arguments {
+        let pointer_type = pointer.get_type(ctx);
+        let pointer_type_ref = pointer_type.deref(ctx);
+        let pointer_type = pointer_type_ref.downcast_ref::<MirPtrType>()?;
+        if pointer_type.is_mutable || pointer.num_uses(ctx) != 1 {
+            return None;
+        }
+    }
+
+    let mut loads = Vec::new();
+    let mut comparison = None;
+    let mut return_op = None;
+    for operation in block.deref(ctx).iter(ctx) {
+        if let Some(load) = Operation::get_op::<MirLoadOp>(operation, ctx) {
+            if load.is_volatile(ctx) {
+                return None;
+            }
+            loads.push(operation);
+        } else if Operation::get_op::<MirEqOp>(operation, ctx).is_some() {
+            if comparison
+                .replace((operation, TrivialComparisonKind::Eq))
+                .is_some()
+            {
+                return None;
+            }
+        } else if Operation::get_op::<MirNeOp>(operation, ctx).is_some() {
+            if comparison
+                .replace((operation, TrivialComparisonKind::Ne))
+                .is_some()
+            {
+                return None;
+            }
+        } else if Operation::get_op::<MirReturnOp>(operation, ctx).is_some() {
+            if return_op.replace(operation).is_some() {
+                return None;
+            }
+        } else if Operation::get_op::<MirStorageLiveOp>(operation, ctx).is_none()
+            && Operation::get_op::<MirStorageDeadOp>(operation, ctx).is_none()
+        {
+            return None;
+        }
+    }
+
+    let [lhs_load, rhs_load] = loads.as_slice() else {
+        return None;
+    };
+    let (comparison, kind) = comparison?;
+    let return_op = return_op?;
+    if lhs_load.deref(ctx).get_operand(0) != *lhs_pointer
+        || rhs_load.deref(ctx).get_operand(0) != *rhs_pointer
+    {
+        return None;
+    }
+    let lhs = lhs_load.deref(ctx).get_result(0);
+    let rhs = rhs_load.deref(ctx).get_result(0);
+    let result = comparison.deref(ctx).get_result(0);
+    if lhs.num_uses(ctx) != 1
+        || rhs.num_uses(ctx) != 1
+        || result.num_uses(ctx) != 1
+        || comparison.deref(ctx).get_operand(0) != lhs
+        || comparison.deref(ctx).get_operand(1) != rhs
+        || return_op.deref(ctx).get_num_operands() != 1
+        || return_op.deref(ctx).get_operand(0) != result
+    {
+        return None;
+    }
+    Some(kind)
+}
+
+fn pointer_has_indexed_aggregate_projection(ctx: &Context, mut pointer: Value) -> bool {
+    loop {
+        let Some(defining_op) = pointer.defining_op() else {
+            return false;
+        };
+        if Operation::get_op::<MirArrayElementAddrOp>(defining_op, ctx).is_some() {
+            return true;
+        }
+        if Operation::get_op::<MirFieldAddrOp>(defining_op, ctx).is_some() {
+            pointer = defining_op.deref(ctx).get_operand(0);
+            continue;
+        }
+        if let Some(cast) = Operation::get_op::<MirCastOp>(defining_op, ctx)
+            && cast
+                .get_attr_cast_kind(ctx)
+                .is_some_and(|kind| matches!(*kind, MirCastKindAttr::PtrToPtr))
+        {
+            pointer = defining_op.deref(ctx).get_operand(0);
+            continue;
+        }
+        return false;
+    }
+}
+
+fn rewrite_trivial_comparison_call(
+    ctx: &mut Context,
+    call: Ptr<Operation>,
+    comparison: TrivialComparisonKind,
+    pointee_types: &[TypeHandle],
+) {
+    let location = call.deref(ctx).loc().clone();
+    let operands: Vec<_> = (0..2)
+        .map(|index| call.deref(ctx).get_operand(index))
+        .collect();
+    let result_type = call.deref(ctx).get_result(0).get_type(ctx);
+    let mut loaded = Vec::with_capacity(2);
+    for (index, pointee_type) in pointee_types.iter().copied().enumerate() {
+        let load = Operation::new(
+            ctx,
+            MirLoadOp::get_concrete_op_info(),
+            vec![pointee_type],
+            vec![operands[index]],
+            vec![],
+            0,
+        );
+        load.deref_mut(ctx).set_loc(location.clone());
+        load.insert_before(ctx, call);
+        loaded.push(load.deref(ctx).get_result(0));
+    }
+
+    let comparison_info = match comparison {
+        TrivialComparisonKind::Eq => MirEqOp::get_concrete_op_info(),
+        TrivialComparisonKind::Ne => MirNeOp::get_concrete_op_info(),
+    };
+    let replacement = Operation::new(ctx, comparison_info, vec![result_type], loaded, vec![], 0);
+    replacement.deref_mut(ctx).set_loc(location);
+    replacement.insert_before(ctx, call);
+    let replacement_value = replacement.deref(ctx).get_result(0);
+    let old_result = call.deref(ctx).get_result(0);
+    old_result.replace_all_uses_with(ctx, &replacement_value);
+
+    let mut rewriter = IRRewriter::<Recorder>::default();
+    rewriter.erase_operation(ctx, call);
 }
 
 #[derive(Clone, Copy)]
@@ -766,19 +1143,42 @@ mod tests {
         alloca: Ptr<Operation>,
     }
 
+    #[derive(Default)]
+    struct FixtureOptions {
+        additional_store: bool,
+        volatile_load: bool,
+        store_in_body: bool,
+        nested_scalar_wrapper: bool,
+        comparison_call: bool,
+    }
+
     fn build_fixture(
         ctx: &mut Context,
         array_size: u64,
         divisor: Option<u64>,
-        additional_store: bool,
-        volatile_load: bool,
+        options: FixtureOptions,
     ) -> Fixture {
         dialect_mir::register(ctx);
 
         let element_type: TypeHandle = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
         let index_type = IntegerType::get(ctx, 64, Signedness::Unsigned);
         let index_handle: TypeHandle = index_type.into();
-        let array_type: TypeHandle = MirArrayType::get(ctx, element_type, array_size).into();
+        let array_element_type = if options.nested_scalar_wrapper {
+            MirStructType::get_with_full_layout(
+                ctx,
+                "ScalarWrapper".into(),
+                vec!["value".into()],
+                vec![element_type],
+                vec![0],
+                vec![0],
+                4,
+                4,
+            )
+            .into()
+        } else {
+            element_type
+        };
+        let array_type: TypeHandle = MirArrayType::get(ctx, array_element_type, array_size).into();
         let aggregate_type: TypeHandle = MirStructType::get_with_full_layout(
             ctx,
             "BorrowedAggregate".into(),
@@ -835,9 +1235,11 @@ mod tests {
             vec![],
             0,
         );
-        store.insert_at_back(entry, ctx);
+        if !options.store_in_body {
+            store.insert_at_back(entry, ctx);
+        }
 
-        if additional_store {
+        if options.additional_store {
             let second_store = Operation::new(
                 ctx,
                 MirStoreOp::get_concrete_op_info(),
@@ -890,6 +1292,10 @@ mod tests {
             raw_index
         };
 
+        if options.store_in_body {
+            store.insert_at_back(body, ctx);
+        }
+
         let field_pointer: TypeHandle = MirPtrType::get_generic(ctx, array_type, false).into();
         let field = Operation::new(
             ctx,
@@ -903,7 +1309,8 @@ mod tests {
         field.insert_at_back(body, ctx);
         let field_value = field.deref(ctx).get_result(0);
 
-        let element_pointer: TypeHandle = MirPtrType::get_generic(ctx, element_type, false).into();
+        let element_pointer: TypeHandle =
+            MirPtrType::get_generic(ctx, array_element_type, false).into();
         let element_address = Operation::new(
             ctx,
             MirArrayElementAddrOp::get_concrete_op_info(),
@@ -915,18 +1322,52 @@ mod tests {
         element_address.insert_at_back(body, ctx);
         let element_pointer_value = element_address.deref(ctx).get_result(0);
 
-        let load = Operation::new(
-            ctx,
-            MirLoadOp::get_concrete_op_info(),
-            vec![element_type],
-            vec![element_pointer_value],
-            vec![],
-            0,
-        );
-        if volatile_load {
-            MirLoadOp::new(load).set_volatile(ctx, true);
+        let scalar_pointer = if options.nested_scalar_wrapper {
+            let pointer_type: TypeHandle = MirPtrType::get_generic(ctx, element_type, false).into();
+            let field = Operation::new(
+                ctx,
+                MirFieldAddrOp::get_concrete_op_info(),
+                vec![pointer_type],
+                vec![element_pointer_value],
+                vec![],
+                0,
+            );
+            MirFieldAddrOp::new(field).set_attr_field_index(ctx, FieldIndexAttr(0));
+            field.insert_at_back(body, ctx);
+            field.deref(ctx).get_result(0)
+        } else {
+            element_pointer_value
+        };
+
+        if options.comparison_call {
+            append_trivial_comparison_helper(ctx, module.get_operation(), element_type);
+            let call = Operation::new(
+                ctx,
+                MirCallOp::get_concrete_op_info(),
+                vec![IntegerType::get(ctx, 1, Signedness::Signless).into()],
+                vec![scalar_pointer, scalar_pointer],
+                vec![],
+                0,
+            );
+            MirCallOp::new(call).set_attr_callee(
+                ctx,
+                pliron::builtin::attributes::StringAttr::new("trivial_ne".to_string()),
+            );
+            call.insert_at_back(body, ctx);
+        } else {
+            let load = Operation::new(
+                ctx,
+                MirLoadOp::get_concrete_op_info(),
+                vec![element_type],
+                vec![scalar_pointer],
+                vec![],
+                0,
+            );
+            if options.volatile_load {
+                MirLoadOp::new(load).set_volatile(ctx, true);
+            }
+            load.insert_at_back(body, ctx);
         }
-        load.insert_at_back(body, ctx);
 
         let return_op = Operation::new(
             ctx,
@@ -944,6 +1385,73 @@ mod tests {
         }
     }
 
+    fn append_trivial_comparison_helper(
+        ctx: &mut Context,
+        module: Ptr<Operation>,
+        element_type: TypeHandle,
+    ) {
+        let pointer_type: TypeHandle = MirPtrType::get_generic(ctx, element_type, false).into();
+        let result_type: TypeHandle = IntegerType::get(ctx, 1, Signedness::Signless).into();
+        let function_type =
+            FunctionType::get(ctx, vec![pointer_type, pointer_type], vec![result_type]);
+        let function = Operation::new(
+            ctx,
+            MirFuncOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        let function_op = MirFuncOp::new(ctx, function, TypeAttr::new(function_type.into()));
+        function_op.set_symbol_name(ctx, "trivial_ne".try_into().unwrap());
+        let module_region = module.deref(ctx).get_region(0);
+        let module_block = module_region
+            .deref(ctx)
+            .iter(ctx)
+            .next()
+            .expect("fixture module has one block");
+        function.insert_at_back(module_block, ctx);
+
+        let region: Ptr<Region> = function.deref(ctx).get_region(0);
+        let entry = BasicBlock::new(ctx, None, vec![pointer_type, pointer_type]);
+        entry.insert_at_back(region, ctx);
+        let lhs_pointer = entry.deref(ctx).get_argument(0);
+        let rhs_pointer = entry.deref(ctx).get_argument(1);
+
+        let mut loaded = Vec::new();
+        for pointer in [lhs_pointer, rhs_pointer] {
+            let load = Operation::new(
+                ctx,
+                MirLoadOp::get_concrete_op_info(),
+                vec![element_type],
+                vec![pointer],
+                vec![],
+                0,
+            );
+            load.insert_at_back(entry, ctx);
+            loaded.push(load.deref(ctx).get_result(0));
+        }
+        let comparison = Operation::new(
+            ctx,
+            MirNeOp::get_concrete_op_info(),
+            vec![result_type],
+            loaded,
+            vec![],
+            0,
+        );
+        comparison.insert_at_back(entry, ctx);
+        let result = comparison.deref(ctx).get_result(0);
+        let return_op = Operation::new(
+            ctx,
+            MirReturnOp::get_concrete_op_info(),
+            vec![],
+            vec![result],
+            vec![],
+            0,
+        );
+        return_op.insert_at_back(entry, ctx);
+    }
+
     fn count<T: Op>(ctx: &Context, root: Ptr<Operation>) -> usize {
         let mut operations = Vec::new();
         collect_ops(ctx, root, &mut operations);
@@ -956,7 +1464,7 @@ mod tests {
     #[test]
     fn bounded_rem_rewrites_large_array_with_small_candidate_set() {
         let mut ctx = Context::new();
-        let fixture = build_fixture(&mut ctx, 64, Some(3), false, false);
+        let fixture = build_fixture(&mut ctx, 64, Some(3), FixtureOptions::default());
 
         canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
 
@@ -974,7 +1482,7 @@ mod tests {
     #[test]
     fn unbounded_index_is_canonicalized_for_lowering_fallback() {
         let mut ctx = Context::new();
-        let fixture = build_fixture(&mut ctx, 3, None, false, false);
+        let fixture = build_fixture(&mut ctx, 3, None, FixtureOptions::default());
 
         canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
 
@@ -988,7 +1496,7 @@ mod tests {
     #[test]
     fn oversized_candidate_set_is_canonicalized_for_lowering_fallback() {
         let mut ctx = Context::new();
-        let fixture = build_fixture(&mut ctx, 64, Some(17), false, false);
+        let fixture = build_fixture(&mut ctx, 64, Some(17), FixtureOptions::default());
 
         canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
 
@@ -1002,7 +1510,15 @@ mod tests {
     #[test]
     fn additional_store_rejects_the_entire_slot() {
         let mut ctx = Context::new();
-        let fixture = build_fixture(&mut ctx, 3, Some(3), true, false);
+        let fixture = build_fixture(
+            &mut ctx,
+            3,
+            Some(3),
+            FixtureOptions {
+                additional_store: true,
+                ..FixtureOptions::default()
+            },
+        );
 
         canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
 
@@ -1013,12 +1529,91 @@ mod tests {
     #[test]
     fn volatile_load_rejects_the_entire_slot() {
         let mut ctx = Context::new();
-        let fixture = build_fixture(&mut ctx, 3, Some(3), false, true);
+        let fixture = build_fixture(
+            &mut ctx,
+            3,
+            Some(3),
+            FixtureOptions {
+                volatile_load: true,
+                ..FixtureOptions::default()
+            },
+        );
 
         canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
 
         assert_eq!(count::<MirExtractArrayElementOp>(&ctx, fixture.module), 0);
         assert_eq!(count::<MirLoadOp>(&ctx, fixture.module), 1);
+    }
+
+    #[test]
+    fn body_initialized_local_is_canonicalized_through_a_whole_value_load() {
+        let mut ctx = Context::new();
+        let fixture = build_fixture(
+            &mut ctx,
+            3,
+            Some(3),
+            FixtureOptions {
+                store_in_body: true,
+                ..FixtureOptions::default()
+            },
+        );
+
+        canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false);
+
+        assert_eq!(count::<MirExtractFieldOp>(&ctx, fixture.module), 1);
+        assert_eq!(count::<MirExtractArrayElementOp>(&ctx, fixture.module), 1);
+        assert_eq!(count::<MirFieldAddrOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirArrayElementAddrOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirLoadOp>(&ctx, fixture.module), 1);
+
+        let mut analyses = pliron::pass::AnalysisManager::default();
+        pliron::opts::mem2reg::mem2reg(fixture.module, &mut ctx, &mut analyses)
+            .expect("the whole-value access makes the local promotable");
+
+        assert_eq!(count::<MirAllocaOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirStoreOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirLoadOp>(&ctx, fixture.module), 0);
+    }
+
+    #[test]
+    fn indexed_newtype_comparison_becomes_promotable_scalar_extraction() {
+        let mut ctx = Context::new();
+        let fixture = build_fixture(
+            &mut ctx,
+            3,
+            Some(3),
+            FixtureOptions {
+                store_in_body: true,
+                nested_scalar_wrapper: true,
+                comparison_call: true,
+                ..FixtureOptions::default()
+            },
+        );
+
+        assert_eq!(count::<MirCallOp>(&ctx, fixture.module), 1);
+        assert_eq!(
+            canonicalize_trivial_indexed_comparison_calls(fixture.module, &mut ctx, false),
+            1
+        );
+        assert_eq!(count::<MirCallOp>(&ctx, fixture.module), 0);
+        assert_eq!(
+            canonicalize_read_only_aggregate_arguments(fixture.module, &mut ctx, false),
+            2
+        );
+        assert_eq!(count::<MirArrayElementAddrOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirFieldAddrOp>(&ctx, fixture.module), 0);
+
+        let mut analyses = pliron::pass::AnalysisManager::default();
+        pliron::opts::mem2reg::mem2reg(fixture.module, &mut ctx, &mut analyses)
+            .expect("nested scalar extraction makes the aggregate local promotable");
+
+        assert_eq!(count::<MirAllocaOp>(&ctx, fixture.module), 0);
+        assert_eq!(count::<MirStoreOp>(&ctx, fixture.module), 0);
+        assert_eq!(
+            count::<MirLoadOp>(&ctx, fixture.module),
+            2,
+            "only the two loads inside the comparison helper remain"
+        );
     }
 
     struct BorrowedPointerFixture {
